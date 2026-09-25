@@ -41,9 +41,19 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         _file = Path.Combine(directory, FileName);
         _snapshotFile = Path.Combine(directory, SnapshotFileName);
         _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-        LoadSnapshot();
-        LoadAndRepair();
-        DropCompactedPrefixOnDisk();
+        try
+        {
+            LoadSnapshot();
+            LoadAndRepair();
+            DropCompactedPrefixOnDisk();
+        }
+        catch
+        {
+            _closed = true;
+            _channel.Dispose();
+            _channel = null;
+            throw;
+        }
     }
 
     /// <summary>Number of successful fsync calls from <see cref="Force"/>.</summary>
