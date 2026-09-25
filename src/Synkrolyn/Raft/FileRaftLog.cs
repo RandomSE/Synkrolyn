@@ -40,7 +40,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         Directory.CreateDirectory(directory);
         _file = Path.Combine(directory, FileName);
         _snapshotFile = Path.Combine(directory, SnapshotFileName);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
         LoadSnapshot();
         LoadAndRepair();
         DropCompactedPrefixOnDisk();
@@ -528,7 +528,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
         _channel?.Dispose();
         FilePersistentState.Replace(tmp, _file);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
         _channel.Position = _channel.Length;
         _forcedOffsets = newOffsets;
         _forcedCount = newCount;
