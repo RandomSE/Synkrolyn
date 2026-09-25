@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Synkrolyn.Host/Synkrolyn.Host.csproj" />
+    <Project Path="src/Synkrolyn/Synkrolyn.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj" />
+  </Folder>
+</Solution>
