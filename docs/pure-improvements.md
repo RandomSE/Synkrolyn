@@ -1,0 +1,27 @@
+# Pure improvements
+
+A pure improvement here is a correctness, strictness, or completeness fix that does not give up latency, throughput, availability, or a Raft safety property. Batching, pipelining, leases, PreVote, and CheckQuorum stay as in Prytolyn.
+
+| What | Why it is not a tradeoff | Test |
+| --- | --- | --- |
+| Leader commit quorum counts this node only when `DurableIndex` covers the index. Prytolyn counts volatile `lastIndex`. AppendEntries is still sent before the leader fsync. | A volatile self-count can commit an entry the leader has not forced. Waiting to send until after fsync would add a latency round, so that alternative is rejected. Parallel send stays. | `ReplicationAndPureImprovementTests.Leader_doesNotCountItselfUntilForce`, `Leader_sendsAppendEntriesBeforeItsOwnForce` |
+| After `TimeoutNow`, the old leader stays a follower and reports transfer success only when it observes the target as leader. A deadline aborts and clears the pending transfer. | Fire-and-forget can report success when the target never wins. Observing the next leader does not add an RPC and does not keep the old leader in the election. | `ReplicationAndPureImprovementTests.Transfer_reportsSuccessOnlyAfterTargetWins_andTimeoutAborts` |
+| Leases, CheckQuorum, and election deadlines use `Stopwatch` ticks (`SystemRaftClock`), not wall time. | A wall-clock step can expire or extend a lease without a real interval. A monotonic clock does not change the timeout values. | `FakeClockTests` source scan of `src/Synkrolyn` for `DateTime.Now` / `UtcNow`, plus `SystemRaftClock` |
+| Follower `commitIndex` is `max(commitIndex, min(leaderCommit, storedThrough))`. | A reordered AppendEntries must not move commit backward. | `ReplicationAndPureImprovementTests.ReorderedAppendEntries_commitIndexDoesNotDecrease` |
+| AppendEntries success, client success, and apply run only after `Force`. One fsync per drain. | Ack-before-fsync can report a commit that a crash drops. Grouping the fsync does not add a fsync per entry. | `DurableRestartTests.CrashBeforeForce_waiterNotApplied_reopenDropsEntry`, `FileWal_batchPutsOneDrain_fewerForcesThanSequentialDrains` |
+| `InstallSnapshotResponse` echoes the installed index and term. `matchIndex` advances only to that echo. | Copying the leader's newer `lastIncludedIndex` from a stale done chunk skips a generation. | `SafetyRepairTests.InstallSnapshot_staleDoneDoesNotJumpMatchToNewerSnapshot` |
+| `becomeLeader` seeds the CheckQuorum ack map and does not seed the quorum-lease map. | Using the grace seed as a lease would serve a bounded-stale read before any AppendEntries success. The grace still prevents an immediate step-down. | `SafetyRepairTests.LeaseFalseBeforeAppendAck_checkQuorumGraceKeepsLeader` |
+| Leadership transfer sends `TimeoutNow` only after the target `matchIndex` reaches `lastIndex`. The deadline cancels the transfer and leaves this node leader. | Sending `TimeoutNow` early can elect a follower that is missing the log. Catch-up uses the replication path that already exists. | `SafetyRepairTests.TransferBehindPeer_noTimeoutNowUntilCaughtUp` |
+| `TimeoutNow` at the leader's current term starts one election (`BeginElection`), not a campaign at `term + 1` plus another bump. | A double bump skips a term and can split the cluster from the intended target. | `ReplicationAndPureImprovementTests.Transfer_reportsSuccessOnlyAfterTargetWins_andTimeoutAborts` (target becomes leader once) |
+| `removeServer` refuses a voter removal that would not leave a majority of the current voters. 3 to 2 is allowed. 2 to 1 is empty. Learner removal stays allowed. | Dropping the last majority is an availability hole, not a faster config change. | `MembershipChangeTests.RemoveVoterFromTwo_returnsEmpty_learnerRemoveReturnsIndex`, `RemoveVoter_oldNodeNoLongerRequiredForCommit` |
+| Apply of non-membership commands is queued. `Drain` does not spin-wait for the state machine. | A blocking apply stalls heartbeats. Queuing the completion preserves order. | `DurableRestartTests.ApplyExecutor_drainReturnsBeforeStateMachineRuns` |
+| PTKV delta framing includes the delete-count field in the buffer length. | A short buffer throws on a legal delta. The fix does not change the on-wire layout. | `KvSnapshotTests.DeltaSnapshot_mergesOnBase`, `LegacyDeltaWithoutSerialTrailer_keepsBaseSerials` |
+| Linearizable reads use the monotonic time when the echoed AppendEntries stamp was sent, not the time the ack arrived, and not `QuorumLeaseValid`. | Extending the lease from ack arrival hides delay. The send-time window is the same election timeout. | `SafetyRepairTests.LinearizableGet_doesNotExtendLeaseFromAckArrival` |
+
+## Considered and rejected (tradeoff)
+
+- Do not send AppendEntries until the leader has fsynced. That would serialize disk and network and add commit latency. Paper 10.2.1 allows the parallel send. The quorum rule above is the safety fix.
+- Do not count any peer until every peer has fsynced, including delaying the follower ack until a later barrier beyond the existing force-before-ack. The existing group commit already acks after fsync. An extra barrier would add latency.
+- Report leadership-transfer success at `TimeoutNow` send time. That is fewer messages to wait for and a weaker completion signal.
+- Drive leases from `DateTime.UtcNow`. Wall time can jump. The monotonic clock is the non-tradeoff.
+- Raise `PreVoteLeaderLeaseFactor` or the election timeout to hide stalls. That spends availability.

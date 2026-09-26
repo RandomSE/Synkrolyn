@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build
+        run: dotnet build Synkrolyn.slnx --configuration Release
+      - name: Test
+        run: dotnet test Synkrolyn.slnx --configuration Release --no-build
+      - name: TLC if installed
+        if: runner.os == 'Linux'
+        run: |
+          if command -v tlc >/dev/null 2>&1; then
+            tlc -config tla/MC.cfg tla/Synkrolyn.tla
+          else
+            echo "tlc not on PATH; skipping TLA+ model check"
+          fi

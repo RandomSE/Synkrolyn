@@ -1,0 +1,6 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+    <InternalsVisibleTo Include="Synkrolyn.Tests" />
+  </ItemGroup>
+</Project>
