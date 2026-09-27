@@ -363,9 +363,14 @@ public sealed class DurableRestartTests : IDisposable
 
     private void Restart(string id, IEnumerable<string> peers, TimeSpan election)
     {
+        if (_cluster!.Log(id) is IDisposable openLog)
+        {
+            openLog.Dispose();
+        }
+
         var store = new InMemoryKvStore();
         _stores[id] = store;
-        var node = _cluster!.ReplaceNode(id, peers, election, Heartbeat, store, new FilePersistentState(Dir(id)), new FileRaftLog(Dir(id)));
+        var node = _cluster.ReplaceNode(id, peers, election, Heartbeat, store, new FilePersistentState(Dir(id)), new FileRaftLog(Dir(id)));
         _clients[id] = new KvClient(node, store);
     }
 

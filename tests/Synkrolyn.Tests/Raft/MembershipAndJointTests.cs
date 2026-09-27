@@ -130,6 +130,7 @@ public sealed class MembershipChangeTests : IDisposable
 
         var restored = new InMemoryKvStore();
         var state2 = new FilePersistentState(dir);
+        log.Dispose();
         var log2 = new FileRaftLog(dir);
         _cluster.Harness.ReplaceNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat, restored, state2, log2);
         Assert.Contains("n4", _cluster.Harness.Node("n1").LearnerPeerIds);
@@ -329,6 +330,7 @@ public sealed class JointConsensusTests : IDisposable
 
         var restored = new InMemoryKvStore();
         var state2 = new FilePersistentState(dir);
+        log.Dispose();
         var log2 = new FileRaftLog(dir);
         _cluster.Harness.ReplaceNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat, restored, state2, log2);
         Assert.True(_cluster.Harness.Node("n1").InJointConsensus);

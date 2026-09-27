@@ -418,6 +418,11 @@ public sealed class ChaosCampaignTests : IDisposable
 
         void Restart(string id, TimeSpan election)
         {
+            if (cluster.Log(id) is IDisposable openLog)
+            {
+                openLog.Dispose();
+            }
+
             var store = new InMemoryKvStore();
             stores[id] = store;
             string dir = Path.Combine(_root, id);

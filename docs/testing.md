@@ -2,7 +2,7 @@
 
 ## Clock
 
-Unit tests advance `FakeClock`. `ClusterHarness.Advance` moves the clock, drains every mailbox, then runs CheckQuorum. `SourceConventionsTests.UnitTestsMustNotCallThreadSleep` fails if `Thread.Sleep` appears under `tests/`.
+Unit tests advance `FakeClock`, which is compiled into the test assembly. `ClusterHarness.Advance` moves the clock, drains every mailbox, then runs CheckQuorum. `SourceConventionsTests.UnitTestsMustNotCallThreadSleep` fails if `Thread.Sleep` appears under `tests/`. `Phase3RobustnessTests.Finding16_fakeClock_isNotInTheProductionAssembly` fails if that type is linked into `Synkrolyn.dll`.
 
 `SystemRaftClock` reads `Stopwatch` ticks. `FakeClockTests.SystemClock_movesForwardAndIgnoresListeners` checks that those ticks move forward and that `OnAdvance` is not fired.
 

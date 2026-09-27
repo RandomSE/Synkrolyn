@@ -11,8 +11,17 @@ namespace Synkrolyn.Raft;
 /// </summary>
 public sealed class RaftNode
 {
-    /// <summary>Cap on AppendEntries payload size.</summary>
+    /// <summary>Cap on AppendEntries entry count.</summary>
     public const int MaxAppendEntriesBatch = 16;
+
+    /// <summary>Cap on AppendEntries command bytes. Stays under the 1 MiB frame.</summary>
+    public const int MaxAppendEntriesBytes = 512 * 1024;
+
+    /// <summary>Default InstallSnapshot chunk. Stays under the frame cap.</summary>
+    public const int DefaultSnapshotChunkBytes = 256 * 1024;
+
+    /// <summary>Mailbox depth that fail-stops the node.</summary>
+    public const int MaxMailbox = 4096;
 
     /// <summary>Auto-snapshot is off unless <see cref="SnapshotThreshold"/> is set.</summary>
     public const int DefaultSnapshotThreshold = 0;
@@ -76,7 +85,7 @@ public sealed class RaftNode
     private long _lastAcceptedLeaderCommit;
     private bool _lastPreVoteGranted;
     private Func<long, long> _electionJitter = static timeout => timeout;
-    private int _snapshotChunkSize = int.MaxValue;
+    private int _snapshotChunkSize = DefaultSnapshotChunkBytes;
     private int _snapshotThreshold = DefaultSnapshotThreshold;
     private long _followerLeasePauseSlackMillis;
     private int _snapshotChunksReceived;
@@ -99,6 +108,18 @@ public sealed class RaftNode
     private long _preVoteRound;
     private long _nonVoterSinceIndex;
     private bool _fatal;
+    private bool _logIndexCacheValid;
+    private long _cacheTailIndex = -1;
+    private long _cacheIncludedIndex = -1;
+    private bool _cachedLogHasCnew;
+    private bool _snapshotWhenIdle;
+    private long _cachedLatestJointIndex;
+    private byte[]? _deferredSnapshot;
+    private long _deferredSnapshotIndex;
+    private long _deferredSnapshotTerm;
+    private string? _deferredSnapshotFrom;
+    private readonly Dictionary<long, (long First, long Last)> _termSpan = [];
+    private readonly List<(long Index, byte[] Command)> _configEntries = [];
 
     /// <summary>Creates a node with a no-op state machine.</summary>
     public RaftNode(
@@ -413,17 +434,33 @@ public sealed class RaftNode
     }
 
     /// <summary>Enqueues a clock tick.</summary>
-    public void EnqueueTick() => _mailbox.Enqueue(OnTick);
+    public void EnqueueTick() => Enqueue(OnTick);
+
+    private void Enqueue(Action action)
+    {
+        if (_fatal)
+        {
+            return;
+        }
+
+        if (_mailbox.Count >= MaxMailbox)
+        {
+            _fatal = true;
+            return;
+        }
+
+        _mailbox.Enqueue(action);
+    }
 
     /// <summary>Enqueues an inbound envelope. The caller must <see cref="Drain"/>.</summary>
     public void Receive(Envelope envelope)
     {
         ArgumentNullException.ThrowIfNull(envelope);
-        _mailbox.Enqueue(() => Dispatch(envelope));
+        Enqueue(() => Dispatch(envelope));
     }
 
     /// <summary>Enqueues a candidate transition without draining.</summary>
-    public void StartElection() => _mailbox.Enqueue(BeginElection);
+    public void StartElection() => Enqueue(BeginElection);
 
     /// <summary>Next election or heartbeat deadline, in clock milliseconds.</summary>
     public long NextDeadlineMillis()
@@ -463,7 +500,16 @@ public sealed class RaftNode
                             break;
                         }
 
-                        task();
+                        try
+                        {
+                            task();
+                        }
+                        catch (Exception)
+                        {
+                            FailStop();
+                            return true;
+                        }
+
                         ran = true;
                         worked = true;
                     }
@@ -500,6 +546,15 @@ public sealed class RaftNode
             }
 
             return worked;
+        }
+    }
+
+    /// <summary>Unacked AppendEntries stamps remembered for <paramref name="peer"/>.</summary>
+    internal int PendingAeStampCount(string peer)
+    {
+        lock (_eventLock)
+        {
+            return _aeSendMillis.TryGetValue(peer, out Dictionary<long, long>? sent) ? sent.Count : 0;
         }
     }
 
@@ -857,6 +912,11 @@ public sealed class RaftNode
 
             if (now >= _nextHeartbeatAt)
             {
+                foreach (string peer in _snapshotInFlight.ToArray())
+                {
+                    SendSnapshot(peer);
+                }
+
                 ReplicateToAll();
                 _nextHeartbeatAt = now + _heartbeatIntervalMillis;
             }
@@ -1049,9 +1109,17 @@ public sealed class RaftNode
                 : _log.Read(prevIndex).Term;
         var entries = new List<LogEntry>();
         long last = Math.Min(_log.LastIndex, next + MaxAppendEntriesBatch - 1);
+        int bytes = 0;
         for (long i = next; i <= last; i++)
         {
-            entries.Add(_log.Read(i));
+            LogEntry entry = _log.Read(i);
+            if (entries.Count > 0 && bytes + entry.Command.Length > MaxAppendEntriesBytes)
+            {
+                break;
+            }
+
+            entries.Add(entry);
+            bytes += entry.Command.Length;
         }
 
         long stamp = _nextAeStamp.TryGetValue(peer, out long previous) ? previous + 1 : 1;
@@ -1063,6 +1131,19 @@ public sealed class RaftNode
         }
 
         sent[stamp] = _clock.Millis;
+        while (sent.Count > 32)
+        {
+            long oldest = long.MaxValue;
+            foreach (long key in sent.Keys)
+            {
+                if (key < oldest)
+                {
+                    oldest = key;
+                }
+            }
+
+            sent.Remove(oldest);
+        }
         _transport.Send(
             _nodeId,
             peer,
@@ -1356,6 +1437,7 @@ public sealed class RaftNode
         if (conflictAt is long truncateAt)
         {
             _log.TruncateFrom(truncateAt);
+            InvalidateLogIndexCache();
             RebuildMembershipFromLog();
         }
 
@@ -1409,7 +1491,7 @@ public sealed class RaftNode
 
             if (_nextIndex.GetValueOrDefault(from, 1) <= _log.LastIndex)
             {
-                _mailbox.Enqueue(() => SendTo(from));
+                Enqueue(() => SendTo(from));
             }
 
             if (_readRoundOpen
@@ -1450,7 +1532,7 @@ public sealed class RaftNode
         _nextIndex[from] = next;
         if (next != current)
         {
-            _mailbox.Enqueue(() => SendTo(from));
+            Enqueue(() => SendTo(from));
         }
     }
 
@@ -1484,16 +1566,94 @@ public sealed class RaftNode
 
     private long LastIndexWithTerm(long term)
     {
-        long found = _log.LastIncludedTerm == term ? _log.LastIncludedIndex : 0;
-        for (long i = _log.FirstIndex; i <= _log.LastIndex; i++)
+        EnsureLogIndexCache();
+        return _termSpan.TryGetValue(term, out (long First, long Last) span) ? span.Last : 0;
+    }
+
+    private void EnsureLogIndexCache()
+    {
+        if (_logIndexCacheValid && _cacheTailIndex == _log.LastIndex && _cacheIncludedIndex == _log.LastIncludedIndex)
         {
-            if (_log.Read(i).Term == term)
-            {
-                found = i;
-            }
+            return;
         }
 
-        return found;
+        _termSpan.Clear();
+        _configEntries.Clear();
+        _cachedLatestJointIndex = 0;
+        _cachedLogHasCnew = false;
+        if (_log.LastIncludedIndex > 0)
+        {
+            _termSpan[_log.LastIncludedTerm] = (_log.LastIncludedIndex, _log.LastIncludedIndex);
+        }
+
+        for (long i = _log.FirstIndex; i <= _log.LastIndex; i++)
+        {
+            LogEntry entry = _log.Read(i);
+            if (_termSpan.TryGetValue(entry.Term, out (long First, long Last) span))
+            {
+                _termSpan[entry.Term] = (span.First, entry.Index);
+            }
+            else
+            {
+                _termSpan[entry.Term] = (entry.Index, entry.Index);
+            }
+
+            NoteCachedConfig(entry);
+        }
+
+        _cacheTailIndex = _log.LastIndex;
+        _cacheIncludedIndex = _log.LastIncludedIndex;
+        _logIndexCacheValid = true;
+    }
+
+    private void InvalidateLogIndexCache()
+    {
+        _logIndexCacheValid = false;
+        _cacheTailIndex = -1;
+        _cacheIncludedIndex = -1;
+        _termSpan.Clear();
+        _configEntries.Clear();
+        _cachedLatestJointIndex = 0;
+        _cachedLogHasCnew = false;
+    }
+
+    private void NoteCachedAppend(LogEntry entry)
+    {
+        if (!_logIndexCacheValid)
+        {
+            return;
+        }
+
+        if (_termSpan.TryGetValue(entry.Term, out (long First, long Last) span))
+        {
+            _termSpan[entry.Term] = (span.First, entry.Index);
+        }
+        else
+        {
+            _termSpan[entry.Term] = (entry.Index, entry.Index);
+        }
+
+        NoteCachedConfig(entry);
+        _cacheTailIndex = entry.Index;
+    }
+
+    private void NoteCachedConfig(LogEntry entry)
+    {
+        if (!MembershipCodec.IsMembership(entry.Command))
+        {
+            return;
+        }
+
+        _configEntries.Add((entry.Index, entry.Command));
+        MembershipCodec.Kind kind = MembershipCodec.Decode(entry.Command).Kind;
+        if (kind == MembershipCodec.Kind.Joint)
+        {
+            _cachedLatestJointIndex = entry.Index;
+        }
+        else if (kind == MembershipCodec.Kind.Cnew)
+        {
+            _cachedLogHasCnew = true;
+        }
     }
 
     private AppendEntriesResponse PrevConflict(long prevLogIndex, long stamp)
@@ -1510,11 +1670,12 @@ public sealed class RaftNode
         }
 
         long xTerm = _log.Read(prevLogIndex).Term;
-        long xIndex = prevLogIndex;
+        EnsureLogIndexCache();
+        long xIndex = _termSpan.TryGetValue(xTerm, out (long First, long Last) span) ? span.First : prevLogIndex;
         long first = _log.FirstIndex;
-        while (xIndex > first && _log.Read(xIndex - 1).Term == xTerm)
+        if (xIndex < first)
         {
-            xIndex--;
+            xIndex = first;
         }
 
         return new AppendEntriesResponse(CurrentTermLocked(), false, 0, 0, xTerm, xIndex, stamp);
@@ -1549,6 +1710,11 @@ public sealed class RaftNode
         _lastLeaderContactMillis = _clock.Millis;
         ResetElectionDeadline();
         ObserveTransfer(install.LeaderId);
+        if (_deferredSnapshot is not null)
+        {
+            return;
+        }
+
         if (install.LastIncludedIndex <= _commitIndex)
         {
             _transport.Send(
@@ -1599,6 +1765,43 @@ public sealed class RaftNode
             return;
         }
 
+        if (_applyInFlight)
+        {
+            _deferredSnapshot = bytes;
+            _deferredSnapshotIndex = install.LastIncludedIndex;
+            _deferredSnapshotTerm = install.LastIncludedTerm;
+            _deferredSnapshotFrom = from;
+            return;
+        }
+
+        InstallAcceptedSnapshot(from, install.LastIncludedIndex, install.LastIncludedTerm, bytes);
+    }
+
+    private void RunDeferredInstall()
+    {
+        if (_deferredSnapshot is not byte[] bytes || _deferredSnapshotFrom is not string from)
+        {
+            return;
+        }
+
+        long index = _deferredSnapshotIndex;
+        long term = _deferredSnapshotTerm;
+        _deferredSnapshot = null;
+        _deferredSnapshotFrom = null;
+        InstallAcceptedSnapshot(from, index, term, bytes);
+    }
+
+    private void InstallAcceptedSnapshot(string from, long lastIncludedIndex, long lastIncludedTerm, byte[] bytes)
+    {
+        if (lastIncludedIndex < _log.LastIncludedIndex)
+        {
+            _transport.Send(
+                _nodeId,
+                from,
+                new InstallSnapshotResponse(CurrentTermLocked(), true, true, _log.LastIncludedIndex, _log.LastIncludedTerm));
+            return;
+        }
+
         MembershipSnapshot.Decoded decoded = MembershipSnapshot.Decode(bytes);
         try
         {
@@ -1616,16 +1819,17 @@ public sealed class RaftNode
         }
 
         byte[] persisted = MembershipSnapshot.Encode(AllVoters(), AllLearners(), _coldVoters, _cnewVoters, _stateMachine.Snapshot());
-        _log.CompactThrough(install.LastIncludedIndex, install.LastIncludedTerm, persisted);
-        if (_commitIndex < install.LastIncludedIndex)
+        _log.CompactThrough(lastIncludedIndex, lastIncludedTerm, persisted);
+        InvalidateLogIndexCache();
+        if (_commitIndex < lastIncludedIndex)
         {
-            _commitIndex = install.LastIncludedIndex;
+            _commitIndex = lastIncludedIndex;
         }
 
-        _lastAcceptedLeaderCommit = Math.Max(_lastAcceptedLeaderCommit, install.LastIncludedIndex);
-        if (_lastApplied < install.LastIncludedIndex)
+        _lastAcceptedLeaderCommit = Math.Max(_lastAcceptedLeaderCommit, lastIncludedIndex);
+        if (_lastApplied < lastIncludedIndex)
         {
-            _lastApplied = install.LastIncludedIndex;
+            _lastApplied = lastIncludedIndex;
         }
 
         _snapshotsInstalled++;
@@ -1652,7 +1856,7 @@ public sealed class RaftNode
         {
             _snapshotForceFull.Add(from);
             _snapshotNextOffset[from] = 0;
-            _mailbox.Enqueue(() => SendSnapshot(from));
+            Enqueue(() => SendSnapshot(from));
             return;
         }
 
@@ -1660,7 +1864,7 @@ public sealed class RaftNode
         {
             int offset = _snapshotNextOffset.GetValueOrDefault(from);
             _snapshotNextOffset[from] = offset + _snapshotChunkSize;
-            _mailbox.Enqueue(() => SendSnapshot(from));
+            Enqueue(() => SendSnapshot(from));
             return;
         }
 
@@ -1676,7 +1880,7 @@ public sealed class RaftNode
         {
             _snapshotForceFull.Add(from);
             _snapshotNextOffset[from] = 0;
-            _mailbox.Enqueue(() => SendSnapshot(from));
+            Enqueue(() => SendSnapshot(from));
             return;
         }
 
@@ -1687,7 +1891,7 @@ public sealed class RaftNode
         MaybeAdvanceCommit();
         if (_nextIndex.GetValueOrDefault(from, 1) <= _log.LastIndex)
         {
-            _mailbox.Enqueue(() => SendTo(from));
+            Enqueue(() => SendTo(from));
         }
     }
 
@@ -1767,12 +1971,21 @@ public sealed class RaftNode
             }
             catch (Exception)
             {
-                _mailbox.Enqueue(FailStop);
+                Enqueue(FailStop);
                 return;
             }
 
-            _mailbox.Enqueue(() => FinishApply(index));
+            Enqueue(() => FinishApply(index));
         });
+    }
+
+    /// <summary>Fail-stops after an exception escaped the Raft thread.</summary>
+    internal void StopAfterRaftThreadFault()
+    {
+        lock (_eventLock)
+        {
+            FailStop();
+        }
     }
 
     private void FailStop()
@@ -1793,11 +2006,22 @@ public sealed class RaftNode
         _applyInFlight = false;
         if (index != _lastApplied + 1)
         {
+            RunDeferredInstall();
             return;
         }
 
         _lastApplied = index;
         SignalApplyWaiters();
+        if (_snapshotWhenIdle)
+        {
+            _snapshotWhenIdle = false;
+            if (!_fatal && _lastApplied > _log.LastIncludedIndex)
+            {
+                SnapshotThroughLocked(_lastApplied);
+            }
+        }
+
+        RunDeferredInstall();
         MaybeAutoSnapshot();
         MaybeAutoCnew();
         ApplyCommitted();
@@ -1857,6 +2081,12 @@ public sealed class RaftNode
             return;
         }
 
+        if (_applyInFlight)
+        {
+            _snapshotWhenIdle = true;
+            return;
+        }
+
         long term = _log.Read(index).Term;
         long baseIndex = _log.LastIncludedIndex;
         byte[] deltaSm = _stateMachine.SnapshotDelta(baseIndex);
@@ -1875,7 +2105,7 @@ public sealed class RaftNode
         }
 
         _snapshotForceFull.Clear();
-        _snapshotExecutor(() => _mailbox.Enqueue(() => CompactSnapshot(index, term, bytes)));
+        _snapshotExecutor(() => Enqueue(() => CompactSnapshot(index, term, bytes)));
         if (!_draining)
         {
             Drain();
@@ -1890,6 +2120,7 @@ public sealed class RaftNode
         }
 
         _log.CompactThrough(index, term, bytes);
+        InvalidateLogIndexCache();
     }
 
     private void StepDown(long newTerm)
@@ -2163,6 +2394,7 @@ public sealed class RaftNode
     {
         _log.Append(entry);
         _logNeedsForce = true;
+        NoteCachedAppend(entry);
         ActivateAppendedConfig(entry);
     }
 
@@ -2343,11 +2575,16 @@ public sealed class RaftNode
             view.Learners.UnionWith(_bootstrapLearners);
         }
 
+        EnsureLogIndexCache();
         long end = Math.Min(index, _log.LastIndex);
-        for (long i = _log.FirstIndex; i <= end; i++)
+        foreach ((long configIndex, byte[] command) in _configEntries)
         {
-            byte[] command = _log.Read(i).Command;
-            if (MembershipCodec.IsMembership(command))
+            if (configIndex > end)
+            {
+                break;
+            }
+
+            if (configIndex >= _log.FirstIndex)
             {
                 view.Apply(MembershipCodec.Decode(command));
             }
@@ -2487,15 +2724,10 @@ public sealed class RaftNode
 
     private void ReplayLogConfigs()
     {
-        for (long i = _log.FirstIndex; i <= _log.LastIndex; i++)
+        EnsureLogIndexCache();
+        foreach ((long index, byte[] command) in _configEntries)
         {
-            byte[] command = _log.Read(i).Command;
-            if (!MembershipCodec.IsMembership(command))
-            {
-                continue;
-            }
-
-            ApplyMembershipCommand(command, i);
+            ApplyMembershipCommand(command, index);
         }
     }
 
@@ -2545,31 +2777,14 @@ public sealed class RaftNode
 
     private bool LogHasCnew()
     {
-        for (long i = _log.FirstIndex; i <= _log.LastIndex; i++)
-        {
-            byte[] command = _log.Read(i).Command;
-            if (MembershipCodec.IsMembership(command) && MembershipCodec.Decode(command).Kind == MembershipCodec.Kind.Cnew)
-            {
-                return true;
-            }
-        }
-
-        return false;
+        EnsureLogIndexCache();
+        return _cachedLogHasCnew;
     }
 
     private long LatestJointIndex()
     {
-        long found = 0;
-        for (long i = _log.FirstIndex; i <= _log.LastIndex; i++)
-        {
-            byte[] command = _log.Read(i).Command;
-            if (MembershipCodec.IsMembership(command) && MembershipCodec.Decode(command).Kind == MembershipCodec.Kind.Joint)
-            {
-                found = i;
-            }
-        }
-
-        return found;
+        EnsureLogIndexCache();
+        return _cachedLatestJointIndex;
     }
 
     private void OnTimeoutNow(TimeoutNow timeout)

@@ -15,7 +15,9 @@ public sealed class SocketTransport : ITransport, IDisposable
     private readonly Dictionary<string, IPEndPoint> _peers = [];
     private readonly HashSet<string> _disabled = [];
     private readonly Dictionary<string, TcpClient> _outbound = [];
-    private readonly Channel<Outbound> _queue = Channel.CreateUnbounded<Outbound>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly Dictionary<string, Channel<byte[]>> _peerQueues = [];
+    private readonly Dictionary<string, Thread> _writers = [];
+    private readonly List<TcpClient> _inbound = [];
     private readonly object _gate = new();
 
     private Action<Envelope>? _handler;
@@ -23,7 +25,6 @@ public sealed class SocketTransport : ITransport, IDisposable
     private volatile bool _running;
     private TcpListener? _listener;
     private Thread? _acceptor;
-    private Thread? _writer;
 
     /// <summary>Creates an unbound transport for <paramref name="nodeId"/>.</summary>
     public SocketTransport(string nodeId, IMessageCodec codec)
@@ -89,9 +90,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         _running = true;
         _acceptor = new Thread(AcceptLoop) { IsBackground = true, Name = "synkrolyn-accept-" + _nodeId };
-        _writer = new Thread(WriteLoop) { IsBackground = true, Name = "synkrolyn-write-" + _nodeId };
         _acceptor.Start();
-        _writer.Start();
     }
 
     /// <summary>Closes sockets to <paramref name="peerId"/> and drops further sends.</summary>
@@ -162,17 +161,48 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
 
         byte[] body = _codec.Encode(sender, payload);
-        _queue.Writer.TryWrite(new Outbound(recipient, FrameCodec.Encode(body)));
+        PeerQueue(recipient).Writer.TryWrite(FrameCodec.Encode(body));
+    }
+
+    private Channel<byte[]> PeerQueue(string recipient)
+    {
+        lock (_gate)
+        {
+            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing))
+            {
+                return existing;
+            }
+
+            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+            {
+                SingleReader = true,
+                FullMode = BoundedChannelFullMode.DropOldest,
+            });
+            _peerQueues[recipient] = channel;
+            var thread = new Thread(() => WriteLoop(recipient, channel))
+            {
+                IsBackground = true,
+                Name = "synkrolyn-write-" + _nodeId + "-" + recipient,
+            };
+            _writers[recipient] = thread;
+            thread.Start();
+            return channel;
+        }
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
         _running = false;
-        _queue.Writer.TryComplete();
-        _listener?.Stop();
+        Channel<byte[]>[] channels;
+        Thread[] writers;
+        TcpClient[] inbound;
         lock (_gate)
         {
+            channels = _peerQueues.Values.ToArray();
+            writers = _writers.Values.ToArray();
+            inbound = _inbound.ToArray();
+            _inbound.Clear();
             foreach (TcpClient client in _outbound.Values)
             {
                 client.Dispose();
@@ -181,8 +211,23 @@ public sealed class SocketTransport : ITransport, IDisposable
             _outbound.Clear();
         }
 
+        foreach (Channel<byte[]> channel in channels)
+        {
+            channel.Writer.TryComplete();
+        }
+
+        foreach (TcpClient client in inbound)
+        {
+            client.Dispose();
+        }
+
+        _listener?.Stop();
         _acceptor?.Join(1000);
-        _writer?.Join(1000);
+        foreach (Thread writer in writers)
+        {
+            writer.Join(1000);
+        }
+
         GC.SuppressFinalize(this);
     }
 
@@ -193,6 +238,11 @@ public sealed class SocketTransport : ITransport, IDisposable
             try
             {
                 TcpClient client = _listener!.AcceptTcpClient();
+                lock (_gate)
+                {
+                    _inbound.Add(client);
+                }
+
                 var reader = new Thread(() => ReadLoop(client)) { IsBackground = true, Name = "synkrolyn-read-" + _nodeId };
                 reader.Start();
             }
@@ -210,23 +260,23 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private void WriteLoop()
+    private void WriteLoop(string peer, Channel<byte[]> channel)
     {
         while (_running)
         {
-            if (!_queue.Reader.TryRead(out Outbound next))
+            byte[] frame;
+            try
             {
-                if (!_queue.Reader.WaitToReadAsync().AsTask().Wait(50))
-                {
-                    continue;
-                }
-
-                continue;
+                frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
+            }
+            catch (ChannelClosedException)
+            {
+                return;
             }
 
             lock (_gate)
             {
-                if (_disabled.Contains(next.To))
+                if (_disabled.Contains(peer))
                 {
                     continue;
                 }
@@ -234,36 +284,32 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             try
             {
-                TcpClient client = EnsureOutbound(next.To);
+                TcpClient client = EnsureOutbound(peer);
                 NetworkStream stream = client.GetStream();
-                stream.Write(next.Frame);
+                stream.Write(frame);
                 stream.Flush();
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
             {
-                lock (_gate)
-                {
-                    if (_outbound.Remove(next.To, out TcpClient? client))
-                    {
-                        client.Dispose();
-                    }
-                }
+                DropOutbound(peer);
             }
-            catch (SocketException)
+        }
+    }
+
+    private void DropOutbound(string peer)
+    {
+        lock (_gate)
+        {
+            if (_outbound.Remove(peer, out TcpClient? client))
             {
-                lock (_gate)
-                {
-                    if (_outbound.Remove(next.To, out TcpClient? client))
-                    {
-                        client.Dispose();
-                    }
-                }
+                client.Dispose();
             }
         }
     }
 
     private TcpClient EnsureOutbound(string peerId)
     {
+        IPEndPoint address;
         lock (_gate)
         {
             if (_outbound.TryGetValue(peerId, out TcpClient? existing) && existing.Connected)
@@ -271,13 +317,35 @@ public sealed class SocketTransport : ITransport, IDisposable
                 return existing;
             }
 
-            if (!_peers.TryGetValue(peerId, out IPEndPoint? address))
+            if (!_peers.TryGetValue(peerId, out IPEndPoint? found))
             {
                 throw new IOException("no address for " + peerId);
             }
 
-            var socket = new TcpClient();
-            socket.Connect(address);
+            address = found;
+        }
+
+        var socket = new TcpClient();
+        socket.Connect(address);
+        lock (_gate)
+        {
+            if (_disabled.Contains(peerId))
+            {
+                socket.Dispose();
+                throw new IOException("peer disabled: " + peerId);
+            }
+
+            if (_outbound.TryGetValue(peerId, out TcpClient? raced) && raced.Connected)
+            {
+                socket.Dispose();
+                return raced;
+            }
+
+            if (_outbound.Remove(peerId, out TcpClient? stale))
+            {
+                stale.Dispose();
+            }
+
             _outbound[peerId] = socket;
             return socket;
         }
@@ -320,15 +388,18 @@ public sealed class SocketTransport : ITransport, IDisposable
                 }
             }
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
         {
             // Connection close stays on the I/O thread.
         }
         finally
         {
+            lock (_gate)
+            {
+                _inbound.Remove(client);
+            }
+
             client.Dispose();
         }
     }
-
-    private readonly record struct Outbound(string To, byte[] Frame);
 }

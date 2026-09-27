@@ -104,6 +104,14 @@ public sealed class RaftRuntime : IDisposable
         catch (Exception ex)
         {
             _uncaught = ex;
+            try
+            {
+                _node.StopAfterRaftThreadFault();
+            }
+            catch (Exception stop)
+            {
+                _uncaught = new AggregateException(ex, stop);
+            }
         }
     }
 

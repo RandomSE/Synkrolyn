@@ -227,6 +227,34 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
     public static void Replace(string tmp, string dest)
     {
         File.Move(tmp, dest, overwrite: true);
+        SyncDirectory(dest);
+    }
+
+    private static void SyncDirectory(string dest)
+    {
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(dest));
+        if (string.IsNullOrEmpty(directory))
+        {
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            // FILE_FLAG_BACKUP_SEMANTICS. The public FileOptions enum does not name it.
+            const FileOptions directoryBackupSemantics = (FileOptions)0x02000000;
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.ReadWrite | FileShare.Delete,
+                Options = directoryBackupSemantics,
+            };
+            using var dir = new FileStream(directory, options);
+            dir.Flush(flushToDisk: true);
+            return;
+        }
+
+        PosixDirectorySync.Sync(directory);
     }
 
     private void EnsureOpen()
