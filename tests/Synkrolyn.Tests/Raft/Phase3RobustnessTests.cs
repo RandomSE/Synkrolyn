@@ -246,15 +246,20 @@ public class Phase3RobustnessTests
         string dir = Directory.CreateTempSubdirectory("synkrolyn-force-").FullName;
         try
         {
-            var log = new FileRaftLog(dir);
-            log.Append(new LogEntry(1, 1, "kept"u8.ToArray()));
-            FileRaftLog.AfterForceWrite = static channel =>
+            var failOnce = true;
+            var log = new FileRaftLog(dir, channel =>
             {
+                if (!failOnce)
+                {
+                    return;
+                }
+
+                failOnce = false;
                 channel.Write(new byte[8]);
                 throw new IOException("torn");
-            };
+            });
+            log.Append(new LogEntry(1, 1, "kept"u8.ToArray()));
             Assert.Throws<IOException>(() => log.Force());
-            FileRaftLog.AfterForceWrite = null;
             log.Force();
             log.Dispose();
             using var reopened = new FileRaftLog(dir);
@@ -262,8 +267,58 @@ public class Phase3RobustnessTests
         }
         finally
         {
-            FileRaftLog.AfterForceWrite = null;
             Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Finding14_faultHooks_doNotCrossInstances()
+    {
+        string tornDir = Directory.CreateTempSubdirectory("synkrolyn-hook-torn-").FullName;
+        string cleanDir = Directory.CreateTempSubdirectory("synkrolyn-hook-clean-").FullName;
+        try
+        {
+            var torn = new FileRaftLog(tornDir, channel =>
+            {
+                channel.Write(new byte[8]);
+                throw new IOException("torn");
+            });
+            var cleanCalls = 0;
+            var clean = new FileRaftLog(cleanDir, _ => Interlocked.Increment(ref cleanCalls));
+            torn.Append(new LogEntry(1, 1, "lost"u8.ToArray()));
+            clean.Append(new LogEntry(1, 1, "kept"u8.ToArray()));
+            var start = new Barrier(2);
+            Exception? tornError = null;
+            Exception? cleanError = null;
+            var tornThread = new Thread(() =>
+            {
+                start.SignalAndWait();
+                tornError = Record.Exception(() => torn.Force());
+            });
+            var cleanThread = new Thread(() =>
+            {
+                start.SignalAndWait();
+                cleanError = Record.Exception(() => clean.Force());
+            });
+            tornThread.Start();
+            cleanThread.Start();
+            tornThread.Join();
+            cleanThread.Join();
+            Assert.IsType<IOException>(tornError);
+            Assert.Equal("torn", tornError.Message);
+            Assert.Null(cleanError);
+            Assert.Equal(1, cleanCalls);
+            torn.CrashWithoutForce();
+            clean.Dispose();
+            using var reopenedTorn = new FileRaftLog(tornDir);
+            using var reopenedClean = new FileRaftLog(cleanDir);
+            Assert.Equal(0, reopenedTorn.LastIndex);
+            Assert.Equal("kept"u8.ToArray(), reopenedClean.Read(1).Command);
+        }
+        finally
+        {
+            Directory.Delete(tornDir, true);
+            Directory.Delete(cleanDir, true);
         }
     }
 

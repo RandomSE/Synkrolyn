@@ -33,11 +33,22 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     private byte[] _snapshot = [];
     private int _forceCount;
     private int _diskReadCount;
+    private readonly Action<FileStream>? _afterForceWrite;
 
     /// <summary>Opens or creates the log under <paramref name="directory"/>.</summary>
     public FileRaftLog(string directory)
+        : this(directory, null)
+    {
+    }
+
+    /// <summary>
+    /// Opens the log. <paramref name="afterForceWrite"/> runs on this instance only,
+    /// after the pending bytes are written and before they are flushed.
+    /// </summary>
+    internal FileRaftLog(string directory, Action<FileStream>? afterForceWrite)
     {
         ArgumentNullException.ThrowIfNull(directory);
+        _afterForceWrite = afterForceWrite;
         _dir = directory;
         Directory.CreateDirectory(directory);
         _directoryLock = DataDirectoryLock.Acquire(directory, "raft.log");
@@ -59,9 +70,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             throw;
         }
     }
-
-    /// <summary>Test hook invoked after the pending bytes are written and before they are committed.</summary>
-    internal static Action<FileStream>? AfterForceWrite;
 
     /// <summary>Forced-entry reads that hit the log file. Pending entries do not count.</summary>
     internal int DiskReadCount
@@ -337,7 +345,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         try
         {
             channel.Write(bytes);
-            AfterForceWrite?.Invoke(channel);
+            _afterForceWrite?.Invoke(channel);
             channel.Flush(flushToDisk: true);
         }
         catch
