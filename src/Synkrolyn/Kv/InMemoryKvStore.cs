@@ -11,9 +11,11 @@ public sealed class InMemoryKvStore : IKvStore
 {
     private static readonly byte[] SerialMagic = "PTCS"u8.ToArray();
     private const int SerialSnapshotVersion = 1;
+    private readonly object _gate = new();
     private readonly Dictionary<string, string> _map = [];
     private readonly Dictionary<string, long> _clientSerials = [];
     private Dictionary<string, string>? _lastSnapMap;
+    private int _epoch;
 
     /// <inheritdoc />
     public void Apply(long index, byte[] command)
@@ -24,7 +26,19 @@ public sealed class InMemoryKvStore : IKvStore
             return;
         }
 
+        int seen;
+        lock (_gate)
+        {
+            seen = _epoch;
+        }
+
         KvCommandCodec.Command decoded = KvCommandCodec.Decode(command);
+        lock (_gate)
+        {
+            if (seen != _epoch)
+            {
+                return;
+            }
         if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
         {
             if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
@@ -35,33 +49,53 @@ public sealed class InMemoryKvStore : IKvStore
             _clientSerials[decoded.ClientId] = decoded.Serial;
         }
 
-        if (decoded.Operation == KvCommandCodec.Op.Put)
-        {
-            _map[decoded.Key] = decoded.Value;
-        }
-        else
-        {
-            _map.Remove(decoded.Key);
+            if (decoded.Operation == KvCommandCodec.Op.Put)
+            {
+                _map[decoded.Key] = decoded.Value;
+            }
+            else
+            {
+                _map.Remove(decoded.Key);
+            }
         }
     }
 
     /// <inheritdoc />
     public byte[] Snapshot()
     {
-        byte[] bytes = EncodeMapLocked();
-        _lastSnapMap = new Dictionary<string, string>(_map);
-        return bytes;
+        lock (_gate)
+        {
+            byte[] bytes = EncodeMapLocked();
+            _lastSnapMap = new Dictionary<string, string>(_map);
+            return bytes;
+        }
     }
 
     /// <summary>Bytes for disk persist. Does not move the delta base.</summary>
-    public byte[] EncodeMapForPersist() => EncodeMapLocked();
+    public byte[] EncodeMapForPersist()
+    {
+        lock (_gate)
+        {
+            return EncodeMapLocked();
+        }
+    }
 
     /// <inheritdoc />
     public byte[] SnapshotDelta(long baseIndex)
     {
+        lock (_gate)
+        {
+            return SnapshotDeltaLocked(baseIndex);
+        }
+    }
+
+    private byte[] SnapshotDeltaLocked(long baseIndex)
+    {
         if (_lastSnapMap is null)
         {
-            return Snapshot();
+            byte[] bytes = EncodeMapLocked();
+            _lastSnapMap = new Dictionary<string, string>(_map);
+            return bytes;
         }
 
         var puts = new Dictionary<string, string>();
@@ -89,18 +123,31 @@ public sealed class InMemoryKvStore : IKvStore
     public void Restore(byte[] snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        if (KvSnapshotDelta.IsDelta(snapshot))
+        lock (_gate)
         {
-            throw new ArgumentException("delta snapshot requires a base");
-        }
+            _epoch++;
+            if (KvSnapshotDelta.IsDelta(snapshot))
+            {
+                throw new ArgumentException("delta snapshot requires a base");
+            }
 
-        RestoreFull(snapshot);
+            RestoreFull(snapshot);
+        }
     }
 
     /// <inheritdoc />
     public void RestoreChecked(long lastIncludedIndex, long lastApplied, byte[] snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_gate)
+        {
+            _epoch++;
+            RestoreCheckedLocked(lastIncludedIndex, lastApplied, snapshot);
+        }
+    }
+
+    private void RestoreCheckedLocked(long lastIncludedIndex, long lastApplied, byte[] snapshot)
+    {
         if (KvSnapshotDelta.IsDelta(snapshot))
         {
             if (_lastSnapMap is null
@@ -123,7 +170,10 @@ public sealed class InMemoryKvStore : IKvStore
     public string? Get(string key)
     {
         KvCommandCodec.RequireKey(key);
-        return _map.GetValueOrDefault(key);
+        lock (_gate)
+        {
+            return _map.GetValueOrDefault(key);
+        }
     }
 
     private byte[] EncodeMapLocked()

@@ -8,4 +8,7 @@ public interface ITransport
 {
     /// <summary>Sends <paramref name="payload"/> from <paramref name="sender"/> to <paramref name="recipient"/>.</summary>
     void Send(string sender, string recipient, object payload);
+
+    /// <summary>True when <paramref name="nodeId"/> is a known peer. The default accepts every id.</summary>
+    bool HasPeer(string nodeId) => true;
 }
