@@ -24,7 +24,7 @@ public enum LeadershipTransferStatus
     /// <summary>Waiting for the target's match index to reach the leader's last index.</summary>
     CatchingUp,
 
-    /// <summary>TimeoutNow was sent and this node is a follower waiting to see the target win.</summary>
+    /// <summary>TimeoutNow was sent. This node stays leader and refuses new proposals until the target wins or the deadline passes.</summary>
     AwaitingWinner,
 
     /// <summary>An AppendEntries from the target was observed.</summary>

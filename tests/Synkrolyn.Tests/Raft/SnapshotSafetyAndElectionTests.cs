@@ -247,7 +247,7 @@ public sealed class SafetyRepairTests
         cluster.Harness.Advance(delay);
         cluster.Harness.Advance(10);
         Assert.Equal(Role.Leader, cluster.Harness.Node("n1").Role);
-        Assert.True(cluster.Harness.Node("n1").QuorumLeaseValid);
+        Assert.False(cluster.Harness.Node("n1").QuorumLeaseValid);
         cluster.Harness.Transport.DelayNext("n2", "n1", TimeSpan.FromMilliseconds(10_000));
         cluster.Harness.Transport.DelayNext("n3", "n1", TimeSpan.FromMilliseconds(10_000));
         Assert.Null(leader.LinearizableGet("k"));

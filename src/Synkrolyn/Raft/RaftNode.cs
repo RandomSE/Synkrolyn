@@ -92,6 +92,11 @@ public sealed class RaftNode
     private long _lastApplied;
     private long _pendingReadIndex;
     private long _pendingReadTerm;
+    private long _readEpoch;
+    private long _openReadEpoch;
+    private long _confirmedReadEpoch;
+    private bool _readRoundOpen;
+    private long _preVoteRound;
     private long _nonVoterSinceIndex;
     private bool _fatal;
 
@@ -557,6 +562,10 @@ public sealed class RaftNode
     }
 
     /// <summary>Leader ReadIndex. Empty when not leader or no current-term commit.</summary>
+    /// <remarks>
+    /// Each call joins the open heartbeat round or starts one. A finished round does not
+    /// authorize a later read. Concurrent calls share that one round.
+    /// </remarks>
     public long? BeginReadIndex()
     {
         lock (_eventLock)
@@ -566,6 +575,14 @@ public sealed class RaftNode
                 return null;
             }
 
+            if (_readRoundOpen)
+            {
+                return _pendingReadIndex;
+            }
+
+            _readEpoch++;
+            _openReadEpoch = _readEpoch;
+            _readRoundOpen = true;
             _pendingReadIndex = _commitIndex;
             _pendingReadTerm = CurrentTermLocked();
             _readIndexAcks.Clear();
@@ -576,16 +593,32 @@ public sealed class RaftNode
             }
 
             ReplicateToAll();
+            NoteReadQuorum();
             return _pendingReadIndex;
         }
     }
 
-    /// <summary>True when a pending ReadIndex or the send-time lease is satisfied and applied.</summary>
+    /// <summary>Ticket for the ReadIndex round started or joined by the latest <see cref="BeginReadIndex"/>.</summary>
+    public long CurrentReadTicket
+    {
+        get { lock (_eventLock) { return _openReadEpoch; } }
+    }
+
+    /// <summary>True when the send-time read lease is valid and the commit index is applied.</summary>
     public bool ReadIndexSatisfied()
     {
         lock (_eventLock)
         {
-            return ReadIndexSatisfiedLocked();
+            return LinearizableLeaseValidLocked() && _lastApplied >= _commitIndex;
+        }
+    }
+
+    /// <summary>True when <paramref name="ticket"/>'s heartbeat round has a quorum and its index is applied.</summary>
+    public bool ReadIndexSatisfied(long ticket)
+    {
+        lock (_eventLock)
+        {
+            return ReadTicketSatisfiedLocked(ticket);
         }
     }
 
@@ -816,6 +849,12 @@ public sealed class RaftNode
                 return;
             }
 
+            if (_transferStatus == LeadershipTransferStatus.AwaitingWinner && now >= _pendingTransferDeadline)
+            {
+                _transferStatus = LeadershipTransferStatus.Aborted;
+                _pendingTransferTo = null;
+            }
+
             if (now >= _nextHeartbeatAt)
             {
                 ReplicateToAll();
@@ -862,11 +901,12 @@ public sealed class RaftNode
 
     private void BeginPreVote()
     {
+        _preVoteRound++;
         _preCandidate = true;
         _preVotesGranted.Clear();
         _preVotesGranted.Add(_nodeId);
         ResetElectionDeadline();
-        var request = new RequestVote(CurrentTermLocked() + 1, _nodeId, _log.LastIndex, _log.LastTerm, true);
+        var request = new RequestVote(CurrentTermLocked() + 1, _nodeId, _log.LastIndex, _log.LastTerm, true, _preVoteRound);
         foreach (string peer in _voterPeers)
         {
             _transport.Send(_nodeId, peer, request);
@@ -939,7 +979,6 @@ public sealed class RaftNode
     private void CompleteTransfer(string peer)
     {
         _transport.Send(_nodeId, peer, new TimeoutNow(CurrentTermLocked(), _nodeId));
-        StepDown(CurrentTermLocked());
         _pendingTransferTo = peer;
         _transferStatus = LeadershipTransferStatus.AwaitingWinner;
         _pendingTransferDeadline = _clock.Millis + _electionTimeoutMillis;
@@ -968,6 +1007,11 @@ public sealed class RaftNode
     private long? ProposeLocked(byte[] command)
     {
         ArgumentNullException.ThrowIfNull(command);
+        if (_transferStatus == LeadershipTransferStatus.AwaitingWinner)
+        {
+            return null;
+        }
+
         long index = _log.LastIndex + 1;
         AppendLocked(new LogEntry(index, CurrentTermLocked(), command));
         ReplicateToAll();
@@ -1140,7 +1184,7 @@ public sealed class RaftNode
             if (_preCandidate && string.CompareOrdinal(request.CandidateId, _nodeId) >= 0)
             {
                 _lastPreVoteGranted = false;
-                _transport.Send(_nodeId, from, new RequestVoteResponse(CurrentTermLocked(), false, true));
+                _transport.Send(_nodeId, from, new RequestVoteResponse(CurrentTermLocked(), false, true, request.Round));
                 return;
             }
 
@@ -1150,7 +1194,7 @@ public sealed class RaftNode
         }
 
         _lastPreVoteGranted = grant;
-        _transport.Send(_nodeId, from, new RequestVoteResponse(CurrentTermLocked(), grant, true));
+        _transport.Send(_nodeId, from, new RequestVoteResponse(CurrentTermLocked(), grant, true, request.Round));
     }
 
     private bool HeardLeaderRecently()
@@ -1167,7 +1211,7 @@ public sealed class RaftNode
     {
         if (response.PreVote)
         {
-            if (!_preCandidate)
+            if (!_preCandidate || response.Round != _preVoteRound || !IsCurrentVoter(from))
             {
                 return;
             }
@@ -1190,7 +1234,7 @@ public sealed class RaftNode
             return;
         }
 
-        if (_role != Role.Candidate || response.Term != CurrentTermLocked() || !response.VoteGranted)
+        if (_role != Role.Candidate || response.Term != CurrentTermLocked() || !response.VoteGranted || !IsCurrentVoter(from))
         {
             return;
         }
@@ -1219,6 +1263,13 @@ public sealed class RaftNode
             _role = Role.Follower;
         }
 
+        if (_role == Role.Leader)
+        {
+            _transport.Send(_nodeId, from, new AppendEntriesResponse(CurrentTermLocked(), false, 0, append.Stamp));
+            return;
+        }
+
+        DisarmPreVote();
         _leaderId = append.LeaderId;
         _lastLeaderContactMillis = _clock.Millis;
         ResetElectionDeadline();
@@ -1339,7 +1390,13 @@ public sealed class RaftNode
         {
             long now = _clock.Millis;
             _lastAppendAckMillis[from] = now;
-            _leaseAckMillis[from] = now;
+            if (response.Stamp > 0
+                && _aeSendMillis.TryGetValue(from, out Dictionary<long, long>? sentTimes)
+                && sentTimes.TryGetValue(response.Stamp, out long sentAt)
+                && (!_leaseAckMillis.TryGetValue(from, out long previousLease) || sentAt > previousLease))
+            {
+                _leaseAckMillis[from] = sentAt;
+            }
             long matched = Math.Max(_matchIndex.GetValueOrDefault(from), response.MatchIndex);
             _matchIndex[from] = matched;
             _nextIndex[from] = matched + 1;
@@ -1355,13 +1412,15 @@ public sealed class RaftNode
                 _mailbox.Enqueue(() => SendTo(from));
             }
 
-            if (_pendingReadIndex > 0
+            if (_readRoundOpen
+                && _pendingReadIndex > 0
                 && CurrentTermLocked() == _pendingReadTerm
                 && _voterPeers.Contains(from)
                 && response.Stamp > 0
                 && response.Stamp >= _readStampFloor.GetValueOrDefault(from, long.MaxValue))
             {
                 _readIndexAcks.Add(from);
+                NoteReadQuorum();
             }
 
             NoteLinearizableAck(from, response.Stamp);
@@ -1479,6 +1538,13 @@ public sealed class RaftNode
             _role = Role.Follower;
         }
 
+        if (_role == Role.Leader)
+        {
+            _transport.Send(_nodeId, from, new InstallSnapshotResponse(CurrentTermLocked(), false, false));
+            return;
+        }
+
+        DisarmPreVote();
         _leaderId = install.LeaderId;
         _lastLeaderContactMillis = _clock.Millis;
         ResetElectionDeadline();
@@ -1872,23 +1938,29 @@ public sealed class RaftNode
         return _log.Read(_commitIndex).Term == term;
     }
 
-    private bool ReadIndexSatisfiedLocked()
+    private bool ReadTicketSatisfiedLocked(long ticket)
     {
-        if (_role != Role.Leader)
+        return _role == Role.Leader
+            && ticket > 0
+            && ticket == _confirmedReadEpoch
+            && ticket == _openReadEpoch
+            && CurrentTermLocked() == _pendingReadTerm
+            && _lastApplied >= _pendingReadIndex;
+    }
+
+    private void NoteReadQuorum()
+    {
+        if (!_readRoundOpen || !ReadQuorumReached())
         {
-            return false;
+            return;
         }
 
-        if (LinearizableLeaseValidLocked() && _lastApplied >= _commitIndex)
-        {
-            return true;
-        }
+        _readRoundOpen = false;
+        _confirmedReadEpoch = _openReadEpoch;
+    }
 
-        if (_pendingReadIndex < 1 || CurrentTermLocked() != _pendingReadTerm || _lastApplied < _pendingReadIndex)
-        {
-            return false;
-        }
-
+    private bool ReadQuorumReached()
+    {
         if (InJointLocked())
         {
             var granted = new HashSet<string>(_readIndexAcks);
@@ -1903,6 +1975,18 @@ public sealed class RaftNode
         int self = _selfVoter ? 1 : 0;
         return self + _readIndexAcks.Count >= Majority();
     }
+
+    private void DisarmPreVote()
+    {
+        _preCandidate = false;
+        _preVotesGranted.Clear();
+        _preVoteRound++;
+    }
+
+    private bool IsCurrentVoter(string peer) => _voterPeers.Contains(peer);
+
+    private long ReadLeaseBoundMillis() =>
+        Math.Min(_electionTimeoutMillis, PreVoteLeaderLeaseFactor * _heartbeatIntervalMillis);
 
     private bool FollowerReadLeaseValidLocked()
     {
@@ -1931,12 +2015,14 @@ public sealed class RaftNode
             return _selfVoter;
         }
 
+        long now = _clock.Millis;
+        long bound = ReadLeaseBoundMillis();
         if (InJointLocked())
         {
-            return HeardQuorum(_coldVoters, _leaseAckMillis) && HeardQuorum(_cnewVoters, _leaseAckMillis);
+            return HeardQuorum(_coldVoters, _leaseAckMillis, now, bound) && HeardQuorum(_cnewVoters, _leaseAckMillis, now, bound);
         }
 
-        return HeardCount(_leaseAckMillis) >= Majority();
+        return HeardCount(_leaseAckMillis, bound) >= Majority();
     }
 
     private bool LinearizableLeaseValidLocked()
@@ -1951,22 +2037,25 @@ public sealed class RaftNode
             return _selfVoter;
         }
 
+        long now = _clock.Millis;
+        long bound = ReadLeaseBoundMillis();
         if (InJointLocked())
         {
-            return HeardQuorum(_coldVoters, _linearizableAckSendMillis) && HeardQuorum(_cnewVoters, _linearizableAckSendMillis);
+            return HeardQuorum(_coldVoters, _linearizableAckSendMillis, now, bound)
+                && HeardQuorum(_cnewVoters, _linearizableAckSendMillis, now, bound);
         }
 
-        return HeardCount(_linearizableAckSendMillis) >= Majority();
+        return HeardCount(_linearizableAckSendMillis, bound) >= Majority();
     }
 
-    private int HeardCount(Dictionary<string, long> acks)
+    private int HeardCount(Dictionary<string, long> acks, long bound)
     {
         int heard = _selfVoter ? 1 : 0;
         long now = _clock.Millis;
         foreach (string peer in _voterPeers)
         {
             long last = acks.GetValueOrDefault(peer, long.MinValue);
-            if (last != long.MinValue && now - last < _electionTimeoutMillis)
+            if (last != long.MinValue && now - last < bound)
             {
                 heard++;
             }
@@ -1997,6 +2086,9 @@ public sealed class RaftNode
     {
         _pendingReadIndex = 0;
         _pendingReadTerm = 0;
+        _readRoundOpen = false;
+        _openReadEpoch = 0;
+        _confirmedReadEpoch = 0;
         _readIndexAcks.Clear();
         _readStampFloor.Clear();
     }
@@ -2323,9 +2415,12 @@ public sealed class RaftNode
     }
 
     private bool HeardQuorum(IReadOnlySet<string> voters, Dictionary<string, long> acks) =>
-        HeardQuorum(voters, acks, _clock.Millis);
+        HeardQuorum(voters, acks, _clock.Millis, _electionTimeoutMillis);
 
-    private bool HeardQuorum(IReadOnlySet<string> voters, Dictionary<string, long> acks, long now)
+    private bool HeardQuorum(IReadOnlySet<string> voters, Dictionary<string, long> acks, long now) =>
+        HeardQuorum(voters, acks, now, _electionTimeoutMillis);
+
+    private bool HeardQuorum(IReadOnlySet<string> voters, Dictionary<string, long> acks, long now, long bound)
     {
         int heard = 0;
         foreach (string id in voters)
@@ -2337,7 +2432,7 @@ public sealed class RaftNode
             }
 
             long last = acks.GetValueOrDefault(id, long.MinValue);
-            if (last != long.MinValue && now - last < _electionTimeoutMillis)
+            if (last != long.MinValue && now - last < bound)
             {
                 heard++;
             }
@@ -2486,7 +2581,7 @@ public sealed class RaftNode
 
         if (timeout.Term > CurrentTermLocked())
         {
-            CampaignAt(timeout.Term);
+            CampaignAt(timeout.Term + 1);
             return;
         }
 

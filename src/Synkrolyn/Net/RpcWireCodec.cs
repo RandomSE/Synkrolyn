@@ -35,12 +35,14 @@ public sealed class RpcWireCodec : IMessageCodec
                 writer.PutLong(vote.LastLogIndex);
                 writer.PutLong(vote.LastLogTerm);
                 writer.PutBool(vote.PreVote);
+                writer.PutLong(vote.Round);
                 break;
             case RequestVoteResponse voteResponse:
                 writer.PutByte(RequestVoteResponseTag);
                 writer.PutLong(voteResponse.Term);
                 writer.PutBool(voteResponse.VoteGranted);
                 writer.PutBool(voteResponse.PreVote);
+                writer.PutLong(voteResponse.Round);
                 break;
             case AppendEntries append:
                 writer.PutByte(AppendEntriesTag);
@@ -108,8 +110,8 @@ public sealed class RpcWireCodec : IMessageCodec
         byte type = reader.ReadByte();
         object rpc = type switch
         {
-            RequestVoteTag => new RequestVote(reader.ReadLong(), reader.ReadString(), reader.ReadLong(), reader.ReadLong(), reader.ReadBool()),
-            RequestVoteResponseTag => new RequestVoteResponse(reader.ReadLong(), reader.ReadBool(), reader.ReadBool()),
+            RequestVoteTag => new RequestVote(reader.ReadLong(), reader.ReadString(), reader.ReadLong(), reader.ReadLong(), reader.ReadBool(), reader.ReadLong()),
+            RequestVoteResponseTag => new RequestVoteResponse(reader.ReadLong(), reader.ReadBool(), reader.ReadBool(), reader.ReadLong()),
             AppendEntriesTag => ReadAppendEntries(reader),
             AppendEntriesResponseTag => new AppendEntriesResponse(
                 reader.ReadLong(), reader.ReadBool(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong()),

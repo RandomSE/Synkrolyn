@@ -4,7 +4,7 @@
 
 Unit tests advance `FakeClock`. `ClusterHarness.Advance` moves the clock, drains every mailbox, then runs CheckQuorum. `SourceConventionsTests.UnitTestsMustNotCallThreadSleep` fails if `Thread.Sleep` appears under `tests/`.
 
-`SystemRaftClock` reads `Stopwatch` ticks. It does not read `DateTime`. `FakeClockTests` scans `src/Synkrolyn` for `DateTime.Now` and `DateTime.UtcNow`.
+`SystemRaftClock` reads `Stopwatch` ticks. `FakeClockTests.SystemClock_movesForwardAndIgnoresListeners` checks that those ticks move forward and that `OnAdvance` is not fired.
 
 `RaftRuntime.ForTests` keeps identity election jitter and snapshot threshold 0. `ForProduction` uses jitter in `[T, 2T]` and snapshot threshold 4096. Socket tests use `ForTests`.
 
@@ -17,8 +17,8 @@ Unit tests advance `FakeClock`. `ClusterHarness.Advance` moves the clock, drains
 - Snapshots and InstallSnapshot: `SnapshotClusterTests`, `KvSnapshotTests`.
 - Membership and joint consensus: `MembershipChangeTests`, `JointConsensusTests`.
 - In-memory chaos (partition, drop, delay, kill-mid-write reopen, divergent tails): `ChaosCampaignTests`, `InMemoryTransportTests`.
-- Sockets: `SocketClusterTests` (election, put/get, reconnect, truncated frame, election-window trials).
-- FakeClock election window: `ElectionUnavailabilityTests`. The socket trials assert that N trials finished. They do not fail on a median.
+- Sockets: `SocketClusterTests` (election, put/get, reconnect, truncated frame).
+- FakeClock election window: `ElectionUnavailabilityTests`.
 
 ## Sockets
 

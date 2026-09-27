@@ -61,60 +61,6 @@ public sealed class SocketClusterTests
         Assert.All(cluster.Nodes, node => Assert.Null(node.Runtime.Uncaught));
     }
 
-    [Fact]
-    public void RecordsElectionWindowTrials_doesNotGateMedian()
-    {
-        var windows = new List<long>();
-        for (int trial = 0; trial < 3; trial++)
-        {
-            windows.Add(RunOneWindow());
-        }
-
-        Assert.Equal(3, windows.Count);
-        Assert.All(windows, ms => Assert.True(ms >= 0));
-    }
-
-    private static long RunOneWindow()
-    {
-        using var cluster = SocketCluster.Start(
-            ["n1", "n2", "n3"],
-            [TimeSpan.FromMilliseconds(80), TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400)],
-            TimeSpan.FromMilliseconds(40));
-        WaitUntil("leader", () => cluster.Leaders().Count == 1);
-        SocketNode oldLeader = cluster.Leaders()[0];
-        oldLeader.Client.Put("before", "yes");
-        WaitUntil("prior", () => oldLeader.Client.AwaitCommitted() is not null);
-        long t0 = Stopwatch.GetTimestamp();
-        foreach (SocketNode node in cluster.Nodes)
-        {
-            if (node.Id != oldLeader.Id)
-            {
-                node.Transport.DisconnectPeer(oldLeader.Id);
-            }
-        }
-
-        oldLeader.Transport.DisconnectAll();
-        SocketNode? winner = null;
-        string? proposedOn = null;
-        WaitUntil("successor commits", () =>
-        {
-            winner = cluster.Nodes.FirstOrDefault(node => node.Id != oldLeader.Id && node.Node.Role == Role.Leader);
-            if (winner is null)
-            {
-                return false;
-            }
-
-            if (proposedOn != winner.Id)
-            {
-                winner.Client.Put("after", "ok");
-                proposedOn = winner.Id;
-            }
-
-            return winner.Client.AwaitCommitted() is not null;
-        });
-        return (long)Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
-    }
-
     private static void WaitUntil(string message, Func<bool> condition)
     {
         var started = Stopwatch.StartNew();

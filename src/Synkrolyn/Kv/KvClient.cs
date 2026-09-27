@@ -70,8 +70,12 @@ public sealed class KvClient
             return _store.Get(key);
         }
 
-        _raft.BeginReadIndex();
-        return _raft.ReadIndexSatisfied() ? _store.Get(key) : null;
+        if (_raft.BeginReadIndex() is null)
+        {
+            return null;
+        }
+
+        return _raft.ReadIndexSatisfied(_raft.CurrentReadTicket) ? _store.Get(key) : null;
     }
 
     /// <summary>Bounded-stale lease read. Not linearizable.</summary>

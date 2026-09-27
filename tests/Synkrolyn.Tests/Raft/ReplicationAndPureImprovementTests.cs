@@ -74,19 +74,23 @@ public class ReplicationAndPureImprovementTests
         Elect();
         _cluster.Propose("n1", "catch-up"u8.ToArray());
         RaftNode leader = _cluster.Node("n1");
+        long term = leader.CurrentTerm;
         Assert.True(leader.TransferLeadership("n2"));
-        Assert.Equal(Role.Follower, leader.Role);
+        Assert.Equal(Role.Leader, leader.Role);
         Assert.Equal(LeadershipTransferStatus.AwaitingWinner, leader.TransferStatus);
         _cluster.DrainAll();
         Assert.Equal(Role.Leader, _cluster.Node("n2").Role);
+        Assert.Equal(term + 1, _cluster.Node("n2").CurrentTerm);
         Assert.Equal(LeadershipTransferStatus.Succeeded, leader.TransferStatus);
+        Assert.Equal(Role.Follower, leader.Role);
 
         _cluster.Isolate("n3");
         Assert.True(_cluster.Node("n2").TransferLeadership("n3"));
-        Assert.Equal(Role.Follower, _cluster.Node("n2").Role);
+        Assert.Equal(Role.Leader, _cluster.Node("n2").Role);
         Assert.Equal(LeadershipTransferStatus.AwaitingWinner, _cluster.Node("n2").TransferStatus);
         _cluster.Advance(300);
         Assert.Equal(LeadershipTransferStatus.Aborted, _cluster.Node("n2").TransferStatus);
+        Assert.Equal(Role.Leader, _cluster.Node("n2").Role);
         Assert.NotEqual(Role.Leader, _cluster.Node("n3").Role);
     }
 

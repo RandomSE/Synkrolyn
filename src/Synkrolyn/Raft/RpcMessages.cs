@@ -1,11 +1,11 @@
 namespace Synkrolyn.Raft;
 
 /// <summary>RequestVote RPC, including the PreVote probe flag.</summary>
-public sealed record RequestVote(long Term, string CandidateId, long LastLogIndex, long LastLogTerm, bool PreVote)
+public sealed record RequestVote(long Term, string CandidateId, long LastLogIndex, long LastLogTerm, bool PreVote, long Round = 0)
 {
     /// <summary>A real vote request. <see cref="PreVote"/> is false.</summary>
     public RequestVote(long term, string candidateId, long lastLogIndex, long lastLogTerm)
-        : this(term, candidateId, lastLogIndex, lastLogTerm, false)
+        : this(term, candidateId, lastLogIndex, lastLogTerm, false, 0)
     {
     }
 
@@ -25,11 +25,11 @@ public sealed record RequestVote(long Term, string CandidateId, long LastLogInde
 }
 
 /// <summary>RequestVote result. <see cref="PreVote"/> answers must not count as real votes.</summary>
-public sealed record RequestVoteResponse(long Term, bool VoteGranted, bool PreVote)
+public sealed record RequestVoteResponse(long Term, bool VoteGranted, bool PreVote, long Round = 0)
 {
     /// <summary>A real vote response.</summary>
     public RequestVoteResponse(long term, bool voteGranted)
-        : this(term, voteGranted, false)
+        : this(term, voteGranted, false, 0)
     {
     }
 }
