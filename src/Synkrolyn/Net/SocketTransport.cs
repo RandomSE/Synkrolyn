@@ -460,14 +460,42 @@ public sealed class SocketTransport : ITransport, IDisposable
     private static TcpClient ConnectWithin(IPEndPoint address, TimeSpan budget)
     {
         var client = new TcpClient();
+        var done = new ManualResetEventSlim(false);
         try
         {
             Socket raw = client.Client;
             raw.NoDelay = true;
             raw.SendTimeout = IoBudgetMillis;
-            using var timeout = new CancellationTokenSource(budget);
-            client.ConnectAsync(address, timeout.Token).AsTask().GetAwaiter().GetResult();
-            raw.NoDelay = true;
+            var args = new SocketAsyncEventArgs { RemoteEndPoint = address };
+            args.Completed += (_, _) =>
+            {
+                try
+                {
+                    done.Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The budget already elapsed and the event was released.
+                }
+            };
+            bool pending = raw.ConnectAsync(args);
+            if (!pending)
+            {
+                done.Set();
+            }
+
+            if (!done.Wait(budget))
+            {
+                client.Dispose();
+                done.Wait(50);
+                throw new TimeoutException("connect exceeded " + (int)budget.TotalMilliseconds + " ms");
+            }
+
+            if (args.SocketError != SocketError.Success)
+            {
+                throw new SocketException((int)args.SocketError);
+            }
+
             raw.SendTimeout = IoBudgetMillis;
             return client;
         }
@@ -475,6 +503,10 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             client.Dispose();
             throw;
+        }
+        finally
+        {
+            done.Dispose();
         }
     }
 
