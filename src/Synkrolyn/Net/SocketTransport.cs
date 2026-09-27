@@ -168,9 +168,16 @@ public sealed class SocketTransport : ITransport, IDisposable
     {
         lock (_gate)
         {
-            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing))
+            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing)
+                && _writers.TryGetValue(recipient, out Thread? writer)
+                && writer.IsAlive)
             {
                 return existing;
+            }
+
+            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? abandoned))
+            {
+                abandoned.Writer.TryComplete();
             }
 
             var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
@@ -269,7 +276,7 @@ public sealed class SocketTransport : ITransport, IDisposable
             {
                 frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
             }
-            catch (ChannelClosedException)
+            catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
             {
                 return;
             }

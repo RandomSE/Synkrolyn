@@ -9,16 +9,41 @@ namespace Synkrolyn.Tests.Net;
 
 public sealed class SocketClusterTests
 {
+    private static readonly ManualResetEventSlim Park = new(false);
+
     [Fact]
     public void ThreeNodeTcp_electsExactlyOneLeader_andPutReplicates()
     {
         using var cluster = SocketCluster.Start();
         WaitUntil("exactly one leader", () => cluster.Leaders().Count == 1);
+        SocketNode? pinned = null;
+        long index = 0;
+        WaitUntil("put committed", () =>
+        {
+            List<SocketNode> leaders = cluster.Leaders();
+            if (leaders.Count != 1)
+            {
+                pinned = null;
+                return false;
+            }
+
+            if (!ReferenceEquals(pinned, leaders[0]))
+            {
+                pinned = leaders[0];
+                pinned.Client.Put("city", "athens");
+                return false;
+            }
+
+            if (pinned.Client.AwaitCommitted() is not long committed)
+            {
+                return false;
+            }
+
+            index = committed;
+            return true;
+        });
         Assert.Single(cluster.Leaders());
-        SocketNode leader = cluster.Leaders()[0];
-        leader.Client.Put("city", "athens");
-        WaitUntil("put committed", () => leader.Client.AwaitCommitted() is not null);
-        long index = leader.Client.AwaitCommitted()!.Value;
+        SocketNode leader = pinned!;
         SocketNode follower = cluster.Nodes.First(node => node.Id != leader.Id);
         WaitUntil("follower applied", () => follower.Node.LastApplied >= index);
         Assert.Equal("athens", follower.Client.Get("city"));
@@ -71,7 +96,9 @@ public sealed class SocketClusterTests
                 throw new TimeoutException("timed out: " + message);
             }
 
-            Thread.Yield();
+            // A tight yield holds a core. On a 2-core runner that delays the Raft thread
+            // past a short election timeout, and the put then never commits.
+            Park.Wait(TimeSpan.FromMilliseconds(5));
         }
     }
 }
@@ -85,7 +112,7 @@ internal sealed class SocketCluster : IDisposable
     public List<SocketNode> Leaders() => Nodes.Where(node => node.Node.Role == Role.Leader).ToList();
 
     public static SocketCluster Start() =>
-        Start(["n1", "n2", "n3"], [TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(350), TimeSpan.FromMilliseconds(600)], TimeSpan.FromMilliseconds(40));
+        Start(["n1", "n2", "n3"], [TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(800), TimeSpan.FromMilliseconds(1200)], TimeSpan.FromMilliseconds(40));
 
     public static SocketCluster Start(string[] ids, TimeSpan[] elections, TimeSpan heartbeat)
     {

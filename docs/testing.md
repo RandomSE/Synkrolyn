@@ -22,7 +22,7 @@ Unit tests advance `FakeClock`, which is compiled into the test assembly. `Clust
 
 ## Sockets
 
-`SocketClusterTests` polls with `Thread.Yield` until a deadline. That is wall-clock integration, not a FakeClock unit test. If a socket test fails once, rerun it. Do not treat one pass or one fail as the only evidence. The FakeClock suite is the safety gate.
+`SocketClusterTests` waits on a short park until a deadline, so the test thread does not hold a core. That is wall-clock integration, not a FakeClock unit test. Election timeouts in that fixture are longer than the in-memory suite so a scheduling pause does not step the leader down before a put commits. The FakeClock suite is the safety gate.
 
 ## TLA+
 

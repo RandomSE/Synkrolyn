@@ -9,6 +9,7 @@ namespace Synkrolyn.Tests.Raft;
 public class Phase3RobustnessTests
 {
     private static readonly TimeSpan Heartbeat = TimeSpan.FromMilliseconds(20);
+    private static readonly ManualResetEventSlim Park = new(false);
 
     [Fact]
     public void Finding6_appendBatch_staysUnderFrameCap()
@@ -400,7 +401,7 @@ public class Phase3RobustnessTests
         while (machine.Restores < 1 && DateTime.UtcNow < deadline)
         {
             follower.Drain();
-            Thread.Yield();
+            Park.Wait(TimeSpan.FromMilliseconds(1));
         }
 
         Assert.Equal(1, machine.Restores);
@@ -429,7 +430,7 @@ public class Phase3RobustnessTests
         var deadline = DateTime.UtcNow.AddSeconds(2);
         while (!node.Fatal && DateTime.UtcNow < deadline)
         {
-            Thread.Yield();
+            Park.Wait(TimeSpan.FromMilliseconds(1));
         }
 
         Assert.True(node.Fatal);
