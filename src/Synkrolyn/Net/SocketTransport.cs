@@ -20,9 +20,17 @@ public sealed class SocketTransport : ITransport, IDisposable
     private readonly List<TcpClient> _inbound = [];
     private readonly object _gate = new();
 
+    /// <summary>
+    /// A blocked connect or send fails inside this budget. The socket fixture's
+    /// shortest election timeout is 120 ms, so one stall must end before CheckQuorum
+    /// steps the leader down while the same frame is still being retried.
+    /// </summary>
+    private const int IoBudgetMillis = 75;
+
     private Action<Envelope>? _handler;
     private Action _wakeup = static () => { };
     private volatile bool _running;
+    private int _failConnects;
     private TcpListener? _listener;
     private Thread? _acceptor;
 
@@ -74,6 +82,33 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     /// <summary>Wakes the Raft thread after an inbound frame.</summary>
     public void SetWakeup(Action wakeup) => _wakeup = wakeup ?? throw new ArgumentNullException(nameof(wakeup));
+
+    /// <summary>The next <paramref name="count"/> outbound connects fail with connection refused.</summary>
+    internal void FailNextConnects(int count)
+    {
+        if (count < 0)
+        {
+            throw new ArgumentException("count must be >= 0", nameof(count));
+        }
+
+        Volatile.Write(ref _failConnects, count);
+    }
+
+    /// <summary>Closes accepted sockets. The listener stays up so peers can reconnect.</summary>
+    internal void DropInbound()
+    {
+        TcpClient[] clients;
+        lock (_gate)
+        {
+            clients = _inbound.ToArray();
+            _inbound.Clear();
+        }
+
+        foreach (TcpClient client in clients)
+        {
+            client.Dispose();
+        }
+    }
 
     /// <summary>Starts accept and write threads.</summary>
     public void Start()
@@ -168,16 +203,9 @@ public sealed class SocketTransport : ITransport, IDisposable
     {
         lock (_gate)
         {
-            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing)
-                && _writers.TryGetValue(recipient, out Thread? writer)
-                && writer.IsAlive)
+            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing))
             {
                 return existing;
-            }
-
-            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? abandoned))
-            {
-                abandoned.Writer.TryComplete();
             }
 
             var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
@@ -201,6 +229,17 @@ public sealed class SocketTransport : ITransport, IDisposable
     public void Dispose()
     {
         _running = false;
+        try
+        {
+            _listener?.Stop();
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
+        {
+            // Stopping the listener unblocks Accept.
+        }
+
+        _acceptor?.Join(1000);
+
         Channel<byte[]>[] channels;
         Thread[] writers;
         TcpClient[] inbound;
@@ -228,8 +267,6 @@ public sealed class SocketTransport : ITransport, IDisposable
             client.Dispose();
         }
 
-        _listener?.Stop();
-        _acceptor?.Join(1000);
         foreach (Thread writer in writers)
         {
             writer.Join(1000);
@@ -240,35 +277,52 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     private void AcceptLoop()
     {
+        using var pause = new ManualResetEventSlim(false);
         while (_running)
         {
+            TcpClient client;
             try
             {
-                TcpClient client = _listener!.AcceptTcpClient();
-                lock (_gate)
-                {
-                    _inbound.Add(client);
-                }
-
-                var reader = new Thread(() => ReadLoop(client)) { IsBackground = true, Name = "synkrolyn-read-" + _nodeId };
-                reader.Start();
+                client = _listener!.AcceptTcpClient();
             }
-            catch (SocketException)
+            catch (Exception)
             {
                 if (!_running)
                 {
                     return;
                 }
+
+                // One accept error must not exit the listener or spin a core.
+                pause.Wait(5);
+                continue;
             }
-            catch (InvalidOperationException)
+
+            client.NoDelay = true;
+            if (!_running)
             {
+                client.Dispose();
                 return;
             }
+
+            lock (_gate)
+            {
+                if (!_running)
+                {
+                    client.Dispose();
+                    return;
+                }
+
+                _inbound.Add(client);
+            }
+
+            var reader = new Thread(() => ReadLoop(client)) { IsBackground = true, Name = "synkrolyn-read-" + _nodeId };
+            reader.Start();
         }
     }
 
     private void WriteLoop(string peer, Channel<byte[]> channel)
     {
+        using var pause = new ManualResetEventSlim(false);
         while (_running)
         {
             byte[] frame;
@@ -281,25 +335,50 @@ public sealed class SocketTransport : ITransport, IDisposable
                 return;
             }
 
-            lock (_gate)
+            // The frame stays here until it is written or the peer is disabled.
+            // A connect refusal, a reset, or a timed-out handshake must not drop it:
+            // nothing else will resend a frame that Raft already handed off.
+            while (_running && !TrySend(peer, frame))
             {
-                if (_disabled.Contains(peer))
+                if (IsDisabled(peer))
                 {
-                    continue;
+                    break;
                 }
+
+                DropOutbound(peer);
+                pause.Wait(5);
+            }
+        }
+    }
+
+    private bool TrySend(string peer, byte[] frame)
+    {
+        try
+        {
+            if (IsDisabled(peer))
+            {
+                return true;
             }
 
-            try
-            {
-                TcpClient client = EnsureOutbound(peer);
-                NetworkStream stream = client.GetStream();
-                stream.Write(frame);
-                stream.Flush();
-            }
-            catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
-            {
-                DropOutbound(peer);
-            }
+            TcpClient client = EnsureOutbound(peer);
+            NetworkStream stream = client.GetStream();
+            stream.Write(frame);
+            stream.Flush();
+            return true;
+        }
+        catch (Exception)
+        {
+            // Any send failure, including a connect abort, leaves the writer alive.
+            DropOutbound(peer);
+            return false;
+        }
+    }
+
+    private bool IsDisabled(string peer)
+    {
+        lock (_gate)
+        {
+            return _disabled.Contains(peer);
         }
     }
 
@@ -319,9 +398,14 @@ public sealed class SocketTransport : ITransport, IDisposable
         IPEndPoint address;
         lock (_gate)
         {
-            if (_outbound.TryGetValue(peerId, out TcpClient? existing) && existing.Connected)
+            if (_outbound.TryGetValue(peerId, out TcpClient? existing) && IsLive(existing))
             {
                 return existing;
+            }
+
+            if (_outbound.Remove(peerId, out TcpClient? dead))
+            {
+                dead.Dispose();
             }
 
             if (!_peers.TryGetValue(peerId, out IPEndPoint? found))
@@ -332,8 +416,12 @@ public sealed class SocketTransport : ITransport, IDisposable
             address = found;
         }
 
-        var socket = new TcpClient();
-        socket.Connect(address);
+        if (Volatile.Read(ref _failConnects) > 0 && Interlocked.Decrement(ref _failConnects) >= 0)
+        {
+            throw new SocketException(10061);
+        }
+
+        TcpClient socket = ConnectWithin(address, TimeSpan.FromMilliseconds(IoBudgetMillis));
         lock (_gate)
         {
             if (_disabled.Contains(peerId))
@@ -355,6 +443,45 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             _outbound[peerId] = socket;
             return socket;
+        }
+    }
+
+    private static TcpClient ConnectWithin(IPEndPoint address, TimeSpan budget)
+    {
+        var client = new TcpClient();
+        try
+        {
+            Socket raw = client.Client;
+            raw.NoDelay = true;
+            raw.SendTimeout = IoBudgetMillis;
+            using var timeout = new CancellationTokenSource(budget);
+            client.ConnectAsync(address, timeout.Token).AsTask().GetAwaiter().GetResult();
+            raw.NoDelay = true;
+            raw.SendTimeout = IoBudgetMillis;
+            return client;
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
+    }
+
+    private static bool IsLive(TcpClient client)
+    {
+        try
+        {
+            if (!client.Connected)
+            {
+                return false;
+            }
+
+            Socket socket = client.Client;
+            return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 

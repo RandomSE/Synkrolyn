@@ -454,8 +454,17 @@ public class Phase3RobustnessTests
         raw.Connect(IPAddress.Loopback, transport.LocalPort);
         raw.ReceiveTimeout = 1000;
         transport.Dispose();
-        int read = raw.GetStream().Read(new byte[8]);
-        Assert.Equal(0, read);
+        try
+        {
+            int read = raw.GetStream().Read(new byte[8]);
+            Assert.Equal(0, read);
+        }
+        catch (IOException ex) when (ex.InnerException is SocketException socket)
+        {
+            // Stop resets a handshake that has not been accepted yet (10054).
+            // A timeout means Dispose left the socket open.
+            Assert.NotEqual(SocketError.TimedOut, socket.SocketErrorCode);
+        }
     }
 
     private sealed class BlockingMachine : IStateMachine
