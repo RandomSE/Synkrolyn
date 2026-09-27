@@ -128,9 +128,10 @@ public sealed class MembershipChangeTests : IDisposable
         Assert.True(File.Exists(Path.Combine(dir, FilePersistentState.ConfigFileName)));
         _cluster.Harness.Node("n1").Snapshot();
 
+        state.Dispose();
+        log.Dispose();
         var restored = new InMemoryKvStore();
         var state2 = new FilePersistentState(dir);
-        log.Dispose();
         var log2 = new FileRaftLog(dir);
         _cluster.Harness.ReplaceNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat, restored, state2, log2);
         Assert.Contains("n4", _cluster.Harness.Node("n1").LearnerPeerIds);
@@ -256,9 +257,8 @@ public sealed class JointConsensusTests : IDisposable
         Assert.True(_cluster.Harness.Node("n1").CommitIndex < jointIndex);
 
         _cluster.Harness.Isolate("n1");
-        _cluster.Harness.Heal("n2");
-        _cluster.Harness.Heal("n3");
-        _cluster.Harness.StartElections("n2");
+        _cluster.Harness.Transport.HealBidirectional("n2", "n3");
+        _cluster.Harness.Advance(400);
         Assert.Equal(Role.Leader, _cluster.Harness.Node("n2").Role);
         _cluster.Clients["n2"] = new KvClient(_cluster.Harness.Node("n2"), _cluster.Stores["n2"]);
         _cluster.Clients["n2"].Put("fresh", "ok");
@@ -328,9 +328,10 @@ public sealed class JointConsensusTests : IDisposable
         Assert.True(_cluster.Harness.Node("n1").InJointConsensus);
         _cluster.Harness.Node("n1").Snapshot();
 
+        state.Dispose();
+        log.Dispose();
         var restored = new InMemoryKvStore();
         var state2 = new FilePersistentState(dir);
-        log.Dispose();
         var log2 = new FileRaftLog(dir);
         _cluster.Harness.ReplaceNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat, restored, state2, log2);
         Assert.True(_cluster.Harness.Node("n1").InJointConsensus);

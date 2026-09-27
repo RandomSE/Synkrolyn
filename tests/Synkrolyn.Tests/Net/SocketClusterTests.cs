@@ -28,12 +28,9 @@ public sealed class SocketClusterTests
     [Fact]
     public void ConnectFailuresAndReset_originalPutStillCommits()
     {
-        // One second, not the 120 ms fixture. A refused connect is retried in
-        // well under a second; a connect that blocks for the OS timeout still
-        // misses the 12 s commit deadline. ThreeNodeTcp keeps 120/350/600 ms.
         using var cluster = SocketCluster.Start(
             ["n1", "n2", "n3"],
-            [TimeSpan.FromMilliseconds(1000), TimeSpan.FromMilliseconds(1500), TimeSpan.FromMilliseconds(2000)],
+            SocketCluster.ElectionTimeouts,
             TimeSpan.FromMilliseconds(40));
         WaitUntil("exactly one leader", () => cluster.Leaders().Count == 1);
         Assert.Single(cluster.Leaders());
@@ -112,8 +109,11 @@ internal sealed class SocketCluster : IDisposable
 
     public List<SocketNode> Leaders() => Nodes.Where(node => node.Node.Role == Role.Leader).ToList();
 
+    /// <summary>Election timeouts for the three-node socket fixture. Host ships 150 ms.</summary>
+    public static readonly TimeSpan[] ElectionTimeouts = [TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(350), TimeSpan.FromMilliseconds(600)];
+
     public static SocketCluster Start() =>
-        Start(["n1", "n2", "n3"], [TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(350), TimeSpan.FromMilliseconds(600)], TimeSpan.FromMilliseconds(40));
+        Start(["n1", "n2", "n3"], ElectionTimeouts, TimeSpan.FromMilliseconds(40));
 
     public static SocketCluster Start(string[] ids, TimeSpan[] elections, TimeSpan heartbeat)
     {

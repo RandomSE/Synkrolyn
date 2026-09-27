@@ -228,7 +228,11 @@ public sealed class DurableRestartTests : IDisposable
         Assert.Equal(0, _cluster.Node("n1").CommitIndex);
         Assert.Null(_clients["n1"].Get("k"));
 
-        _cluster.Advance(80);
+        for (int i = 0; i < 40 && _cluster.Leaders().Count == 0; i++)
+        {
+            _cluster.Advance(10);
+        }
+
         Assert.Single(_cluster.Leaders());
         string leaderId = _cluster.Leaders()[0].NodeId;
         _clients[leaderId].Put("k2", "v2");
@@ -363,7 +367,12 @@ public sealed class DurableRestartTests : IDisposable
 
     private void Restart(string id, IEnumerable<string> peers, TimeSpan election)
     {
-        if (_cluster!.Log(id) is IDisposable openLog)
+        if (_cluster!.State(id) is IDisposable openState)
+        {
+            openState.Dispose();
+        }
+
+        if (_cluster.Log(id) is IDisposable openLog)
         {
             openLog.Dispose();
         }

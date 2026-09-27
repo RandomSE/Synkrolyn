@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Synkrolyn.Raft;
 
 namespace Synkrolyn.Net;
@@ -62,8 +63,12 @@ public sealed class InMemoryTransport : ITransport
         }
 
         RequireRegistered(sender);
-        RequireRegistered(recipient);
         ArgumentNullException.ThrowIfNull(payload);
+        if (!_handlers.ContainsKey(recipient))
+        {
+            Trace.WriteLine("drop send to unknown node id: " + recipient);
+            return;
+        }
         if (IsPartitioned(sender, recipient) || ConsumeDrop(sender, recipient))
         {
             return;
@@ -229,6 +234,9 @@ public sealed class InMemoryTransport : ITransport
 
         return extra;
     }
+
+    /// <inheritdoc />
+    public bool HasPeer(string nodeId) => _handlers.ContainsKey(nodeId);
 
     private bool IsPartitioned(string a, string b) => _partitions.Contains(Partition.Of(a, b));
 

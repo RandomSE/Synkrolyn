@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -175,6 +176,15 @@ public sealed class SocketTransport : ITransport, IDisposable
     }
 
     /// <inheritdoc />
+    public bool HasPeer(string nodeId)
+    {
+        lock (_gate)
+        {
+            return _peers.ContainsKey(nodeId);
+        }
+    }
+
+    /// <inheritdoc />
     public void Send(string sender, string recipient, object payload)
     {
         if (sender != _nodeId)
@@ -186,7 +196,8 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             if (!_peers.ContainsKey(recipient))
             {
-                throw new ArgumentException("unknown node id: " + recipient);
+                Trace.WriteLine("drop send to unknown node id: " + recipient);
+                return;
             }
 
             if (_disabled.Contains(recipient))

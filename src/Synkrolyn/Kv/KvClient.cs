@@ -14,6 +14,8 @@ public sealed class KvClient
     private long _nextSerial;
     private long? _pendingIndex;
     private RaftNode.ApplyWaiter? _applyWaiter;
+    private long _readTicket;
+    private bool _readTicketOpen;
 
     /// <summary>Creates a client without exactly-once serials.</summary>
     public KvClient(RaftNode raft, IKvStore store)
@@ -70,12 +72,36 @@ public sealed class KvClient
             return _store.Get(key);
         }
 
-        if (_raft.BeginReadIndex() is null)
+        if (_readTicketOpen)
+        {
+            if (_raft.ReadIndexSatisfied(_readTicket))
+            {
+                _readTicketOpen = false;
+                return _store.Get(key);
+            }
+
+            if (_raft.ReadTicketPending(_readTicket) && _raft.Role == Role.Leader)
+            {
+                return null;
+            }
+
+            _readTicketOpen = false;
+        }
+
+        if (_raft.Role != Role.Leader || _raft.BeginReadIndex() is null)
         {
             return null;
         }
 
-        return _raft.ReadIndexSatisfied(_raft.CurrentReadTicket) ? _store.Get(key) : null;
+        _readTicket = _raft.CurrentReadTicket;
+        _readTicketOpen = true;
+        if (_raft.ReadIndexSatisfied(_readTicket))
+        {
+            _readTicketOpen = false;
+            return _store.Get(key);
+        }
+
+        return null;
     }
 
     /// <summary>Bounded-stale lease read. Not linearizable.</summary>

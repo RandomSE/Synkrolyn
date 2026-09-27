@@ -22,7 +22,7 @@ Unit tests advance `FakeClock`, which is compiled into the test assembly. `Clust
 
 ## Sockets
 
-`SocketClusterTests` polls with `Thread.Yield` until a deadline. That is wall-clock integration, not a FakeClock unit test. The FakeClock suite is the safety gate. Election timeouts in that fixture stay 120/350/600 ms. A refused connect, a peer that starts listening after the first send, or a reset connection must still deliver the frame that was already queued: `SocketDeliveryTests`. `ConnectFailuresAndReset_originalPutStillCommits` is the same rule for a cluster commit.
+`SocketClusterTests` polls with `Thread.Yield` until a deadline. That is wall-clock integration, not a FakeClock unit test. The FakeClock suite is the safety gate. `ThreeNodeTcp_electsExactlyOneLeader_andPutReplicates` and `ConnectFailuresAndReset_originalPutStillCommits` both use 120/350/600 ms. A refused connect, a peer that starts listening after the first send, or a reset connection must still deliver the frame that was already queued: `SocketDeliveryTests`.
 
 ## TLA+
 

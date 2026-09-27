@@ -334,7 +334,7 @@ public sealed class ReadIndexTests
         cluster.Harness.Advance(20);
         Assert.Equal("v", cluster.Clients["n2"].BoundedStaleGet("k"));
         cluster.Harness.Isolate("n2");
-        cluster.Harness.Advance(RaftNode.PreVoteLeaderLeaseFactor * 20);
+        cluster.Harness.Advance(400);
         Assert.Equal(Role.Follower, cluster.Harness.Node("n2").Role);
         Assert.False(cluster.Harness.Node("n2").FollowerReadLeaseValid);
         Assert.Null(cluster.Clients["n2"].BoundedStaleGet("k"));

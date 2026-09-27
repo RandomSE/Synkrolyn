@@ -92,7 +92,7 @@ public class Phase3RobustnessTests
     }
 
     [Fact]
-    public void Finding6_mailboxOverflow_failStops()
+    public void Finding6_mailboxOverflow_dropsInboundRpc()
     {
         var cluster = new ClusterHarness();
         RaftNode node = cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
@@ -103,7 +103,9 @@ public class Phase3RobustnessTests
             node.Receive(new Envelope("n2", "n1", noise));
         }
 
-        Assert.True(node.Fatal);
+        Assert.False(node.Fatal);
+        node.Drain();
+        Assert.False(node.Fatal);
     }
 
     [Fact]
@@ -327,17 +329,17 @@ public class Phase3RobustnessTests
     public void Finding16_unackedHeartbeats_doNotGrowSendTimesWithoutBound()
     {
         var cluster = new ClusterHarness();
-        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(150), Heartbeat);
         cluster.AddNode("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
         cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
-        cluster.Advance(10_000);
+        cluster.Advance(150);
         cluster.Transport.PartitionBidirectional("n1", "n3");
-        for (int i = 0; i < 80; i++)
+        for (int i = 0; i < 40; i++)
         {
             cluster.Advance(20);
         }
 
-        Assert.InRange(cluster.Node("n1").PendingAeStampCount("n3"), 0, 32);
+        Assert.InRange(cluster.Node("n1").PendingAeStampCount("n3"), 1, 12);
     }
 
     [Fact]

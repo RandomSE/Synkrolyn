@@ -293,16 +293,62 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     /// <inheritdoc />
     public void CompactThrough(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot)
     {
+        StagedCompaction staged = StageCompaction(lastIncludedIndex, lastIncludedTerm, snapshot);
+        staged.Write();
+        staged.Commit();
+    }
+
+    /// <inheritdoc />
+    public StagedCompaction StageCompaction(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot)
+    {
         lock (this)
         {
             EnsureOpen();
             List<LogEntry> kept = CopyVisible();
             LogCompaction.Apply(kept, _lastIncludedIndex, lastIncludedIndex, lastIncludedTerm, snapshot);
-            _lastIncludedIndex = lastIncludedIndex;
-            _lastIncludedTerm = lastIncludedTerm;
-            _snapshot = (byte[])snapshot.Clone();
-            PersistSnapshot();
-            PersistEntries(kept);
+            var job = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), kept, _dir);
+            return new StagedCompaction(() => job.Write(), () => CommitJob(job));
+        }
+    }
+
+    private void CommitJob(CompactJob job)
+    {
+        lock (this)
+        {
+            if (_closed || job.Index <= _lastIncludedIndex)
+            {
+                job.DeleteTemps();
+                return;
+            }
+
+            List<LogEntry> current = CopyVisible();
+            LogCompaction.Apply(current, _lastIncludedIndex, job.Index, job.Term, job.Snapshot);
+            if (!job.Written)
+            {
+                job.Write();
+            }
+
+            if (!job.MatchesPrefix(current))
+            {
+                job.RewriteEntries(current);
+            }
+            else if (current.Count > job.Kept.Count)
+            {
+                job.AppendTail(current);
+            }
+
+            job.Publish(
+                ref _channel,
+                ref _forcedOffsets,
+                ref _forcedCount,
+                ref _forcedBaseIndex,
+                ref _forcedLastTerm,
+                _snapshotFile,
+                _file);
+            _lastIncludedIndex = job.Index;
+            _lastIncludedTerm = job.Term;
+            _snapshot = job.Snapshot;
+            ClearPending();
         }
     }
 
@@ -411,51 +457,19 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         _snapshot = payload.AsSpan(16).ToArray();
     }
 
-    private static void WriteRecords(Stream channel, byte[] payload)
-    {
-        int offset = 0;
-        do
-        {
-            int length = Math.Min(ChecksummedRecords.MaxPayloadBytes, payload.Length - offset);
-            byte[] slice = payload.AsSpan(offset, length).ToArray();
-            byte[] framed = ChecksummedRecords.Frame(slice);
-            channel.Write(framed);
-            offset += length;
-        }
-        while (offset < payload.Length);
-    }
+    private static void WriteRecords(Stream channel, byte[] payload) =>
+        ChecksummedRecords.WriteRecords(channel, payload);
 
     private static byte[] ReadRecords(byte[] framed)
     {
-        var payload = new List<byte>(framed.Length);
-        int pos = 0;
-        while (pos < framed.Length)
+        try
         {
-            if (framed.Length - pos < 8)
-            {
-                throw new InvalidOperationException("incomplete or corrupt snapshot file");
-            }
-
-            int length = BinaryPrimitives.ReadInt32BigEndian(framed.AsSpan(pos));
-            int record = 4 + length + 4;
-            if (length < 0 || pos + record > framed.Length)
-            {
-                throw new InvalidOperationException("incomplete or corrupt snapshot file");
-            }
-
-            try
-            {
-                payload.AddRange(ChecksummedRecords.Unframe(framed.AsSpan(pos, record).ToArray()));
-            }
-            catch (InvalidOperationException ex)
-            {
-                throw new InvalidOperationException("incomplete or corrupt snapshot file", ex);
-            }
-
-            pos += record;
+            return ChecksummedRecords.ReadRecords(framed);
         }
-
-        return payload.ToArray();
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidOperationException("incomplete or corrupt snapshot file", ex);
+        }
     }
 
     private void PersistSnapshot()
@@ -744,6 +758,159 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         if (_closed)
         {
             throw new InvalidOperationException("FileRaftLog is closed");
+        }
+    }
+
+    private sealed class CompactJob
+    {
+        private readonly string _snapshotTmp;
+        private readonly string _entriesTmp;
+        private long[] _offsets = new long[8];
+        private int _count;
+        private long _base;
+        private long _lastTerm;
+        private bool _written;
+
+        public CompactJob(long index, long term, byte[] snapshot, List<LogEntry> kept, string directory)
+        {
+            Index = index;
+            Term = term;
+            Snapshot = snapshot;
+            Kept = kept;
+            string token = Guid.NewGuid().ToString("N");
+            _snapshotTmp = Path.Combine(directory, SnapshotFileName + ".cmp-" + token);
+            _entriesTmp = Path.Combine(directory, FileName + ".cmp-" + token);
+        }
+
+        public long Index { get; }
+
+        public long Term { get; }
+
+        public byte[] Snapshot { get; }
+
+        public List<LogEntry> Kept { get; }
+
+        public bool Written => _written;
+
+        public void Write()
+        {
+            WriteSnapshotFile();
+            WriteEntries(Kept, append: false);
+            _written = true;
+        }
+
+        public bool MatchesPrefix(List<LogEntry> current)
+        {
+            if (current.Count < Kept.Count)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < Kept.Count; i++)
+            {
+                if (current[i].Index != Kept[i].Index || current[i].Term != Kept[i].Term)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public void AppendTail(List<LogEntry> current)
+        {
+            var tail = new List<LogEntry>();
+            for (int i = Kept.Count; i < current.Count; i++)
+            {
+                tail.Add(current[i]);
+            }
+
+            WriteEntries(tail, append: true);
+        }
+
+        public void RewriteEntries(List<LogEntry> current)
+        {
+            _count = 0;
+            _offsets = new long[Math.Max(8, current.Count)];
+            WriteEntries(current, append: false);
+        }
+
+        public void Publish(
+            ref FileStream? channel,
+            ref long[] forcedOffsets,
+            ref int forcedCount,
+            ref long forcedBaseIndex,
+            ref long forcedLastTerm,
+            string snapshotFile,
+            string logFile)
+        {
+            channel?.Dispose();
+            channel = null;
+            FilePersistentState.Replace(_snapshotTmp, snapshotFile);
+            FilePersistentState.Replace(_entriesTmp, logFile);
+            channel = new FileStream(logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+            channel.Position = channel.Length;
+            forcedOffsets = _offsets;
+            forcedCount = _count;
+            forcedBaseIndex = _base;
+            forcedLastTerm = _lastTerm;
+        }
+
+        public void DeleteTemps()
+        {
+            if (File.Exists(_snapshotTmp))
+            {
+                File.Delete(_snapshotTmp);
+            }
+
+            if (File.Exists(_entriesTmp))
+            {
+                File.Delete(_entriesTmp);
+            }
+        }
+
+        private void WriteSnapshotFile()
+        {
+            byte[] payload = new byte[16 + Snapshot.Length];
+            BinaryPrimitives.WriteInt64BigEndian(payload, Index);
+            BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(8), Term);
+            Snapshot.CopyTo(payload.AsSpan(16));
+            using var channel = new FileStream(_snapshotTmp, FileMode.Create, FileAccess.Write, FileShare.None);
+            WriteRecords(channel, payload);
+            channel.Flush(flushToDisk: true);
+        }
+
+        private void WriteEntries(List<LogEntry> entries, bool append)
+        {
+            if (!append)
+            {
+                _count = 0;
+                _base = entries.Count == 0 ? 0 : entries[0].Index;
+                _lastTerm = entries.Count == 0 ? Term : entries[^1].Term;
+                _offsets = new long[Math.Max(8, entries.Count)];
+            }
+            else if (entries.Count > 0)
+            {
+                _lastTerm = entries[^1].Term;
+            }
+
+            var mode = append ? FileMode.Append : FileMode.Create;
+            using var channel = new FileStream(_entriesTmp, mode, FileAccess.Write, FileShare.None);
+            long pos = append ? channel.Length : 0;
+            foreach (LogEntry entry in entries)
+            {
+                byte[] framed = ChecksummedRecords.Frame(Encode(entry));
+                channel.Write(framed);
+                if (_count == _offsets.Length)
+                {
+                    Array.Resize(ref _offsets, _offsets.Length * 2);
+                }
+
+                _offsets[_count++] = pos;
+                pos += framed.Length;
+            }
+
+            channel.Flush(flushToDisk: true);
         }
     }
 }

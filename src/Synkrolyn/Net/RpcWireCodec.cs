@@ -36,6 +36,7 @@ public sealed class RpcWireCodec : IMessageCodec
                 writer.PutLong(vote.LastLogTerm);
                 writer.PutBool(vote.PreVote);
                 writer.PutLong(vote.Round);
+                writer.PutBool(vote.LeadershipTransfer);
                 break;
             case RequestVoteResponse voteResponse:
                 writer.PutByte(RequestVoteResponseTag);
@@ -70,6 +71,7 @@ public sealed class RpcWireCodec : IMessageCodec
                 writer.PutLong(appendResponse.XTerm);
                 writer.PutLong(appendResponse.XIndex);
                 writer.PutLong(appendResponse.Stamp);
+                writer.PutLong(appendResponse.PrevLogIndex);
                 break;
             case InstallSnapshot snapshot:
                 writer.PutByte(InstallSnapshotTag);
@@ -88,6 +90,7 @@ public sealed class RpcWireCodec : IMessageCodec
                 writer.PutBool(snapshotResponse.Done);
                 writer.PutLong(snapshotResponse.InstalledIndex);
                 writer.PutLong(snapshotResponse.InstalledTerm);
+                writer.PutLong(snapshotResponse.NextOffset);
                 break;
             case TimeoutNow timeout:
                 writer.PutByte(TimeoutNowTag);
@@ -110,15 +113,27 @@ public sealed class RpcWireCodec : IMessageCodec
         byte type = reader.ReadByte();
         object rpc = type switch
         {
-            RequestVoteTag => new RequestVote(reader.ReadLong(), reader.ReadString(), reader.ReadLong(), reader.ReadLong(), reader.ReadBool(), reader.ReadLong()),
+            RequestVoteTag => new RequestVote(
+                reader.ReadLong(),
+                reader.ReadString(),
+                reader.ReadLong(),
+                reader.ReadLong(),
+                reader.ReadBool(),
+                reader.ReadLong(),
+                reader.ReadBool()),
             RequestVoteResponseTag => new RequestVoteResponse(reader.ReadLong(), reader.ReadBool(), reader.ReadBool(), reader.ReadLong()),
             AppendEntriesTag => ReadAppendEntries(reader),
             AppendEntriesResponseTag => new AppendEntriesResponse(
-                reader.ReadLong(), reader.ReadBool(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong()),
+                reader.ReadLong(), reader.ReadBool(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong()),
             InstallSnapshotTag => new InstallSnapshot(
                 reader.ReadLong(), reader.ReadString(), reader.ReadLong(), reader.ReadLong(), reader.ReadLong(), reader.ReadBytes(), reader.ReadBool()),
             InstallSnapshotResponseTag => new InstallSnapshotResponse(
-                reader.ReadLong(), reader.ReadBool(), reader.ReadBool(), reader.ReadLong(), reader.ReadLong()),
+                reader.ReadLong(),
+                reader.ReadBool(),
+                reader.ReadBool(),
+                reader.ReadLong(),
+                reader.ReadLong(),
+                reader.ReadLong()),
             TimeoutNowTag => new TimeoutNow(reader.ReadLong(), reader.ReadString()),
             _ => throw new ArgumentException("unknown RPC type tag: " + type),
         };

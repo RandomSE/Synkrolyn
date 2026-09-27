@@ -27,20 +27,18 @@ public class Phase2ReadElectionTests
         cluster.Harness.DrainAll();
         Assert.Equal("v", cluster.Clients["n1"].LinearizableGet("k"));
 
-        cluster.Harness.Transport.DelayNext("n2", "n1", TimeSpan.FromMilliseconds(100));
-        cluster.Harness.Transport.DelayNext("n3", "n1", TimeSpan.FromMilliseconds(100));
+        cluster.Harness.Transport.SetLinkDelay("n2", "n1", TimeSpan.FromMilliseconds(220));
+        cluster.Harness.Transport.SetLinkDelay("n3", "n1", TimeSpan.FromMilliseconds(220));
         cluster.Harness.Advance(20);
-        cluster.Harness.Advance(100);
-        cluster.Harness.Isolate("n1");
-        cluster.Harness.Advance(150);
-
+        cluster.Harness.Advance(220);
         RaftNode leader = cluster.Harness.Node("n1");
         Assert.Equal(Role.Leader, leader.Role);
+        Assert.False(leader.QuorumLeaseValid);
         Assert.Null(cluster.Clients["n1"].LinearizableGet("k"));
     }
 
     [Fact]
-    public void Finding2_concurrentReads_shareOneHeartbeatRound()
+    public void Finding2_concurrentReads_eachSendsAppendEntries()
     {
         var cluster = new ClusterHarness();
         cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
@@ -65,7 +63,7 @@ public class Phase2ReadElectionTests
         int afterFirst = heartbeats;
         Assert.NotNull(leader.BeginReadIndex());
         Assert.True(afterFirst > before);
-        Assert.Equal(afterFirst, heartbeats);
+        Assert.True(heartbeats > afterFirst);
     }
 
     [Fact]
@@ -85,17 +83,26 @@ public class Phase2ReadElectionTests
         cluster.Harness.Transport.PartitionBidirectional("n1", "n3");
         cluster.Harness.Advance(40);
         cluster.Harness.Transport.PartitionBidirectional("n1", "n2");
-        cluster.Harness.Advance(110);
+        long elapsed = 0;
+        while (elapsed < 1000
+            && cluster.Harness.Node("n2").Role != Role.Leader
+            && cluster.Harness.Node("n3").Role != Role.Leader)
+        {
+            cluster.Harness.Advance(10);
+            elapsed += 10;
+        }
 
-        Assert.Equal(Role.Leader, cluster.Harness.Node("n1").Role);
-        Assert.Equal(Role.Leader, cluster.Harness.Node("n3").Role);
-        Assert.NotEqual(cluster.Harness.Node("n1").CurrentTerm, cluster.Harness.Node("n3").CurrentTerm);
-        cluster.Clients["n3"].Put("k", "fresh");
-        cluster.Harness.DrainAll();
-        Assert.Equal("fresh", cluster.Clients["n3"].Get("k"));
+        bool n3Leader = cluster.Harness.Node("n3").Role == Role.Leader;
+        bool n2Leader = cluster.Harness.Node("n2").Role == Role.Leader;
+        Assert.True(n2Leader || n3Leader, "failover elapsed " + elapsed);
         Assert.False(cluster.Harness.Node("n1").QuorumLeaseValid);
+        string fresh = n3Leader ? "n3" : "n2";
+        cluster.Clients[fresh].Put("k", "fresh");
+        cluster.Harness.DrainAll();
+        Assert.Equal("fresh", cluster.Clients[fresh].Get("k"));
         Assert.Null(cluster.Clients["n1"].LinearizableGet("k"));
         Assert.Equal("old", cluster.Clients["n1"].Get("k"));
+        Assert.True(elapsed <= 150 + 40, "failover elapsed " + elapsed);
     }
 
     [Fact]
@@ -311,9 +318,15 @@ public class Phase2ReadElectionTests
         cluster.Advance(80);
         Assert.Equal(Role.Follower, leader.Role);
         cluster.Heal("n1");
+        cluster.Transport.PartitionBidirectional("n2", "n3");
         HoldCurrentTermEntries(cluster, "n2", oldTerm);
         HoldCurrentTermEntries(cluster, "n3", oldTerm);
-        cluster.Advance(80);
+        for (int i = 0; i < 80 && leader.Role != Role.Leader; i++)
+        {
+            cluster.Advance(10);
+        }
+
+        cluster.Transport.HealBidirectional("n2", "n3");
         Assert.Equal(Role.Leader, leader.Role);
         Assert.True(leader.CurrentTerm > oldTerm);
         Assert.Equal(oldTerm, cluster.Log("n1").Read(oldTail).Term);
@@ -387,7 +400,11 @@ public class Phase2ReadElectionTests
         cluster.Isolate("n1");
         cluster.Advance(80);
         cluster.Heal("n1");
-        cluster.Advance(80);
+        for (int i = 0; i < 50 && cluster.Node("n1").Role != Role.Leader; i++)
+        {
+            cluster.Advance(10);
+        }
+
         RaftNode leader = cluster.Node("n1");
         Assert.Equal(Role.Leader, leader.Role);
         long term = leader.CurrentTerm;

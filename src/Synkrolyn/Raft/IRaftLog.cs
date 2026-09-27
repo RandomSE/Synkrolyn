@@ -42,6 +42,40 @@ public interface IRaftLog
     /// <summary>Compacts through <paramref name="lastIncludedIndex"/>, keeping a contiguous suffix.</summary>
     void CompactThrough(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot);
 
+    /// <summary>
+    /// Copies the suffix at <paramref name="lastIncludedIndex"/>. <see cref="StagedCompaction.Write"/>
+    /// runs off the Raft thread. <see cref="StagedCompaction.Commit"/> publishes the result on it.
+    /// </summary>
+    StagedCompaction StageCompaction(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot)
+    {
+        long index = lastIncludedIndex;
+        long term = lastIncludedTerm;
+        byte[] bytes = snapshot;
+        return new StagedCompaction(
+            static () => { },
+            () => CompactThrough(index, term, bytes));
+    }
+
     /// <summary>Durability barrier. File logs share one fsync across the pending batch.</summary>
     void Force();
+}
+
+/// <summary>Compaction whose file write is separate from the in-memory swap.</summary>
+public sealed class StagedCompaction
+{
+    private readonly Action _write;
+    private readonly Action _commit;
+
+    /// <summary>Creates a compaction. <paramref name="write"/> performs the slow IO.</summary>
+    public StagedCompaction(Action write, Action commit)
+    {
+        _write = write ?? throw new ArgumentNullException(nameof(write));
+        _commit = commit ?? throw new ArgumentNullException(nameof(commit));
+    }
+
+    /// <summary>Writes the staged bytes. Safe to call off the Raft thread.</summary>
+    public void Write() => _write();
+
+    /// <summary>Publishes the staged compaction. Called on the Raft thread.</summary>
+    public void Commit() => _commit();
 }

@@ -133,32 +133,31 @@ public class ThesisSafetyTests
         cluster.Isolate("b");
 
         Assert.NotNull(cluster.Node("a").PromoteVoter("d"));
+        cluster.DrainAll();
         long? removed = cluster.Node("a").RemoveServer("c");
-        if (removed is not null)
+        Assert.NotNull(removed);
+        for (int i = 0; i < 8; i++)
         {
-            for (int i = 0; i < 8; i++)
-            {
-                cluster.Transport.DropNext("a", "c");
-            }
+            cluster.Transport.DropNext("a", "c");
+        }
 
+        cluster.DrainAll();
+        cluster.Transport.PartitionBidirectional("a", "c");
+        cluster.Transport.PartitionBidirectional("d", "c");
+        cluster.Transport.PartitionBidirectional("d", "b");
+        cluster.Transport.HealBidirectional("b", "c");
+        cluster.Node("c").StartElection();
+        cluster.DrainAll();
+        if (cluster.Node("c").Role == Role.Leader)
+        {
+            cluster.Node("c").Propose("from-c"u8.ToArray());
             cluster.DrainAll();
-            cluster.Transport.PartitionBidirectional("a", "c");
-            cluster.Transport.PartitionBidirectional("d", "c");
-            cluster.Transport.PartitionBidirectional("d", "b");
-            cluster.Transport.HealBidirectional("b", "c");
-            cluster.Node("c").StartElection();
-            cluster.DrainAll();
-            if (cluster.Node("c").Role == Role.Leader)
-            {
-                cluster.Node("c").Propose("from-c"u8.ToArray());
-                cluster.DrainAll();
-            }
+        }
 
-            if (cluster.Node("a").Role == Role.Leader)
-            {
-                cluster.Node("a").Propose("from-a"u8.ToArray());
-                cluster.DrainAll();
-            }
+        if (cluster.Node("a").Role == Role.Leader)
+        {
+            cluster.Node("a").Propose("from-a"u8.ToArray());
+            cluster.DrainAll();
         }
 
         long horizon = Math.Max(cluster.Log("a").LastIndex, cluster.Log("c").LastIndex);
@@ -273,7 +272,7 @@ public class ThesisSafetyTests
         cluster.Propose("n1", "two"u8.ToArray());
         long match = cluster.Node("n1").MatchIndex("n2");
         Assert.True(match >= 2);
-        var stale = new AppendEntriesResponse(cluster.Node("n1").CurrentTerm, false, 0, 1, 0, 1, 1);
+        var stale = new AppendEntriesResponse(cluster.Node("n1").CurrentTerm, false, 0, 1, 0, 1, 1, 1);
         cluster.Node("n1").Receive(new Envelope("n2", "n1", stale));
         cluster.Node("n1").Drain();
         Assert.True(cluster.Node("n1").NextIndex("n2") >= match + 1);

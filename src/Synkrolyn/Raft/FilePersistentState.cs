@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace Synkrolyn.Raft;
 
 /// <summary>
@@ -15,6 +17,7 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
     private readonly string _dir;
     private readonly string _file;
     private readonly string _configFile;
+    private readonly DataDirectoryLock _directoryLock;
     private long _currentTerm;
     private string? _votedFor;
     private byte[] _membership = [];
@@ -26,10 +29,19 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
         ArgumentNullException.ThrowIfNull(directory);
         _dir = directory;
         Directory.CreateDirectory(directory);
+        _directoryLock = DataDirectoryLock.Acquire(directory, FileName);
         _file = Path.Combine(directory, FileName);
         _configFile = Path.Combine(directory, ConfigFileName);
-        Load();
-        LoadMembership();
+        try
+        {
+            Load();
+            LoadMembership();
+        }
+        catch
+        {
+            _directoryLock.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -114,7 +126,16 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
     }
 
     /// <inheritdoc />
-    public void Dispose() => _closed = true;
+    public void Dispose()
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        _closed = true;
+        _directoryLock.Dispose();
+    }
 
     private void Load()
     {
@@ -223,12 +244,31 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
         Replace(tmp, dest);
     }
 
+    /// <summary>MOVEFILE_REPLACE_EXISTING.</summary>
+    private const uint MoveFileReplaceExisting = 0x1;
+
+    /// <summary>MOVEFILE_WRITE_THROUGH. The rename is flushed before MoveFileEx returns.</summary>
+    private const uint MoveFileWriteThrough = 0x8;
+
     /// <summary>Atomically replaces <paramref name="dest"/> with <paramref name="tmp"/>.</summary>
     public static void Replace(string tmp, string dest)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            if (!MoveFileEx(tmp, dest, MoveFileReplaceExisting | MoveFileWriteThrough))
+            {
+                throw new IOException("MoveFileEx failed: " + Marshal.GetLastWin32Error());
+            }
+
+            return;
+        }
+
         File.Move(tmp, dest, overwrite: true);
         SyncDirectory(dest);
     }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW")]
+    private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
 
     private static void SyncDirectory(string dest)
     {
