@@ -348,65 +348,127 @@ public sealed class SocketTransport : ITransport, IDisposable
     private void WriteLoop(string peer, Channel<byte[]> channel)
     {
         using var pause = new ManualResetEventSlim(false);
-        byte[]? inflight = null;
-        Task<bool>? queued = null;
-        while (_running)
+        using var watchStop = new ManualResetEventSlim(false);
+        var watch = new SendWatch();
+        var watchdog = new Thread(() => WatchStalledSend(watch, watchStop))
         {
-            // Write can return after the kernel has copied the bytes and before the
-            // peer's Read. DropInbound then discards them, IsLive still passed, and
-            // nothing else will resend a frame Raft already handed off. Hold the
-            // last frame and resend it when that socket dies, before any newer one.
-            if (inflight is not null && !OutboundLive(peer))
+            IsBackground = true,
+            Name = "synkrolyn-send-watch-" + _nodeId + "-" + peer,
+        };
+        watchdog.Start();
+        try
+        {
+            byte[]? inflight = null;
+            Task<bool>? queued = null;
+            while (_running)
             {
-                DropOutbound(peer);
-                pause.Wait(5);
-                inflight = SendUntil(peer, inflight, pause) ? inflight : null;
-                continue;
-            }
-
-            if (channel.Reader.TryRead(out byte[]? frame))
-            {
-                queued = null;
-                inflight = SendUntil(peer, frame, pause) ? frame : null;
-                continue;
-            }
-
-            if (inflight is null)
-            {
-                try
+                // Write can return after the kernel has copied the bytes and before the
+                // peer's Read. DropInbound then discards them, IsLive still passed, and
+                // nothing else will resend a frame Raft already handed off. Hold the
+                // last frame and resend it when that socket dies, before any newer one.
+                if (inflight is not null && !OutboundLive(peer))
                 {
-                    frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
-                }
-                catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
-                {
-                    return;
+                    DropOutbound(peer);
+                    pause.Wait(5);
+                    inflight = SendUntil(peer, inflight, pause, watch) ? inflight : null;
+                    continue;
                 }
 
-                inflight = SendUntil(peer, frame, pause) ? frame : null;
-                continue;
-            }
-
-            queued ??= channel.Reader.WaitToReadAsync().AsTask();
-            if (queued.IsCompleted)
-            {
-                if (!queued.IsCompletedSuccessfully || !queued.Result)
+                if (channel.Reader.TryRead(out byte[]? frame))
                 {
-                    return;
+                    queued = null;
+                    inflight = SendUntil(peer, frame, pause, watch) ? frame : null;
+                    continue;
                 }
 
-                queued = null;
-                continue;
-            }
+                if (inflight is null)
+                {
+                    try
+                    {
+                        frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
+                    {
+                        return;
+                    }
 
-            // Park until the next frame or a short probe. A frame that arrives
-            // during the wait is taken immediately; an idle writer does not spin.
-            queued.Wait(ProbeMillis);
+                    inflight = SendUntil(peer, frame, pause, watch) ? frame : null;
+                    continue;
+                }
+
+                queued ??= channel.Reader.WaitToReadAsync().AsTask();
+                if (queued.IsCompleted)
+                {
+                    if (!queued.IsCompletedSuccessfully || !queued.Result)
+                    {
+                        return;
+                    }
+
+                    queued = null;
+                    continue;
+                }
+
+                // Park until the next frame or a short probe. A frame that arrives
+                // during the wait is taken immediately; an idle writer does not spin.
+                queued.Wait(ProbeMillis);
+            }
+        }
+        finally
+        {
+            watch.Stop = true;
+            watchStop.Set();
+            watchdog.Join(1000);
         }
     }
 
-    private bool SendUntil(string peer, byte[] frame, ManualResetEventSlim pause)
+    /// <summary>
+    /// Closes a socket whose blocking send has not returned a chunk for
+    /// <see cref="SendStallMillis"/>. The wait is this thread's own event, so it
+    /// does not wake or consume the writer's retry pause.
+    /// </summary>
+    private static void WatchStalledSend(SendWatch watch, ManualResetEventSlim stop)
     {
-        while (_running && !TrySend(peer, frame))
+        while (!watch.Stop)
+        {
+            if (stop.Wait(200))
+            {
+                return;
+            }
+
+            Socket? socket = Volatile.Read(ref watch.Socket);
+            if (socket is null || watch.Stop)
+            {
+                continue;
+            }
+
+            long stamp = Interlocked.Read(ref watch.Stamp);
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(stamp).TotalMilliseconds < SendStallMillis)
+            {
+                continue;
+            }
+
+            // A chunk that finished while this thread was sampling moved the stamp.
+            // Closing then would drop a live reader.
+            if (!ReferenceEquals(Volatile.Read(ref watch.Socket), socket)
+                || Interlocked.Read(ref watch.Stamp) != stamp)
+            {
+                continue;
+            }
+
+            try
+            {
+                socket.Close();
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+            {
+                // The writer already dropped this socket.
+            }
+        }
+    }
+
+    private bool SendUntil(string peer, byte[] frame, ManualResetEventSlim pause, SendWatch watch)
+    {
+        while (_running && !TrySend(peer, frame, watch))
         {
             if (IsDisabled(peer))
             {
@@ -420,7 +482,7 @@ public sealed class SocketTransport : ITransport, IDisposable
         return _running && !IsDisabled(peer);
     }
 
-    private bool TrySend(string peer, byte[] frame)
+    private bool TrySend(string peer, byte[] frame, SendWatch watch)
     {
         try
         {
@@ -430,7 +492,7 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
 
             TcpClient client = EnsureOutbound(peer);
-            WriteFrame(client.Client, frame);
+            WriteFrame(client.Client, frame, watch);
             if (!OutboundLive(peer))
             {
                 // The peer reset while the bytes were only in the socket buffer.
@@ -620,13 +682,16 @@ public sealed class SocketTransport : ITransport, IDisposable
     internal static int ProbeEntered;
 
     /// <summary>
-    /// Writes <paramref name="frame"/> or throws. A blocking send timeout does not
-    /// fire on Windows, so this socket is non-blocking and the wait is ours. Any
-    /// progress restarts the stall clock. A peer that keeps reading finishes. A
-    /// peer that accepts nothing for <see cref="SendStallMillis"/> throws, and the
-    /// caller drops the socket and sends the whole frame again.
+    /// Writes <paramref name="frame"/> or throws. The socket is non-blocking for
+    /// the write: a blocking send copies into the kernel and returns while a tiny
+    /// window never delivers the tail, and on Windows that same call does not
+    /// return at all when the window is full. A would-block waits in
+    /// <see cref="Socket.Poll(int, SelectMode)"/>. No progress for
+    /// <see cref="SendStallMillis"/> throws. If the send call itself never
+    /// returns, <see cref="WatchStalledSend"/> closes the socket. The caller
+    /// sends the whole frame again.
     /// </summary>
-    private static void WriteFrame(Socket socket, byte[] frame)
+    private static void WriteFrame(Socket socket, byte[] frame, SendWatch watch)
     {
         // Assigning the current Blocking value is a no-op, so toggle first.
         socket.Blocking = true;
@@ -639,6 +704,8 @@ public sealed class SocketTransport : ITransport, IDisposable
             {
                 int sent = 0;
                 bool blocked = false;
+                Volatile.Write(ref watch.Socket, socket);
+                Interlocked.Exchange(ref watch.Stamp, System.Diagnostics.Stopwatch.GetTimestamp());
                 try
                 {
                     sent = socket.Send(frame, offset, frame.Length - offset, SocketFlags.None);
@@ -646,6 +713,12 @@ public sealed class SocketTransport : ITransport, IDisposable
                 catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
                 {
                     blocked = true;
+                }
+                finally
+                {
+                    // A poll wait is not a send that failed to return. Leave the
+                    // socket visible only while Send can be stuck inside the call.
+                    Volatile.Write(ref watch.Socket, null);
                 }
 
                 if (!blocked && sent == 0)
@@ -676,20 +749,27 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
         finally
         {
+            Volatile.Write(ref watch.Socket, null);
             try
             {
                 socket.Blocking = false;
                 socket.Blocking = true;
             }
-            catch (ObjectDisposedException)
-            {
-                // The peer socket was dropped while the write unwound.
-            }
-            catch (SocketException)
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
             {
                 // The peer socket was dropped while the write unwound.
             }
         }
+    }
+
+    /// <summary>The socket a writer is blocked in, and when that send last returned.</summary>
+    private sealed class SendWatch
+    {
+        public Socket? Socket;
+
+        public long Stamp = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        public volatile bool Stop;
     }
 
     private static bool IsLive(TcpClient client)

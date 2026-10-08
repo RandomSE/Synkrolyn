@@ -293,24 +293,45 @@ public class SocketDeliveryTests
         }
     }
 
-    /// <summary>Reads until the large append is found. A leading vote on a retry is skipped.</summary>
+    /// <summary>
+    /// Reads until the large append is found. One decoder stays for the whole
+    /// socket: a vote and the append can arrive in the same read, and dropping
+    /// the tail would decode the next bytes at the wrong offset.
+    /// </summary>
     private static byte[]? ReadAppend(TcpClient client, TimeSpan budget, byte[] command)
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
+        client.ReceiveTimeout = Math.Max(1, (int)budget.TotalMilliseconds);
+        var decoder = new FrameCodec.Decoder();
+        var codec = new RpcWireCodec();
+        byte[] buf = new byte[8192];
+        NetworkStream stream = client.GetStream();
         while (started.Elapsed < budget)
         {
-            FrameRead read = ReadOneFrame(client, budget - started.Elapsed);
-            if (read.Closed || read.Frame is null)
+            int n;
+            try
+            {
+                n = stream.Read(buf, 0, buf.Length);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (n <= 0)
             {
                 return null;
             }
 
-            if (new RpcWireCodec().Decode(read.Frame).Payload is AppendEntries append
-                && append.Entries.Count == 1
-                && append.Entries[0].Command.Length == command.Length
-                && append.Entries[0].Command[0] == command[0])
+            foreach (byte[] frame in decoder.Push(buf.AsSpan(0, n).ToArray()))
             {
-                return read.Frame;
+                if (codec.Decode(frame).Payload is AppendEntries append
+                    && append.Entries.Count == 1
+                    && append.Entries[0].Command.Length == command.Length
+                    && append.Entries[0].Command[0] == command[0])
+                {
+                    return frame;
+                }
             }
         }
 
