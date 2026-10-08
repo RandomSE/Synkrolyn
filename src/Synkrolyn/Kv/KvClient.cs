@@ -88,12 +88,12 @@ public sealed class KvClient
             _readTicketOpen = false;
         }
 
-        if (_raft.Role != Role.Leader || _raft.BeginReadIndex() is null)
+        if (_raft.Role != Role.Leader || _raft.BeginReadIndex() is not ReadIndexStart started)
         {
             return null;
         }
 
-        _readTicket = _raft.CurrentReadTicket;
+        _readTicket = started.Ticket;
         _readTicketOpen = true;
         if (_raft.ReadIndexSatisfied(_readTicket))
         {
@@ -138,16 +138,17 @@ public sealed class KvClient
             return null;
         }
 
-        if (_raft.Role != Role.Leader || _applyWaiter is { Failed: true })
-        {
-            _pendingIndex = null;
-            _applyWaiter = null;
-            return null;
-        }
-
         if (_applyWaiter is { Applied: true } || _raft.AwaitCommitted(_pendingIndex.Value))
         {
             return _pendingIndex;
+        }
+
+        // A step-down used to drop the index here. The entry can still commit
+        // after this node wins again. Truncation is what fails the waiter.
+        if (_applyWaiter is { Failed: true })
+        {
+            _pendingIndex = null;
+            _applyWaiter = null;
         }
 
         return null;

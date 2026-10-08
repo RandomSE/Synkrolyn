@@ -3,6 +3,9 @@ using Synkrolyn.Net;
 
 namespace Synkrolyn.Raft;
 
+/// <summary>One ReadIndex round: the commit index and the ticket that confirms it.</summary>
+public readonly record struct ReadIndexStart(long Index, long Ticket);
+
 /// <summary>
 /// Single-threaded Raft node. I/O only enqueues. One drain loop applies election,
 /// replication, snapshots, and membership. The leader counts itself toward commit
@@ -25,6 +28,9 @@ public sealed class RaftNode
 
     /// <summary>Largest command <see cref="Propose"/> will append. It has to fit in one AppendEntries frame.</summary>
     public const int MaxCommandBytes = MaxAppendEntriesBytes;
+
+    /// <summary>Unsatisfied ReadIndex rounds kept on a leader. Confirmed tickets are not capped.</summary>
+    public const int MaxUnsatisfiedReads = 64;
 
     /// <summary>Auto-snapshot is off unless <see cref="SnapshotThreshold"/> is set.</summary>
     public const int DefaultSnapshotThreshold = 0;
@@ -77,18 +83,22 @@ public sealed class RaftNode
     private bool _preCandidate;
     private bool _logNeedsForce;
     private bool _applyInFlight;
+    private bool _snapshotBusy;
     private bool _selfVoter = true;
     private bool _selfLearner;
     private bool _holdJoint;
     private string? _pendingTransferTo;
     private long _pendingTransferDeadline;
     private LeadershipTransferStatus _transferStatus = LeadershipTransferStatus.None;
+    private long _leaseIgnoreFromMillis = long.MinValue;
+    private long _leaseIgnoreUntilMillis = long.MinValue;
     private bool _transferCampaign;
     private Action<Action> _applyExecutor = static action => action();
     private Action<Action> _snapshotExecutor = static action => action();
     private byte[]? _lastDeltaFramed;
     private long _deltaBaseIndex;
     private long _lastLeaderContactMillis = long.MinValue;
+    private long _leaderAdvertisedLeaseMillis;
     private long _lastAcceptedLeaderCommit;
     private bool _lastPreVoteGranted;
     private Func<long, long> _electionJitter = static timeout => timeout;
@@ -392,11 +402,6 @@ public sealed class RaftNode
             }
 
             _started = true;
-            if (CurrentTermLocked() > 0 || _log.LastIndex > 0 || _log.LastIncludedIndex > 0)
-            {
-                _lastLeaderContactMillis = _clock.Millis;
-            }
-
             if (_log.LastIncludedIndex > 0)
             {
                 MembershipSnapshot.Decoded decoded = MembershipSnapshot.Decode(_log.SnapshotBytes());
@@ -643,11 +648,10 @@ public sealed class RaftNode
 
     /// <summary>Leader ReadIndex. Empty when not leader or no current-term commit.</summary>
     /// <remarks>
-    /// Each call records its own commit index and per-peer stamp floor. A later read does not
-    /// invalidate a confirmed ticket. The floor rides the next AppendEntries, including the one
-    /// this call sends.
+    /// Each call records its own commit index, ticket, and per-peer stamp floor. The floor rides
+    /// the next heartbeat or AppendEntries. This call does not broadcast on its own.
     /// </remarks>
-    public long? BeginReadIndex()
+    public ReadIndexStart? BeginReadIndex()
     {
         lock (_eventLock)
         {
@@ -668,9 +672,9 @@ public sealed class RaftNode
             }
 
             _pendingReads.Add(read);
-            ReplicateToAll();
+            PrunePendingReads();
             NoteRead(read);
-            return read.Index;
+            return new ReadIndexStart(read.Index, read.Ticket);
         }
     }
 
@@ -914,7 +918,7 @@ public sealed class RaftNode
         }
     }
 
-    /// <summary>Client apply waiter. Signaled from apply or step-down.</summary>
+    /// <summary>Client apply waiter. Signaled from apply, or failed when that index is truncated.</summary>
     public sealed class ApplyWaiter
     {
         internal ApplyWaiter(long index) => Index = index;
@@ -932,7 +936,7 @@ public sealed class RaftNode
             internal set => _applied = value;
         }
 
-        /// <summary>True after step-down before apply.</summary>
+        /// <summary>True when the index was truncated or the node fail-stopped before apply.</summary>
         public bool Failed
         {
             get => _failed;
@@ -955,8 +959,10 @@ public sealed class RaftNode
             {
                 _transferStatus = LeadershipTransferStatus.Aborted;
                 _pendingTransferTo = null;
+                CloseTransferLeaseWindow();
             }
 
+            PrunePendingReads();
             if (now >= _nextHeartbeatAt)
             {
             foreach (string peer in _snapshotInFlight.ToArray())
@@ -1112,6 +1118,7 @@ public sealed class RaftNode
         _transport.Send(_nodeId, peer, new TimeoutNow(CurrentTermLocked(), _nodeId));
         _leaseAckMillis.Clear();
         _linearizableAckSendMillis.Clear();
+        OpenTransferLeaseWindow();
         _pendingTransferTo = peer;
         _transferStatus = LeadershipTransferStatus.AwaitingWinner;
         _pendingTransferDeadline = _clock.Millis + _electionTimeoutMillis;
@@ -1221,7 +1228,15 @@ public sealed class RaftNode
         _transport.Send(
             _nodeId,
             peer,
-            new AppendEntries(CurrentTermLocked(), _nodeId, prevIndex, prevTerm, entries, _commitIndex, stamp));
+            new AppendEntries(
+                CurrentTermLocked(),
+                _nodeId,
+                prevIndex,
+                prevTerm,
+                entries,
+                _commitIndex,
+                stamp,
+                ReadLeaseBoundMillis()));
     }
 
     private void SendSnapshot(string peer)
@@ -1360,7 +1375,8 @@ public sealed class RaftNode
             return false;
         }
 
-        return _clock.Millis - _lastLeaderContactMillis < _electionTimeoutMillis;
+        long gate = _leaderAdvertisedLeaseMillis > 0 ? _leaderAdvertisedLeaseMillis : _electionTimeoutMillis;
+        return _clock.Millis - _lastLeaderContactMillis < gate;
     }
 
     private void OnRequestVoteResponse(string from, RequestVoteResponse response)
@@ -1428,6 +1444,11 @@ public sealed class RaftNode
         DisarmPreVote();
         _leaderId = append.LeaderId;
         _lastLeaderContactMillis = _clock.Millis;
+        if (append.LeaseBoundMillis > 0)
+        {
+            _leaderAdvertisedLeaseMillis = append.LeaseBoundMillis;
+        }
+
         ResetElectionDeadline();
         ObserveTransfer(append.LeaderId);
         if (!PrevLogMatches(append.PrevLogIndex, append.PrevLogTerm))
@@ -1465,6 +1486,7 @@ public sealed class RaftNode
             ? LeadershipTransferStatus.Succeeded
             : LeadershipTransferStatus.Aborted;
         _pendingTransferTo = null;
+        CloseTransferLeaseWindow();
     }
 
     private bool PrevLogMatches(long prevLogIndex, long prevLogTerm)
@@ -1514,6 +1536,7 @@ public sealed class RaftNode
             _log.TruncateFrom(truncateAt);
             InvalidateLogIndexCache();
             RebuildMembershipFromLog();
+            FailApplyWaitersFrom(truncateAt);
         }
 
         foreach (LogEntry entry in entries)
@@ -1549,6 +1572,7 @@ public sealed class RaftNode
             if (response.Stamp > 0
                 && _aeSendMillis.TryGetValue(from, out Dictionary<long, long>? sentTimes)
                 && sentTimes.TryGetValue(response.Stamp, out long sentAt)
+                && LeaseSendCounts(sentAt)
                 && (!_leaseAckMillis.TryGetValue(from, out long previousLease) || sentAt > previousLease))
             {
                 _leaseAckMillis[from] = sentAt;
@@ -1897,24 +1921,89 @@ public sealed class RaftNode
             return;
         }
 
-        MembershipSnapshot.Decoded decoded = MembershipSnapshot.Decode(bytes);
-        try
+        if (_snapshotBusy)
         {
-            _stateMachine.RestoreChecked(_log.LastIncludedIndex, _lastApplied, decoded.StateMachineBytes);
-        }
-        catch (ArgumentException)
-        {
-            _transport.Send(_nodeId, from, new InstallSnapshotResponse(CurrentTermLocked(), false, false));
+            _deferredSnapshot = bytes;
+            _deferredSnapshotIndex = lastIncludedIndex;
+            _deferredSnapshotTerm = lastIncludedTerm;
+            _deferredSnapshotFrom = from;
             return;
         }
 
+        _snapshotBusy = true;
+        byte[] payload = (byte[])bytes.Clone();
+        long included = _log.LastIncludedIndex;
+        long applied = _lastApplied;
+        _snapshotExecutor(() =>
+        {
+            MembershipSnapshot.Decoded decoded;
+            try
+            {
+                decoded = MembershipSnapshot.Decode(payload);
+                _stateMachine.RestoreChecked(included, applied, decoded.StateMachineBytes);
+            }
+            catch (ArgumentException)
+            {
+                Enqueue(() =>
+                {
+                    _snapshotBusy = false;
+                    _transport.Send(_nodeId, from, new InstallSnapshotResponse(CurrentTermLocked(), false, false));
+                });
+                return;
+            }
+            catch (Exception)
+            {
+                Enqueue(() =>
+                {
+                    _snapshotBusy = false;
+                    FailStop();
+                });
+                return;
+            }
+
+            byte[] sm = _stateMachine.Snapshot();
+            Enqueue(() => ContinueInstall(from, lastIncludedIndex, lastIncludedTerm, decoded, sm));
+        });
+    }
+
+    private void ContinueInstall(
+        string from,
+        long lastIncludedIndex,
+        long lastIncludedTerm,
+        MembershipSnapshot.Decoded decoded,
+        byte[] stateMachineBytes)
+    {
         if (decoded.HasConfig)
         {
             InstallDecodedConfig(decoded);
         }
 
-        byte[] persisted = MembershipSnapshot.Encode(AllVoters(), AllLearners(), _coldVoters, _cnewVoters, _stateMachine.Snapshot());
-        _log.CompactThrough(lastIncludedIndex, lastIncludedTerm, persisted);
+        var voters = AllVoters().ToHashSet();
+        var learners = AllLearners().ToHashSet();
+        var cold = _coldVoters.ToHashSet();
+        var cnew = _cnewVoters.ToHashSet();
+        _snapshotExecutor(() =>
+        {
+            try
+            {
+                byte[] persisted = MembershipSnapshot.Encode(voters, learners, cold, cnew, stateMachineBytes);
+                _log.CompactThrough(lastIncludedIndex, lastIncludedTerm, persisted);
+                Enqueue(() => FinishInstall(from, lastIncludedIndex));
+            }
+            catch (Exception)
+            {
+                Enqueue(() =>
+                {
+                    _snapshotBusy = false;
+                    FailStop();
+                });
+            }
+        });
+    }
+
+    private void FinishInstall(string from, long lastIncludedIndex)
+    {
+        _snapshotBusy = false;
         InvalidateLogIndexCache();
         RebuildMembershipFromLog();
         if (_commitIndex < lastIncludedIndex)
@@ -1933,6 +2022,7 @@ public sealed class RaftNode
             _nodeId,
             from,
             new InstallSnapshotResponse(CurrentTermLocked(), true, true, _log.LastIncludedIndex, _log.LastIncludedTerm));
+        ApplyCommitted();
     }
 
     private void OnInstallSnapshotResponse(string from, InstallSnapshotResponse response)
@@ -2028,7 +2118,7 @@ public sealed class RaftNode
 
     private void ApplyCommitted()
     {
-        if (_fatal || _logNeedsForce || _applyInFlight)
+        if (_fatal || _logNeedsForce || _applyInFlight || _snapshotBusy)
         {
             return;
         }
@@ -2136,14 +2226,20 @@ public sealed class RaftNode
         });
     }
 
-    private void FailApplyWaiters()
-    {
-        foreach (ApplyWaiter waiter in _applyWaiters)
-        {
-            waiter.Failed = true;
-        }
+    private void FailApplyWaiters() => FailApplyWaitersFrom(0);
 
-        _applyWaiters.Clear();
+    private void FailApplyWaitersFrom(long index)
+    {
+        _applyWaiters.RemoveAll(waiter =>
+        {
+            if (waiter.Index < index)
+            {
+                return false;
+            }
+
+            waiter.Failed = true;
+            return true;
+        });
     }
 
     private void MaybeAutoSnapshot()
@@ -2176,22 +2272,55 @@ public sealed class RaftNode
             return;
         }
 
-        if (_applyInFlight)
+        if (_applyInFlight || _snapshotBusy)
         {
             _snapshotWhenIdle = true;
             return;
         }
 
+        _snapshotBusy = true;
         long term = _log.Read(index).Term;
         long baseIndex = _log.LastIncludedIndex;
-        byte[] deltaSm = _stateMachine.SnapshotDelta(baseIndex);
-        byte[] fullSm = _stateMachine.Snapshot();
         ConfigView asOf = ConfigAsOf(index);
-        byte[] bytes = MembershipSnapshot.Encode(asOf.Voters, asOf.Learners, asOf.Cold, asOf.Cnew, fullSm);
-        byte[] deltaFramed = MembershipSnapshot.Encode(asOf.Voters, asOf.Learners, asOf.Cold, asOf.Cnew, deltaSm);
-        if (deltaFramed.Length < bytes.Length)
+        var voters = asOf.Voters.ToHashSet();
+        var learners = asOf.Learners.ToHashSet();
+        var cold = asOf.Cold.ToHashSet();
+        var cnew = asOf.Cnew.ToHashSet();
+        _snapshotExecutor(() =>
         {
-            _lastDeltaFramed = deltaFramed;
+            try
+            {
+                byte[] deltaSm = _stateMachine.SnapshotDelta(baseIndex);
+                byte[] fullSm = _stateMachine.Snapshot();
+                byte[] bytes = MembershipSnapshot.Encode(voters, learners, cold, cnew, fullSm);
+                byte[] deltaFramed = MembershipSnapshot.Encode(voters, learners, cold, cnew, deltaSm);
+                byte[]? delta = deltaFramed.Length < bytes.Length ? deltaFramed : null;
+                StagedCompaction staged = _log.StageCompaction(index, term, bytes);
+                staged.Write();
+                staged.Commit();
+                Enqueue(() => FinishSnapshot(delta, baseIndex));
+            }
+            catch (Exception)
+            {
+                Enqueue(() =>
+                {
+                    _snapshotBusy = false;
+                    FailStop();
+                });
+            }
+        });
+        if (!_draining)
+        {
+            Drain();
+        }
+    }
+
+    private void FinishSnapshot(byte[]? delta, long baseIndex)
+    {
+        _snapshotBusy = false;
+        if (delta is not null)
+        {
+            _lastDeltaFramed = delta;
             _deltaBaseIndex = baseIndex;
         }
         else
@@ -2201,30 +2330,15 @@ public sealed class RaftNode
 
         _snapshotForceFull.Clear();
         _snapshotCache = null;
-        StagedCompaction staged = _log.StageCompaction(index, term, bytes);
-        _snapshotExecutor(() =>
+        InvalidateLogIndexCache();
+        RunDeferredInstall();
+        if (_snapshotWhenIdle && !_fatal && !_snapshotBusy && _lastApplied > _log.LastIncludedIndex)
         {
-            try
-            {
-                staged.Write();
-            }
-            catch (Exception)
-            {
-                Enqueue(FailStop);
-                return;
-            }
-
-            Enqueue(() =>
-            {
-                staged.Commit();
-                InvalidateLogIndexCache();
-                _snapshotCache = null;
-            });
-        });
-        if (!_draining)
-        {
-            Drain();
+            _snapshotWhenIdle = false;
+            SnapshotThroughLocked(_lastApplied);
         }
+
+        ApplyCommitted();
     }
 
     private void StepDown(long newTerm)
@@ -2254,7 +2368,6 @@ public sealed class RaftNode
 
         _afterForce.Clear();
         _lastLeaderContactMillis = long.MinValue;
-        FailApplyWaiters();
         AbortReadIndex();
         ResetElectionDeadline();
     }
@@ -2434,9 +2547,42 @@ public sealed class RaftNode
         return heard;
     }
 
+    private void OpenTransferLeaseWindow()
+    {
+        _leaseIgnoreFromMillis = _clock.Millis;
+        _leaseIgnoreUntilMillis = long.MaxValue;
+    }
+
+    private void CloseTransferLeaseWindow()
+    {
+        if (_leaseIgnoreUntilMillis == long.MaxValue)
+        {
+            _leaseIgnoreUntilMillis = _clock.Millis;
+        }
+    }
+
+    /// <summary>
+    /// Acks while <see cref="LeadershipTransferStatus.AwaitingWinner"/>, and acks for
+    /// AppendEntries sent in that window, do not extend either read lease.
+    /// </summary>
+    private bool LeaseSendCounts(long sentAt)
+    {
+        if (_transferStatus == LeadershipTransferStatus.AwaitingWinner)
+        {
+            return false;
+        }
+
+        return sentAt < _leaseIgnoreFromMillis || sentAt >= _leaseIgnoreUntilMillis;
+    }
+
     private void NoteLinearizableAck(string from, long stamp)
     {
         if (stamp <= 0 || !_aeSendMillis.TryGetValue(from, out Dictionary<long, long>? sent) || !sent.TryGetValue(stamp, out long at))
+        {
+            return;
+        }
+
+        if (!LeaseSendCounts(at))
         {
             return;
         }
@@ -2449,6 +2595,30 @@ public sealed class RaftNode
         foreach (long older in sent.Keys.Where(older => older < stamp).ToArray())
         {
             sent.Remove(older);
+        }
+    }
+
+    private void PrunePendingReads()
+    {
+        int unsatisfied = 0;
+        foreach (PendingRead read in _pendingReads)
+        {
+            if (!read.Satisfied)
+            {
+                unsatisfied++;
+            }
+        }
+
+        for (int i = 0; unsatisfied > MaxUnsatisfiedReads && i < _pendingReads.Count;)
+        {
+            if (_pendingReads[i].Satisfied)
+            {
+                i++;
+                continue;
+            }
+
+            _pendingReads.RemoveAt(i);
+            unsatisfied--;
         }
     }
 

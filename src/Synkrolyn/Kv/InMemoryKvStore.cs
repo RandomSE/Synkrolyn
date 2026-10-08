@@ -17,6 +17,12 @@ public sealed class InMemoryKvStore : IKvStore
     private Dictionary<string, string>? _lastSnapMap;
     private int _epoch;
 
+    /// <summary>
+    /// Runs once in the gap after the epoch is sampled and before the mutation is
+    /// published. Tests restore or snapshot there. Production leaves it null.
+    /// </summary>
+    internal Action? AfterEpochSample { get; set; }
+
     /// <inheritdoc />
     public void Apply(long index, byte[] command)
     {
@@ -26,36 +32,45 @@ public sealed class InMemoryKvStore : IKvStore
             return;
         }
 
-        int seen;
-        lock (_gate)
-        {
-            seen = _epoch;
-        }
-
         KvCommandCodec.Command decoded = KvCommandCodec.Decode(command);
-        lock (_gate)
+        while (true)
         {
-            if (seen != _epoch)
+            int seen;
+            lock (_gate)
             {
-                return;
-            }
-        if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
-        {
-            if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
-            {
-                return;
+                seen = _epoch;
             }
 
-            _clientSerials[decoded.ClientId] = decoded.Serial;
-        }
+            Action? overlap = AfterEpochSample;
+            AfterEpochSample = null;
+            overlap?.Invoke();
+            lock (_gate)
+            {
+                if (seen != _epoch)
+                {
+                    continue;
+                }
 
-            if (decoded.Operation == KvCommandCodec.Op.Put)
-            {
-                _map[decoded.Key] = decoded.Value;
-            }
-            else
-            {
-                _map.Remove(decoded.Key);
+                if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
+                {
+                    if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
+                    {
+                        return;
+                    }
+
+                    _clientSerials[decoded.ClientId] = decoded.Serial;
+                }
+
+                if (decoded.Operation == KvCommandCodec.Op.Put)
+                {
+                    _map[decoded.Key] = decoded.Value;
+                }
+                else
+                {
+                    _map.Remove(decoded.Key);
+                }
+
+                return;
             }
         }
     }

@@ -228,7 +228,7 @@ public sealed class DurableRestartTests : IDisposable
         Assert.Equal(0, _cluster.Node("n1").CommitIndex);
         Assert.Null(_clients["n1"].Get("k"));
 
-        for (int i = 0; i < 40 && _cluster.Leaders().Count == 0; i++)
+        for (int i = 0; i < 8 && _cluster.Leaders().Count == 0; i++)
         {
             _cluster.Advance(10);
         }

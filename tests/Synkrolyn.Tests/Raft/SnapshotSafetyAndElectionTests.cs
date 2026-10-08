@@ -287,8 +287,7 @@ public sealed class ElectionUnavailabilityTests
         }
 
         Assert.NotNull(window);
-        Assert.True(window.Millis >= 200, "window " + window.Millis);
-        Assert.True(window.Millis <= 400, "window " + window.Millis);
+        Assert.Equal(200, window.Millis);
         Assert.NotEqual("n1", window.SuccessorId);
         Assert.Equal("yes", cluster.Clients[window.SuccessorId].Get("before"));
         Assert.Equal("ok", cluster.Clients[window.SuccessorId].Get("after"));

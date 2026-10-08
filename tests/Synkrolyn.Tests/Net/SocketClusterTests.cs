@@ -86,6 +86,8 @@ public sealed class SocketClusterTests
         Assert.All(cluster.Nodes, node => Assert.Null(node.Runtime.Uncaught));
     }
 
+    private static readonly ManualResetEventSlim Park = new(false);
+
     private static void WaitUntil(string message, Func<bool> condition)
     {
         var started = Stopwatch.StartNew();
@@ -96,7 +98,9 @@ public sealed class SocketClusterTests
                 throw new TimeoutException("timed out: " + message);
             }
 
-            Thread.Yield();
+            // Yield spins a core. On a 2-vCPU runner that keeps the Raft thread off
+            // the CPU until CheckQuorum has already stepped the leader down.
+            Park.Wait(TimeSpan.FromMilliseconds(1));
         }
     }
 }

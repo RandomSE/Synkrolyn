@@ -28,6 +28,12 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// </summary>
     private const int IoBudgetMillis = 75;
 
+    /// <summary>
+    /// How long an idle writer parks before it checks that the peer still holds
+    /// the last frame. A queued frame wakes the wait early.
+    /// </summary>
+    private const int ProbeMillis = 5;
+
     private Action<Envelope>? _handler;
     private Action _wakeup = static () => { };
     private volatile bool _running;
@@ -334,32 +340,76 @@ public sealed class SocketTransport : ITransport, IDisposable
     private void WriteLoop(string peer, Channel<byte[]> channel)
     {
         using var pause = new ManualResetEventSlim(false);
+        byte[]? inflight = null;
+        Task<bool>? queued = null;
         while (_running)
         {
-            byte[] frame;
-            try
+            // Write can return after the kernel has copied the bytes and before the
+            // peer's Read. DropInbound then discards them, IsLive still passed, and
+            // nothing else will resend a frame Raft already handed off. Hold the
+            // last frame and resend it when that socket dies, before any newer one.
+            if (inflight is not null && !OutboundLive(peer))
             {
-                frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
-            }
-            catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
-            {
-                return;
-            }
-
-            // The frame stays here until it is written or the peer is disabled.
-            // A connect refusal, a reset, or a timed-out handshake must not drop it:
-            // nothing else will resend a frame that Raft already handed off.
-            while (_running && !TrySend(peer, frame))
-            {
-                if (IsDisabled(peer))
-                {
-                    break;
-                }
-
                 DropOutbound(peer);
                 pause.Wait(5);
+                inflight = SendUntil(peer, inflight, pause) ? inflight : null;
+                continue;
             }
+
+            if (channel.Reader.TryRead(out byte[]? frame))
+            {
+                queued = null;
+                inflight = SendUntil(peer, frame, pause) ? frame : null;
+                continue;
+            }
+
+            if (inflight is null)
+            {
+                try
+                {
+                    frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
+                }
+                catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
+                {
+                    return;
+                }
+
+                inflight = SendUntil(peer, frame, pause) ? frame : null;
+                continue;
+            }
+
+            queued ??= channel.Reader.WaitToReadAsync().AsTask();
+            if (queued.IsCompleted)
+            {
+                if (!queued.IsCompletedSuccessfully || !queued.Result)
+                {
+                    return;
+                }
+
+                queued = null;
+                continue;
+            }
+
+            // Park until the next frame or a short probe. A frame that arrives
+            // during the wait is taken immediately; an idle writer does not spin.
+            queued.Wait(ProbeMillis);
         }
+    }
+
+    private bool SendUntil(string peer, byte[] frame, ManualResetEventSlim pause)
+    {
+        while (_running && !TrySend(peer, frame))
+        {
+            if (IsDisabled(peer))
+            {
+                return false;
+            }
+
+            DropOutbound(peer);
+            pause.Wait(5);
+        }
+
+        return _running && !IsDisabled(peer);
     }
 
     private bool TrySend(string peer, byte[] frame)
@@ -375,6 +425,13 @@ public sealed class SocketTransport : ITransport, IDisposable
             NetworkStream stream = client.GetStream();
             stream.Write(frame);
             stream.Flush();
+            if (!OutboundLive(peer))
+            {
+                // The peer reset while the bytes were only in the socket buffer.
+                DropOutbound(peer);
+                return false;
+            }
+
             return true;
         }
         catch (Exception)
@@ -382,6 +439,14 @@ public sealed class SocketTransport : ITransport, IDisposable
             // Any send failure, including a connect abort, leaves the writer alive.
             DropOutbound(peer);
             return false;
+        }
+    }
+
+    private bool OutboundLive(string peer)
+    {
+        lock (_gate)
+        {
+            return _outbound.TryGetValue(peer, out TcpClient? client) && IsLive(client);
         }
     }
 
@@ -465,39 +530,47 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             Socket raw = client.Client;
             raw.NoDelay = true;
-            raw.SendTimeout = IoBudgetMillis;
             var args = new SocketAsyncEventArgs { RemoteEndPoint = address };
-            args.Completed += (_, _) =>
+            try
             {
-                try
+                args.Completed += (_, _) =>
+                {
+                    try
+                    {
+                        done.Set();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The budget already elapsed and the event was released.
+                    }
+                };
+                bool pending = raw.ConnectAsync(args);
+                if (!pending)
                 {
                     done.Set();
                 }
-                catch (ObjectDisposedException)
+
+                if (!done.Wait(budget))
                 {
-                    // The budget already elapsed and the event was released.
+                    client.Dispose();
+                    done.Wait(50);
+                    throw new TimeoutException("connect exceeded " + (int)budget.TotalMilliseconds + " ms");
                 }
-            };
-            bool pending = raw.ConnectAsync(args);
-            if (!pending)
-            {
-                done.Set();
-            }
 
-            if (!done.Wait(budget))
-            {
-                client.Dispose();
-                done.Wait(50);
-                throw new TimeoutException("connect exceeded " + (int)budget.TotalMilliseconds + " ms");
-            }
+                if (args.SocketError != SocketError.Success)
+                {
+                    throw new SocketException((int)args.SocketError);
+                }
 
-            if (args.SocketError != SocketError.Success)
-            {
-                throw new SocketException((int)args.SocketError);
+                // The 75 ms budget is the connect. A large frame on a slow link must be
+                // allowed to finish; a send timeout would tear it and retry forever.
+                raw.SendTimeout = 0;
+                return client;
             }
-
-            raw.SendTimeout = IoBudgetMillis;
-            return client;
+            finally
+            {
+                args.Dispose();
+            }
         }
         catch
         {

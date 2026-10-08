@@ -41,7 +41,7 @@ public sealed record RequestVoteResponse(long Term, bool VoteGranted, bool PreVo
     }
 }
 
-/// <summary>AppendEntries RPC. An empty entry list is a heartbeat.</summary>
+/// <summary>AppendEntries RPC. An empty entry list is a heartbeat. <see cref="LeaseBoundMillis"/> is the leader's read-lease window.</summary>
 public sealed record AppendEntries(
     long Term,
     string LeaderId,
@@ -49,7 +49,8 @@ public sealed record AppendEntries(
     long PrevLogTerm,
     IReadOnlyList<LogEntry> Entries,
     long LeaderCommit,
-    long Stamp)
+    long Stamp,
+    long LeaseBoundMillis = 0)
 {
     /// <summary>AppendEntries with stamp 0.</summary>
     public AppendEntries(

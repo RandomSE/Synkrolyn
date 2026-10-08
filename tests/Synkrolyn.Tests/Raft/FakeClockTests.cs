@@ -20,22 +20,17 @@ public class FakeClockTests
     }
 
     [Fact]
-    public void SystemClock_movesForwardAndIgnoresListeners()
+    public void SystemClock_followsTheInjectedTimestampAndDoesNotMoveBackward()
     {
-        var clock = new SystemRaftClock();
+        long ticks = 1_000_000;
+        var clock = new SystemRaftClock(() => ticks);
         int hits = 0;
         clock.OnAdvance(() => hits++);
-        long first = clock.Millis;
-        long previous = first;
-        var started = System.Diagnostics.Stopwatch.StartNew();
-        while (clock.Millis == first && started.Elapsed < TimeSpan.FromMilliseconds(50))
-        {
-            Thread.SpinWait(100);
-        }
-
-        long later = clock.Millis;
-        Assert.True(later >= previous);
-        Assert.True(later > first);
+        Assert.Equal(0, clock.Millis);
+        ticks += System.Diagnostics.Stopwatch.Frequency;
+        Assert.Equal(1000, clock.Millis);
+        ticks -= System.Diagnostics.Stopwatch.Frequency / 2;
+        Assert.Equal(1000, clock.Millis);
         Assert.Equal(0, hits);
     }
 }

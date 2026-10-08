@@ -92,6 +92,48 @@ public class Phase3RobustnessTests
     }
 
     [Fact]
+    public void Finding14_crashBetweenSnapshotAndLogRename_reopens()
+    {
+        string dir = Directory.CreateTempSubdirectory("synkrolyn-rename-gap-").FullName;
+        try
+        {
+            byte[] first = [1, 2];
+            byte[] second = [3, 4, 5];
+            using (var log = new FileRaftLog(dir))
+            {
+                log.Append(new LogEntry(1, 1, [1]));
+                log.Append(new LogEntry(2, 1, [2]));
+                log.Append(new LogEntry(3, 1, [3]));
+                log.Force();
+                log.CompactThrough(1, 1, first);
+            }
+
+            byte[] payload = new byte[16 + second.Length];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(payload, 2);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(8), 1);
+            second.CopyTo(payload.AsSpan(16));
+            string snapshotTmp = Path.Combine(dir, FileRaftLog.SnapshotFileName + ".partial");
+            using (var channel = new FileStream(snapshotTmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                ChecksummedRecords.WriteRecords(channel, payload);
+                channel.Flush(true);
+            }
+
+            FilePersistentState.Replace(snapshotTmp, Path.Combine(dir, FileRaftLog.SnapshotFileName));
+            using var reopened = new FileRaftLog(dir);
+            Assert.Equal(2, reopened.LastIncludedIndex);
+            Assert.Equal(1, reopened.LastIncludedTerm);
+            Assert.Equal(second, reopened.SnapshotBytes());
+            Assert.Equal(3, reopened.LastIndex);
+            Assert.Equal(new byte[] { 3 }, reopened.Read(3).Command);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void Finding6_mailboxOverflow_dropsInboundRpc()
     {
         var cluster = new ClusterHarness();
@@ -174,54 +216,14 @@ public class Phase3RobustnessTests
     }
 
     [Fact]
-    public void Finding7_concurrentApplyAndRead_doesNotThrow()
+    public void Finding7_applyOverlappingRestore_keepsTheCommand()
     {
         var store = new InMemoryKvStore();
-        var failures = new List<Exception>();
-        var start = new ManualResetEventSlim(false);
-        var writers = new Thread(() =>
-        {
-            start.Wait();
-            for (int i = 1; i <= 4_000; i++)
-            {
-                try
-                {
-                    store.Apply(i, KvCommandCodec.EncodePut("k", i.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-                }
-                catch (Exception ex)
-                {
-                    lock (failures)
-                    {
-                        failures.Add(ex);
-                    }
-                }
-            }
-        });
-        var readers = new Thread(() =>
-        {
-            start.Wait();
-            for (int i = 0; i < 4_000; i++)
-            {
-                try
-                {
-                    _ = store.Get("k");
-                    _ = store.Snapshot();
-                }
-                catch (Exception ex)
-                {
-                    lock (failures)
-                    {
-                        failures.Add(ex);
-                    }
-                }
-            }
-        });
-        writers.Start();
-        readers.Start();
-        start.Set();
-        writers.Join();
-        readers.Join();
-        Assert.Empty(failures);
+        store.Apply(1, KvCommandCodec.EncodePut("k", "a"));
+        byte[] snapshot = store.Snapshot();
+        store.AfterEpochSample = () => store.Restore(snapshot);
+        store.Apply(2, KvCommandCodec.EncodePut("k", "b"));
+        Assert.Equal("b", store.Get("k"));
     }
 
     [Fact]
@@ -454,19 +456,10 @@ public class Phase3RobustnessTests
         transport.Start();
         using var raw = new TcpClient();
         raw.Connect(IPAddress.Loopback, transport.LocalPort);
-        raw.ReceiveTimeout = 1000;
         transport.Dispose();
-        try
-        {
-            int read = raw.GetStream().Read(new byte[8]);
-            Assert.Equal(0, read);
-        }
-        catch (IOException ex) when (ex.InnerException is SocketException socket)
-        {
-            // Stop resets a handshake that has not been accepted yet (10054).
-            // A timeout means Dispose left the socket open.
-            Assert.NotEqual(SocketError.TimedOut, socket.SocketErrorCode);
-        }
+        // One millisecond. An open socket returns false. A reset or a FIN is readable with nothing buffered.
+        bool closed = raw.Client.Poll(1_000, SelectMode.SelectRead) && raw.Client.Available == 0;
+        Assert.True(closed);
     }
 
     private sealed class BlockingMachine : IStateMachine

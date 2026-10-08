@@ -23,7 +23,7 @@ public class Phase2ReadElectionTests
         Assert.Equal(Role.Leader, cluster.Harness.Node("n1").Role);
         cluster.Clients["n1"].Put("k", "v");
         cluster.Harness.DrainAll();
-        Assert.Equal(2, cluster.Harness.Node("n1").BeginReadIndex());
+        Assert.Equal(2, cluster.Harness.Node("n1").BeginReadIndex()?.Index);
         cluster.Harness.DrainAll();
         Assert.Equal("v", cluster.Clients["n1"].LinearizableGet("k"));
 
@@ -38,7 +38,7 @@ public class Phase2ReadElectionTests
     }
 
     [Fact]
-    public void Finding2_concurrentReads_eachSendsAppendEntries()
+    public void Finding2_concurrentReads_shareTheNextAppendEntries()
     {
         var cluster = new ClusterHarness();
         cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
@@ -60,10 +60,8 @@ public class Phase2ReadElectionTests
         RaftNode leader = cluster.Node("n1");
         int before = heartbeats;
         Assert.NotNull(leader.BeginReadIndex());
-        int afterFirst = heartbeats;
         Assert.NotNull(leader.BeginReadIndex());
-        Assert.True(afterFirst > before);
-        Assert.True(heartbeats > afterFirst);
+        Assert.Equal(before, heartbeats);
     }
 
     [Fact]

@@ -61,6 +61,7 @@ public sealed class RpcWireCodec : IMessageCodec
 
                 writer.PutLong(append.LeaderCommit);
                 writer.PutLong(append.Stamp);
+                writer.PutLong(append.LeaseBoundMillis);
                 break;
             case AppendEntriesResponse appendResponse:
                 writer.PutByte(AppendEntriesResponseTag);
@@ -159,7 +160,15 @@ public sealed class RpcWireCodec : IMessageCodec
             entries.Add(new LogEntry(reader.ReadLong(), reader.ReadLong(), reader.ReadBytes()));
         }
 
-        return new AppendEntries(term, leaderId, prevIndex, prevTerm, entries, reader.ReadLong(), reader.ReadLong());
+        return new AppendEntries(
+            term,
+            leaderId,
+            prevIndex,
+            prevTerm,
+            entries,
+            reader.ReadLong(),
+            reader.ReadLong(),
+            reader.ReadLong());
     }
 
     private sealed class Writer

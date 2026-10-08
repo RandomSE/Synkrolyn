@@ -155,6 +155,96 @@ public class Phase123ReviewTests
     }
 
     [Fact]
+    public void Item2_heartbeatDuringTransfer_doesNotRearmTheLease()
+    {
+        var heartbeat = TimeSpan.FromMilliseconds(40);
+        using var cluster = new KvClusterTests.KvFixture(heartbeat);
+        cluster.Add("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(150));
+        cluster.Add("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(10_000));
+        cluster.Add("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(10_000));
+        cluster.Harness.Advance(150);
+        cluster.Clients["n1"].Put("k", "v");
+        cluster.Harness.DrainAll();
+        Assert.True(cluster.Harness.Node("n1").QuorumLeaseValid);
+        Assert.True(cluster.Harness.Node("n1").TransferLeadership("n2"));
+        cluster.Harness.Transport.PartitionBidirectional("n2", "n1");
+        cluster.Harness.Transport.PartitionBidirectional("n2", "n3");
+        cluster.Harness.Advance(40);
+        RaftNode leader = cluster.Harness.Node("n1");
+        Assert.Equal(Role.Leader, leader.Role);
+        Assert.Equal(LeadershipTransferStatus.AwaitingWinner, leader.TransferStatus);
+        Assert.False(leader.QuorumLeaseValid);
+        Assert.Null(cluster.Clients["n1"].LinearizableGet("k"));
+        Assert.True(leader.ReadTicketPending(leader.CurrentReadTicket));
+    }
+
+    [Fact]
+    public void MixedTimeout_fastVoter_doesNotVoteInsideTheLeadersLease()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n3"], TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(40));
+        cluster.AddNode("n3", ["n1"], TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(40));
+        cluster.StartElections("n3");
+        Assert.Equal(Role.Leader, cluster.Node("n3").Role);
+        cluster.Advance(40);
+        cluster.Isolate("n3");
+        cluster.Advance(200);
+        RaftNode voter = cluster.Node("n1");
+        long term = voter.CurrentTerm;
+        IRaftLog log = cluster.Log("n1");
+        voter.Receive(new Envelope(
+            "intruder",
+            "n1",
+            new RequestVote(term + 1, "intruder", log.LastIndex, log.LastTerm)));
+        voter.Drain();
+        Assert.Equal(term, voter.CurrentTerm);
+        Assert.NotEqual("intruder", cluster.State("n1").VotedFor);
+    }
+
+    [Fact]
+    public void MixedTimeout_slowVoter_gateFollowsTheLeadersLease()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n3"], TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(40));
+        cluster.AddNode("n3", ["n1"], TimeSpan.FromMilliseconds(400), TimeSpan.FromMilliseconds(40));
+        cluster.Advance(200);
+        Assert.Equal(Role.Leader, cluster.Node("n1").Role);
+        cluster.Advance(40);
+        cluster.Isolate("n1");
+        cluster.Advance(250);
+        RaftNode voter = cluster.Node("n3");
+        long term = voter.CurrentTerm;
+        IRaftLog log = cluster.Log("n3");
+        voter.Receive(new Envelope(
+            "intruder",
+            "n3",
+            new RequestVote(term + 1, "intruder", log.LastIndex, log.LastTerm)));
+        voter.Drain();
+        Assert.Equal("intruder", cluster.State("n3").VotedFor);
+    }
+
+    [Fact]
+    public void RestartedNode_withALog_grantsAVoteBeforeHearingALeader()
+    {
+        var cluster = new ClusterHarness();
+        var state = new InMemoryPersistentState();
+        state.SetCurrentTerm(3);
+        var log = new InMemoryRaftLog();
+        log.Append(new LogEntry(1, 3, "k"u8.ToArray()));
+        cluster.AddNode(
+            "n1",
+            ["n2"],
+            TimeSpan.FromMilliseconds(400),
+            Heartbeat,
+            state: state,
+            log: log);
+        RaftNode restarted = cluster.Node("n1");
+        restarted.Receive(new Envelope("n2", "n1", new RequestVote(4, "n2", 1, 3)));
+        restarted.Drain();
+        Assert.Equal("n2", cluster.State("n1").VotedFor);
+    }
+
+    [Fact]
     public void Item11_leaseLastsTheElectionTimeout()
     {
         var heartbeat = TimeSpan.FromMilliseconds(40);
@@ -184,12 +274,12 @@ public class Phase123ReviewTests
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
         cluster.Transport.DelayNext("n2", "n1", TimeSpan.FromMilliseconds(10_000));
-        long? firstIndex = leader.BeginReadIndex();
+        long? firstIndex = leader.BeginReadIndex()?.Index;
         Assert.NotNull(firstIndex);
         long? appended = leader.Propose("new"u8.ToArray());
         Assert.NotNull(appended);
         leader.CommitIndexForTest(appended.Value);
-        long? secondIndex = leader.BeginReadIndex();
+        long? secondIndex = leader.BeginReadIndex()?.Index;
         Assert.Equal(appended, secondIndex);
         Assert.True(secondIndex > firstIndex);
     }
@@ -204,10 +294,10 @@ public class Phase123ReviewTests
         Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
-        long? firstIndex = leader.BeginReadIndex();
-        long firstTicket = leader.CurrentReadTicket;
-        Assert.NotNull(firstIndex);
-        cluster.DrainAll();
+        ReadIndexStart? first = leader.BeginReadIndex();
+        Assert.NotNull(first);
+        long firstTicket = first.Value.Ticket;
+        cluster.Advance(20);
         Assert.NotNull(leader.BeginReadIndex());
         Assert.True(leader.ReadIndexSatisfied(firstTicket));
     }
@@ -236,6 +326,112 @@ public class Phase123ReviewTests
         Assert.False(cluster.Harness.Node("n1").QuorumLeaseValid);
         Assert.Equal("v", cluster.Clients["n1"].LinearizableGet("k"));
         cluster.Dispose();
+    }
+
+    [Fact]
+    public void Item3_concurrentReads_doNotBroadcastPerRead()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        int heartbeats = 0;
+        RaftNode n2 = cluster.Node("n2");
+        cluster.Transport.Reregister("n2", envelope =>
+        {
+            if (envelope.Payload is AppendEntries)
+            {
+                heartbeats++;
+            }
+
+            n2.Receive(envelope);
+        });
+        RaftNode leader = cluster.Node("n1");
+        int before = heartbeats;
+        for (int i = 0; i < 8; i++)
+        {
+            Assert.NotNull(leader.BeginReadIndex());
+        }
+
+        Assert.Equal(before, heartbeats);
+    }
+
+    [Fact]
+    public void Item3_currentReadTicket_losesTheCallerToALaterRead()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        RaftNode leader = cluster.Node("n1");
+        using var started = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        ReadIndexStart? owned = null;
+        var worker = new Thread(() =>
+        {
+            owned = leader.BeginReadIndex();
+            started.Set();
+            release.Wait();
+        });
+        worker.Start();
+        Assert.True(started.Wait(TimeSpan.FromSeconds(2)));
+        Assert.NotNull(leader.BeginReadIndex());
+        release.Set();
+        worker.Join();
+        Assert.Equal(1, owned!.Value.Ticket);
+        Assert.NotEqual(owned.Value.Ticket, leader.CurrentReadTicket);
+    }
+
+    [Fact]
+    public void Item3_unsatisfiedReads_doNotGrowWithoutBound()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        RaftNode leader = cluster.Node("n1");
+        Assert.NotNull(leader.BeginReadIndex());
+        cluster.Advance(20);
+        long kept = leader.CurrentReadTicket;
+        Assert.True(leader.ReadTicketPending(kept));
+        cluster.Transport.PartitionBidirectional("n1", "n2");
+        for (int i = 0; i < 100; i++)
+        {
+            Assert.NotNull(leader.BeginReadIndex());
+        }
+
+        Assert.True(leader.ReadTicketPending(kept));
+        Assert.True(PendingReadCount(leader) < 100, "pending " + PendingReadCount(leader));
+    }
+
+    [Fact]
+    public void Item3_ackFromBeforeTheRead_doesNotConfirmIt()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
+        RaftNode leader = cluster.Node("n1");
+        long match = cluster.Log("n2").LastIndex;
+        long previous = LastAeStamp(leader, "n2");
+        Assert.True(previous > 0);
+        cluster.Transport.PartitionBidirectional("n1", "n2");
+        ReadIndexStart? index = leader.BeginReadIndex();
+        Assert.NotNull(index);
+        long ticket = index.Value.Ticket;
+        leader.Receive(new Envelope(
+            "n2",
+            "n1",
+            new AppendEntriesResponse(leader.CurrentTerm, true, match, 0, 0, 0, previous)));
+        leader.Drain();
+        Assert.False(leader.ReadIndexSatisfied(ticket));
+        Assert.True(leader.ReadTicketPending(ticket));
     }
 
     [Fact]
@@ -508,6 +704,7 @@ public class Phase123ReviewTests
     [Fact]
     public void Item16_socketFixture_staysNearTheHostTimeout()
     {
+        // Constant check only. It does not run an election at these timeouts.
         Assert.Equal(120, SocketCluster.ElectionTimeouts[0].TotalMilliseconds);
         Assert.Equal(350, SocketCluster.ElectionTimeouts[1].TotalMilliseconds);
         Assert.Equal(600, SocketCluster.ElectionTimeouts[2].TotalMilliseconds);
@@ -516,10 +713,58 @@ public class Phase123ReviewTests
     [Fact]
     public void Item12_windowsReplace_usesWriteThrough()
     {
+        // The DllImport is present. This does not execute the rename or read the flags.
         MethodInfo? method = typeof(FilePersistentState).GetMethod(
             "MoveFileEx",
             BindingFlags.NonPublic | BindingFlags.Static);
         Assert.NotNull(method);
+    }
+
+    [Fact]
+    public void Item12_replace_publishesTheNewBytesAndRemovesTheTemp()
+    {
+        string dir = Directory.CreateTempSubdirectory("synkrolyn-replace-").FullName;
+        try
+        {
+            string dest = Path.Combine(dir, "raft.log");
+            string tmp = Path.Combine(dir, "raft.log.tmp");
+            File.WriteAllBytes(dest, [1, 2, 3]);
+            File.WriteAllBytes(tmp, [4, 5]);
+            FilePersistentState.Replace(tmp, dest);
+            Assert.False(File.Exists(tmp));
+            Assert.Equal(new byte[] { 4, 5 }, File.ReadAllBytes(dest));
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Item13_snapshotCapture_doesNotBlockDrain()
+    {
+        var cluster = new ClusterHarness();
+        var machine = new BlockingSnapshotMachine();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat, machine);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "a"u8.ToArray()));
+        cluster.DrainAll();
+        RaftNode leader = cluster.Node("n1");
+        leader.SetSnapshotExecutor(action => ThreadPool.QueueUserWorkItem(_ => action()));
+        machine.Arm();
+        var drained = new Thread(() => leader.Snapshot());
+        drained.Start();
+        try
+        {
+            bool finished = drained.Join(400);
+            Assert.True(finished);
+        }
+        finally
+        {
+            machine.Release.Set();
+            Assert.True(drained.Join(TimeSpan.FromSeconds(2)));
+        }
     }
 
     [Fact]
@@ -552,6 +797,7 @@ public class Phase123ReviewTests
     [Fact]
     public void Item16_applyWaiterAndFatal_areVolatile()
     {
+        // Modifier check only. It does not race a reader against a writer.
         AssertVolatile(typeof(RaftNode), "_fatal");
         AssertVolatile(typeof(RaftNode.ApplyWaiter), "_applied");
         AssertVolatile(typeof(RaftNode.ApplyWaiter), "_failed");
@@ -586,6 +832,19 @@ public class Phase123ReviewTests
         Assert.True(elapsed <= 150 + 40, "failover elapsed " + elapsed);
     }
 
+    private static int PendingReadCount(RaftNode node)
+    {
+        FieldInfo field = typeof(RaftNode).GetField("_pendingReads", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        return ((System.Collections.ICollection)field.GetValue(node)!).Count;
+    }
+
+    private static long LastAeStamp(RaftNode node, string peer)
+    {
+        FieldInfo field = typeof(RaftNode).GetField("_nextAeStamp", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var stamps = (Dictionary<string, long>)field.GetValue(node)!;
+        return stamps.GetValueOrDefault(peer);
+    }
+
     private static void AssertVolatile(Type type, string fieldName)
     {
         FieldInfo? field = type.GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
@@ -602,6 +861,23 @@ public class Phase123ReviewTests
         }
 
         return cluster.Log(id).Read(index).Command;
+    }
+
+    private sealed class BlockingSnapshotMachine : IStateMachine
+    {
+        public ManualResetEventSlim Release { get; } = new(true);
+
+        public void Arm() => Release.Reset();
+
+        public void Apply(long index, byte[] command)
+        {
+        }
+
+        public byte[] Snapshot()
+        {
+            Release.Wait();
+            return [1];
+        }
     }
 
     /// <summary>Blocks inside <see cref="CompactThrough"/> so a drain that compacts cannot return.</summary>
