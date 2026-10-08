@@ -5,6 +5,7 @@ public sealed class InMemoryPersistentState : IPersistentState
 {
     private long _currentTerm;
     private string? _votedFor;
+    private long _maxAdvertisedLeaseMillis;
     private byte[] _membership = [];
 
     /// <inheritdoc />
@@ -12,6 +13,9 @@ public sealed class InMemoryPersistentState : IPersistentState
 
     /// <inheritdoc />
     public string? VotedFor => _votedFor;
+
+    /// <inheritdoc />
+    public long MaxAdvertisedLeaseMillis => _maxAdvertisedLeaseMillis;
 
     /// <inheritdoc />
     public void SetCurrentTerm(long term)
@@ -47,6 +51,17 @@ public sealed class InMemoryPersistentState : IPersistentState
         }
 
         _votedFor = candidateId;
+    }
+
+    /// <inheritdoc />
+    public void NoteAdvertisedLease(long millis)
+    {
+        if (millis <= _maxAdvertisedLeaseMillis)
+        {
+            return;
+        }
+
+        _maxAdvertisedLeaseMillis = millis;
     }
 
     /// <inheritdoc />

@@ -45,6 +45,7 @@ static async Task<HostCluster> StartClusterAsync(CancellationToken cancellationT
             TimeSpan.FromMilliseconds(150),
             TimeSpan.FromMilliseconds(40),
             store);
+        node.SetClockDriftBound(RaftNode.DefaultClockDriftBound);
         var client = new KvClient(node, store, id);
         var runtime = RaftRuntime.ForProduction(node, transport, clock);
         nodes.Add((transport, node, store, client, runtime));

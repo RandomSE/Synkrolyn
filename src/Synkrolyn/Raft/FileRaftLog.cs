@@ -33,6 +33,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     private byte[] _snapshot = [];
     private int _forceCount;
     private int _diskReadCount;
+    private int _dataSyncCount;
     private ArmedCapture? _armed;
     private readonly Action<FileStream>? _afterForceWrite;
 
@@ -55,7 +56,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         _directoryLock = DataDirectoryLock.Acquire(directory, "raft.log");
         _file = Path.Combine(directory, FileName);
         _snapshotFile = Path.Combine(directory, SnapshotFileName);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
         try
         {
             LoadSnapshot();
@@ -82,6 +83,15 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
                 return _diskReadCount;
             }
         }
+    }
+
+    /// <summary>Data fsyncs. A compaction commit must not add one; the executor already synced the new file.</summary>
+    internal int DataSyncCount => Volatile.Read(ref _dataSyncCount);
+
+    private void DataSync(FileStream channel)
+    {
+        channel.Flush(flushToDisk: true);
+        Interlocked.Increment(ref _dataSyncCount);
     }
 
     /// <summary>Number of successful fsync calls from <see cref="Force"/>.</summary>
@@ -319,6 +329,9 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         staged.Commit();
     }
 
+    /// <summary>Share mode of the armed snapshot reader. Tests check that a rename can replace the log.</summary>
+    internal FileShare LastArmedShare { get; private set; }
+
     /// <inheritdoc />
     public void ArmCompaction(long lastIncludedIndex, long lastIncludedTerm)
     {
@@ -339,7 +352,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             if (_armed is ArmedCapture armed && armed.Index == lastIncludedIndex)
             {
                 _armed = null;
-                var captured = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), [], _dir);
+                var captured = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), [], _dir, DataSync);
                 return new StagedCompaction(
                     () =>
                     {
@@ -358,7 +371,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
             List<LogEntry> kept = CopyVisible();
             LogCompaction.Apply(kept, _lastIncludedIndex, lastIncludedIndex, lastIncludedTerm, snapshot);
-            var job = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), kept, _dir);
+            var job = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), kept, _dir, DataSync);
             return new StagedCompaction(() => job.Write(), () => CommitJob(job));
         }
     }
@@ -375,13 +388,17 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             keptOffset = _forcedOffsets[slot];
         }
 
+        // FileShare.Delete lets Windows MoveFileEx replace raft.log while this
+        // reader still holds the pre-truncate bytes. Without it the rename fails
+        // and the Raft thread fail-stops. Linux keeps the old inode either way.
+        LastArmedShare = FileShare.ReadWrite | FileShare.Delete;
         return new ArmedCapture(
             index,
             term,
             fileEnd,
             keptOffset,
             _pendingEntries.ToList(),
-            new FileStream(_file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+            new FileStream(_file, FileMode.Open, FileAccess.Read, LastArmedShare));
     }
 
     private static List<LogEntry> ReadCaptured(ArmedCapture armed)
@@ -459,20 +476,33 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
                 return;
             }
 
-            List<LogEntry> current = CopyVisible();
-            LogCompaction.Apply(current, _lastIncludedIndex, job.Index, job.Term, job.Snapshot);
             if (!job.Written)
             {
-                job.Write();
+                // The executor fsyncs the new file. Doing it here would stall the Raft thread.
+                job.DeleteTemps();
+                return;
             }
 
+            List<LogEntry> current = CopyVisible();
+            LogCompaction.Apply(current, _lastIncludedIndex, job.Index, job.Term, job.Snapshot);
             if (!job.MatchesPrefix(current))
             {
-                job.RewriteEntries(current);
+                // A truncation landed after the capture. The staged file is stale.
+                // Leave the live log in place; a later snapshot captures it again.
+                job.DeleteTemps();
+                return;
             }
-            else if (current.Count > job.Kept.Count)
+
+            long forcedEnd = ForcedEndIndex();
+            var tail = new List<LogEntry>();
+            bool tailWasForced = false;
+            for (int i = job.Kept.Count; i < current.Count; i++)
             {
-                job.AppendTail(current);
+                tail.Add(current[i]);
+                if (current[i].Index <= forcedEnd)
+                {
+                    tailWasForced = true;
+                }
             }
 
             job.Publish(
@@ -487,6 +517,20 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             _lastIncludedTerm = job.Term;
             _snapshot = job.Snapshot;
             ClearPending();
+            foreach (LogEntry entry in tail)
+            {
+                byte[] framed = ChecksummedRecords.Frame(Encode(entry));
+                _pending.Write(framed);
+                _pendingFrameLengths.Add(framed.Length);
+                _pendingEntries.Add(entry);
+            }
+
+            if (tailWasForced)
+            {
+                // Those bytes were durable in the file the rename replaced.
+                // One normal force puts them on the new file. It is not a rewrite.
+                ForceUnlocked();
+            }
         }
     }
 
@@ -532,7 +576,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         {
             channel.Write(bytes);
             _afterForceWrite?.Invoke(channel);
-            channel.Flush(flushToDisk: true);
+            DataSync(channel);
         }
         catch
         {
@@ -540,7 +584,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             channel.Position = pos;
             try
             {
-                channel.Flush(flushToDisk: true);
+                DataSync(channel);
             }
             catch (IOException)
             {
@@ -622,7 +666,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         using (var channel = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
         {
             WriteRecords(channel, payload);
-            channel.Flush(flushToDisk: true);
+            DataSync(channel);
         }
 
         FilePersistentState.Replace(tmp, _snapshotFile);
@@ -727,7 +771,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     private void TruncateTo(long pos)
     {
         Channel.SetLength(pos);
-        Channel.Flush(flushToDisk: true);
+        DataSync(Channel);
     }
 
     private void PersistEntries(List<LogEntry> kept)
@@ -748,12 +792,12 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
                 pos += framed.Length;
             }
 
-            channel.Flush(flushToDisk: true);
+            DataSync(channel);
         }
 
         _channel?.Dispose();
         FilePersistentState.Replace(tmp, _file);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
         _channel.Position = _channel.Length;
         _forcedOffsets = newOffsets;
         _forcedCount = newCount;
@@ -905,18 +949,20 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     {
         private readonly string _snapshotTmp;
         private readonly string _entriesTmp;
+        private readonly Action<FileStream> _sync;
         private long[] _offsets = new long[8];
         private int _count;
         private long _base;
         private long _lastTerm;
         private bool _written;
 
-        public CompactJob(long index, long term, byte[] snapshot, List<LogEntry> kept, string directory)
+        public CompactJob(long index, long term, byte[] snapshot, List<LogEntry> kept, string directory, Action<FileStream> sync)
         {
             Index = index;
             Term = term;
             Snapshot = snapshot;
             Kept = kept;
+            _sync = sync;
             string token = Guid.NewGuid().ToString("N");
             _snapshotTmp = Path.Combine(directory, SnapshotFileName + ".cmp-" + token);
             _entriesTmp = Path.Combine(directory, FileName + ".cmp-" + token);
@@ -959,24 +1005,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             return true;
         }
 
-        public void AppendTail(List<LogEntry> current)
-        {
-            var tail = new List<LogEntry>();
-            for (int i = Kept.Count; i < current.Count; i++)
-            {
-                tail.Add(current[i]);
-            }
-
-            WriteEntries(tail, append: true);
-        }
-
-        public void RewriteEntries(List<LogEntry> current)
-        {
-            _count = 0;
-            _offsets = new long[Math.Max(8, current.Count)];
-            WriteEntries(current, append: false);
-        }
-
         public void Publish(
             ref FileStream? channel,
             ref long[] forcedOffsets,
@@ -990,7 +1018,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             channel = null;
             FilePersistentState.Replace(_snapshotTmp, snapshotFile);
             FilePersistentState.Replace(_entriesTmp, logFile);
-            channel = new FileStream(logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+            channel = new FileStream(logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
             channel.Position = channel.Length;
             forcedOffsets = _offsets;
             forcedCount = _count;
@@ -1019,7 +1047,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             Snapshot.CopyTo(payload.AsSpan(16));
             using var channel = new FileStream(_snapshotTmp, FileMode.Create, FileAccess.Write, FileShare.None);
             WriteRecords(channel, payload);
-            channel.Flush(flushToDisk: true);
+            _sync(channel);
         }
 
         private void WriteEntries(List<LogEntry> entries, bool append)
@@ -1052,7 +1080,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
                 pos += framed.Length;
             }
 
-            channel.Flush(flushToDisk: true);
+            _sync(channel);
         }
     }
 

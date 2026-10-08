@@ -34,6 +34,14 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// </summary>
     private const int ProbeMillis = 5;
 
+    /// <summary>
+    /// A send that makes no progress for this long is a dead window, not a slow
+    /// reader. The writer drops that socket and sends the same frame again.
+    /// Loopback to a peer that is still reading finishes inside it. The 75 ms
+    /// connect budget stays connect-only.
+    /// </summary>
+    private const int SendStallMillis = 1000;
+
     private Action<Envelope>? _handler;
     private Action _wakeup = static () => { };
     private volatile bool _running;
@@ -191,7 +199,7 @@ public sealed class SocketTransport : ITransport, IDisposable
     }
 
     /// <inheritdoc />
-    public void Send(string sender, string recipient, object payload)
+    public bool Send(string sender, string recipient, object payload)
     {
         if (sender != _nodeId)
         {
@@ -203,17 +211,17 @@ public sealed class SocketTransport : ITransport, IDisposable
             if (!_peers.ContainsKey(recipient))
             {
                 Trace.WriteLine("drop send to unknown node id: " + recipient);
-                return;
+                return false;
             }
 
             if (_disabled.Contains(recipient))
             {
-                return;
+                return false;
             }
         }
 
         byte[] body = _codec.Encode(sender, payload);
-        PeerQueue(recipient).Writer.TryWrite(FrameCodec.Encode(body));
+        return PeerQueue(recipient).Writer.TryWrite(FrameCodec.Encode(body));
     }
 
     private Channel<byte[]> PeerQueue(string recipient)
@@ -444,10 +452,18 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     private bool OutboundLive(string peer)
     {
+        TcpClient? client;
         lock (_gate)
         {
-            return _outbound.TryGetValue(peer, out TcpClient? client) && IsLive(client);
+            if (!_outbound.TryGetValue(peer, out client))
+            {
+                return false;
+            }
         }
+
+        // The probe can block. It must not run while this lock is held, or one
+        // peer stalls SetPeer and every other writer.
+        return IsLive(client);
     }
 
     private bool IsDisabled(string peer)
@@ -471,25 +487,35 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     private TcpClient EnsureOutbound(string peerId)
     {
+        TcpClient? existing;
         IPEndPoint address;
         lock (_gate)
         {
-            if (_outbound.TryGetValue(peerId, out TcpClient? existing) && IsLive(existing))
-            {
-                return existing;
-            }
-
-            if (_outbound.Remove(peerId, out TcpClient? dead))
-            {
-                dead.Dispose();
-            }
-
+            _outbound.TryGetValue(peerId, out existing);
             if (!_peers.TryGetValue(peerId, out IPEndPoint? found))
             {
                 throw new IOException("no address for " + peerId);
             }
 
             address = found;
+        }
+
+        if (existing is not null && IsLive(existing))
+        {
+            return existing;
+        }
+
+        if (existing is not null)
+        {
+            lock (_gate)
+            {
+                if (_outbound.TryGetValue(peerId, out TcpClient? current) && ReferenceEquals(current, existing))
+                {
+                    _outbound.Remove(peerId);
+                }
+            }
+
+            existing.Dispose();
         }
 
         if (Volatile.Read(ref _failConnects) > 0 && Interlocked.Decrement(ref _failConnects) >= 0)
@@ -565,11 +591,13 @@ public sealed class SocketTransport : ITransport, IDisposable
                 // ConnectAsync leaves the native socket non-blocking, and the managed
                 // Blocking flag can already read true, so assigning true is a no-op.
                 // A full send buffer then fails the write and the writer drops a live
-                // slow reader mid-frame. Toggle so the native mode follows, and never
-                // time out a send: the peer being slow is not a dead socket.
+                // slow reader mid-frame. Toggle so the native mode follows. A send
+                // that makes no progress still ends, so a silent peer cannot pin the
+                // frame; a peer that is reading drains the buffer and the write returns.
                 raw.Blocking = false;
                 raw.Blocking = true;
-                raw.SendTimeout = 0;
+                raw.SendTimeout = SendStallMillis;
+                ArmDeadPeerTimeout(raw);
                 return client;
             }
             finally
@@ -588,8 +616,18 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
+    /// <summary>
+    /// Test hook. While set, a liveness probe waits here. Production leaves it null.
+    /// </summary>
+    internal static ManualResetEventSlim? ProbeStall;
+
+    /// <summary>How many liveness probes have started. Tests use this to see the probe is inside.</summary>
+    internal static int ProbeEntered;
+
     private static bool IsLive(TcpClient client)
     {
+        Interlocked.Increment(ref ProbeEntered);
+        ProbeStall?.Wait();
         try
         {
             if (!client.Connected)
@@ -603,30 +641,35 @@ public sealed class SocketTransport : ITransport, IDisposable
                 return true;
             }
 
-            // Poll said readable with nothing queued. On Windows that is true for a
-            // peer that has not sent. A blocking peek would wait forever, and a
-            // receive timeout of 1 ms stores WSAETIMEDOUT and looks like a dead
-            // socket, so the writer would reconnect and tear a live frame. Peek
-            // without blocking. A zero-byte peek is a shutdown only when the socket
-            // error says so.
+            // Poll said readable with nothing queued. On Windows that is also true
+            // for a peer that has not sent. A blocking peek would wait forever, and
+            // a receive timeout stores WSAETIMEDOUT and leaves the socket
+            // indeterminate, so this path never sets one. A non-blocking peek that
+            // would block is a live socket. A zero-byte peek is a graceful FIN and
+            // is dead: the next write can still succeed on a half-closed socket and
+            // the frame would never be sent again.
             try
             {
+                socket.Blocking = true;
                 socket.Blocking = false;
                 int peeked = socket.Receive(new byte[1], SocketFlags.Peek);
-                if (peeked > 0)
-                {
-                    return true;
-                }
-
-                return !IsHardDisconnect(SocketErrorCode(socket));
+                return peeked > 0;
             }
-            catch (SocketException ex) when (!IsHardDisconnect(ex.SocketErrorCode))
+            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.TimedOut or SocketError.IOPending or SocketError.TryAgain)
             {
                 return true;
             }
             finally
             {
-                socket.Blocking = true;
+                try
+                {
+                    socket.Blocking = false;
+                    socket.Blocking = true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The peer socket was dropped while the probe ran.
+                }
             }
         }
         catch (Exception)
@@ -635,22 +678,38 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private static SocketError SocketErrorCode(Socket socket)
+    private static void ArmDeadPeerTimeout(Socket raw)
     {
-        object? raw = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
-        return raw is int code ? (SocketError)code : SocketError.Success;
-    }
+        raw.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        try
+        {
+            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 1);
+            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
+            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        }
+        catch (SocketException)
+        {
+            // This OS has no per-socket keepalive timers. A blocked write still ends.
+        }
 
-    private static bool IsHardDisconnect(SocketError error) =>
-        error is SocketError.ConnectionReset
-            or SocketError.ConnectionAborted
-            or SocketError.Shutdown
-            or SocketError.Disconnecting
-            or SocketError.NotConnected
-            or SocketError.HostDown
-            or SocketError.NetworkDown
-            or SocketError.NetworkReset
-            or SocketError.ConnectionRefused;
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                // TCP_USER_TIMEOUT (18), milliseconds. Unacked data aborts a half-open peer.
+                raw.SetSocketOption(SocketOptionLevel.Tcp, (SocketOptionName)18, SendStallMillis);
+            }
+            else if (OperatingSystem.IsWindows())
+            {
+                // TCP_MAXRT (5), seconds.
+                raw.SetSocketOption(SocketOptionLevel.Tcp, (SocketOptionName)5, Math.Max(1, SendStallMillis / 1000));
+            }
+        }
+        catch (SocketException)
+        {
+            // Keepalive and the send stall still bound a peer that stops answering.
+        }
+    }
 
     private void ReadLoop(TcpClient client)
     {

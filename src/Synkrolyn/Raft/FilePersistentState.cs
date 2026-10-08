@@ -20,6 +20,7 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
     private readonly DataDirectoryLock _directoryLock;
     private long _currentTerm;
     private string? _votedFor;
+    private long _maxAdvertisedLeaseMillis;
     private byte[] _membership = [];
     private bool _closed;
 
@@ -65,6 +66,16 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
     }
 
     /// <inheritdoc />
+    public long MaxAdvertisedLeaseMillis
+    {
+        get
+        {
+            EnsureOpen();
+            return _maxAdvertisedLeaseMillis;
+        }
+    }
+
+    /// <inheritdoc />
     public void SetCurrentTerm(long term)
     {
         EnsureOpen();
@@ -106,6 +117,19 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
         }
 
         _votedFor = candidateId;
+        Persist();
+    }
+
+    /// <inheritdoc />
+    public void NoteAdvertisedLease(long millis)
+    {
+        EnsureOpen();
+        if (millis <= _maxAdvertisedLeaseMillis)
+        {
+            return;
+        }
+
+        _maxAdvertisedLeaseMillis = millis;
         Persist();
     }
 
@@ -183,15 +207,29 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
         }
 
         _votedFor = voteLen == 0 ? null : Be.Utf8(payload.AsSpan(12, voteLen));
+        int voteEnd = 12 + voteLen;
+        if (payload.Length == voteEnd)
+        {
+            _maxAdvertisedLeaseMillis = 0;
+            return;
+        }
+
+        if (payload.Length < voteEnd + 8)
+        {
+            throw new InvalidOperationException("hard-state lease bound truncated");
+        }
+
+        _maxAdvertisedLeaseMillis = Be.ReadLong(payload.AsSpan(voteEnd));
     }
 
     private void Persist()
     {
         byte[] voteBytes = _votedFor is null ? [] : Be.Utf8(_votedFor);
-        byte[] body = new byte[8 + 4 + voteBytes.Length];
+        byte[] body = new byte[8 + 4 + voteBytes.Length + 8];
         System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(body, _currentTerm);
         System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(body.AsSpan(8), voteBytes.Length);
         voteBytes.CopyTo(body.AsSpan(12));
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(body.AsSpan(12 + voteBytes.Length), _maxAdvertisedLeaseMillis);
         AtomicWrite(_file, FileName, ChecksummedRecords.Frame(body));
     }
 

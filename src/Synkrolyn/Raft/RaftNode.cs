@@ -97,7 +97,20 @@ public sealed class RaftNode
     private long _deltaBaseIndex;
     private long _lastLeaderContactMillis = long.MinValue;
     private long _leaderAdvertisedLeaseMillis;
-    private double _clockDriftBound;
+
+    /// <summary>
+    /// Clock time before which a restarted node refuses votes. Covers the larger
+    /// of this node's timeout and the largest lease bound stored with the term.
+    /// </summary>
+    private long _restartLeaseUntilMillis = long.MinValue;
+    /// <summary>
+    /// Thesis §6.4.1. One percent covers a follower clock that runs that much faster
+    /// than the leader without letting it vote inside the leader's lease. Zero left
+    /// production with no margin, because the host never set a bound.
+    /// </summary>
+    public const double DefaultClockDriftBound = 0.01;
+
+    private double _clockDriftBound = DefaultClockDriftBound;
     private long _lastAcceptedLeaderCommit;
     private bool _lastPreVoteGranted;
     private Func<long, long> _electionJitter = static timeout => timeout;
@@ -117,6 +130,9 @@ public sealed class RaftNode
     private long _lastApplied;
     private readonly List<PendingRead> _pendingReads = [];
     private readonly HashSet<string> _aeInFlightPeers = [];
+    private readonly Dictionary<string, long> _aeInFlightSince = [];
+    private readonly HashSet<string> _aeSilentPeers = [];
+    private readonly Dictionary<long, long> _proposedTerms = [];
     private long _nextReadTicket;
     private StateCapture? _openCapture;
     private Action? _wakeDrain;
@@ -326,7 +342,8 @@ public sealed class RaftNode
 
     /// <summary>
     /// Clock-drift bound ρ from thesis §6.4.1. The leader's lease is the advertised
-    /// bound times (1 − ρ). Followers keep gating on the full bound. The default is 0.
+    /// bound times (1 − ρ). Followers keep gating on the full bound. The default is
+    /// <see cref="DefaultClockDriftBound"/>.
     /// </summary>
     public void SetClockDriftBound(double rho)
     {
@@ -462,9 +479,15 @@ public sealed class RaftNode
             if (_persistentState.CurrentTerm > 0)
             {
                 _lastLeaderContactMillis = _clock.Millis;
+                long restartGate = Math.Max(_electionTimeoutMillis, _persistentState.MaxAdvertisedLeaseMillis);
+                _restartLeaseUntilMillis = _clock.Millis + restartGate;
             }
 
             ResetElectionDeadline();
+            if (_restartLeaseUntilMillis != long.MinValue && _electionDeadline < _restartLeaseUntilMillis)
+            {
+                _electionDeadline = _restartLeaseUntilMillis;
+            }
         }
 
         _clock.OnAdvance(EnqueueTick);
@@ -660,7 +683,8 @@ public sealed class RaftNode
     {
         lock (_eventLock)
         {
-            var waiter = new ApplyWaiter(index, ProposalTerm(index));
+            long term = _proposedTerms.TryGetValue(index, out long proposed) ? proposed : ProposalTerm(index);
+            var waiter = new ApplyWaiter(index, term);
             if (_role != Role.Leader)
             {
                 waiter.Failed = true;
@@ -670,12 +694,21 @@ public sealed class RaftNode
             if (ProposalSucceeded(waiter))
             {
                 waiter.Applied = true;
+                _proposedTerms.Remove(index);
+                return waiter;
+            }
+
+            if (SnapshotCovers(waiter))
+            {
+                waiter.Indeterminate = true;
+                _proposedTerms.Remove(index);
                 return waiter;
             }
 
             if (ProposalLost(waiter))
             {
                 waiter.Failed = true;
+                _proposedTerms.Remove(index);
                 return waiter;
             }
 
@@ -712,6 +745,7 @@ public sealed class RaftNode
 
             _pendingReads.Add(read);
             NoteRead(read);
+            ExpireUnackedInFlight(_clock.Millis);
             if (!AeInFlightLocked())
             {
                 ReplicateToAll();
@@ -978,6 +1012,7 @@ public sealed class RaftNode
 
         private volatile bool _applied;
         private volatile bool _failed;
+        private volatile bool _indeterminate;
 
         /// <summary>True after the index is applied.</summary>
         public bool Applied
@@ -992,6 +1027,16 @@ public sealed class RaftNode
             get => _failed;
             internal set => _failed = value;
         }
+
+        /// <summary>
+        /// True when a snapshot covers the index, so the proposal may already be in the
+        /// state machine. Not success, and not a failure the client may retry.
+        /// </summary>
+        public bool Indeterminate
+        {
+            get => _indeterminate;
+            internal set => _indeterminate = value;
+        }
     }
 
     private void OnTick()
@@ -999,6 +1044,7 @@ public sealed class RaftNode
         long now = _clock.Millis;
         if (_role == Role.Leader)
         {
+            ExpireUnackedInFlight(now);
             MaybeFinishTransfer();
             if (_role != Role.Leader)
             {
@@ -1207,7 +1253,9 @@ public sealed class RaftNode
         }
 
         long index = _log.LastIndex + 1;
-        AppendLocked(new LogEntry(index, CurrentTermLocked(), command));
+        long term = CurrentTermLocked();
+        AppendLocked(new LogEntry(index, term, command));
+        _proposedTerms[index] = term;
         ReplicateToAll();
         MaybeAdvanceCommit();
         return index;
@@ -1250,7 +1298,7 @@ public sealed class RaftNode
 
         long sentAtNow = _clock.Millis;
         sent[stamp] = sentAtNow;
-        _aeInFlightPeers.Add(peer);
+        TrackInFlight(peer, sentAtNow);
         long leaseBound = ReadLeaseBoundMillis();
         foreach (long key in sent.Keys.ToArray())
         {
@@ -1259,18 +1307,32 @@ public sealed class RaftNode
                 sent.Remove(key);
             }
         }
-        _transport.Send(
-            _nodeId,
-            peer,
-            new AppendEntries(
-                CurrentTermLocked(),
+        bool accepted;
+        try
+        {
+            accepted = _transport.Send(
                 _nodeId,
-                prevIndex,
-                prevTerm,
-                entries,
-                _commitIndex,
-                stamp,
-                ReadLeaseBoundMillis()));
+                peer,
+                new AppendEntries(
+                    CurrentTermLocked(),
+                    _nodeId,
+                    prevIndex,
+                    prevTerm,
+                    entries,
+                    _commitIndex,
+                    stamp,
+                    ReadLeaseBoundMillis()));
+        }
+        catch (Exception)
+        {
+            accepted = false;
+        }
+
+        if (!accepted)
+        {
+            // The frame never left. A later read must not wait for this peer's ack.
+            SilencePeer(peer);
+        }
     }
 
     private void SendSnapshot(string peer)
@@ -1409,6 +1471,11 @@ public sealed class RaftNode
             return false;
         }
 
+        if (_restartLeaseUntilMillis != long.MinValue && _clock.Millis < _restartLeaseUntilMillis)
+        {
+            return true;
+        }
+
         long gate = _leaderAdvertisedLeaseMillis > 0 ? _leaderAdvertisedLeaseMillis : _electionTimeoutMillis;
         return _clock.Millis - _lastLeaderContactMillis < gate;
     }
@@ -1481,6 +1548,10 @@ public sealed class RaftNode
         if (append.LeaseBoundMillis > 0)
         {
             _leaderAdvertisedLeaseMillis = append.LeaseBoundMillis;
+            if (append.LeaseBoundMillis > _persistentState.MaxAdvertisedLeaseMillis)
+            {
+                _persistentState.NoteAdvertisedLease(append.LeaseBoundMillis);
+            }
         }
 
         ResetElectionDeadline();
@@ -1600,7 +1671,7 @@ public sealed class RaftNode
             return;
         }
 
-        _aeInFlightPeers.Remove(from);
+        HearPeer(from);
         if (response.Success)
         {
             NoteQuorumContact(from);
@@ -2277,10 +2348,19 @@ public sealed class RaftNode
             if (ProposalSucceeded(waiter))
             {
                 waiter.Applied = true;
+                _proposedTerms.Remove(waiter.Index);
+                return true;
+            }
+
+            if (SnapshotCovers(waiter))
+            {
+                waiter.Indeterminate = true;
+                _proposedTerms.Remove(waiter.Index);
                 return true;
             }
 
             waiter.Failed = true;
+            _proposedTerms.Remove(waiter.Index);
             return true;
         });
     }
@@ -2310,9 +2390,12 @@ public sealed class RaftNode
         return _log.Read(waiter.Index).Term == waiter.Term;
     }
 
+    private bool SnapshotCovers(ApplyWaiter waiter) =>
+        _lastApplied >= waiter.Index && waiter.Index <= _log.LastIncludedIndex;
+
     private bool ProposalLost(ApplyWaiter waiter)
     {
-        if (_lastApplied < waiter.Index)
+        if (_lastApplied < waiter.Index || SnapshotCovers(waiter))
         {
             return false;
         }
@@ -2473,6 +2556,8 @@ public sealed class RaftNode
         _linearizableAckSendMillis.Clear();
         _aeSendMillis.Clear();
         _aeInFlightPeers.Clear();
+        _aeInFlightSince.Clear();
+        _aeSilentPeers.Clear();
         if (_transferStatus == LeadershipTransferStatus.CatchingUp)
         {
             _transferStatus = LeadershipTransferStatus.Aborted;
@@ -2732,6 +2817,52 @@ public sealed class RaftNode
     }
 
     private bool AeInFlightLocked() => _aeInFlightPeers.Count > 0;
+
+    private void TrackInFlight(string peer, long sentAt)
+    {
+        if (_aeSilentPeers.Contains(peer))
+        {
+            return;
+        }
+
+        _aeInFlightPeers.Add(peer);
+        _aeInFlightSince[peer] = sentAt;
+    }
+
+    /// <summary>
+    /// The peer is not part of an in-flight round until it answers again.
+    /// Heartbeats are still sent. They must not pin every later read.
+    /// </summary>
+    private void SilencePeer(string peer)
+    {
+        _aeInFlightPeers.Remove(peer);
+        _aeInFlightSince.Remove(peer);
+        _aeSilentPeers.Add(peer);
+    }
+
+    private void HearPeer(string peer)
+    {
+        _aeInFlightPeers.Remove(peer);
+        _aeInFlightSince.Remove(peer);
+        _aeSilentPeers.Remove(peer);
+    }
+
+    /// <summary>
+    /// A send that was accepted and then reset, or an ack that never arrives,
+    /// leaves the peer in flight. One heartbeat with no answer is enough to
+    /// stop waiting. The next read starts a round on the peers that are still up.
+    /// </summary>
+    private void ExpireUnackedInFlight(long now)
+    {
+        foreach (string peer in _aeInFlightPeers.ToArray())
+        {
+            long sent = _aeInFlightSince.GetValueOrDefault(peer, long.MinValue);
+            if (sent == long.MinValue || now - sent >= _heartbeatIntervalMillis)
+            {
+                SilencePeer(peer);
+            }
+        }
+    }
 
     private bool ReadNeedsAnotherRound(string peer, long stamp)
     {

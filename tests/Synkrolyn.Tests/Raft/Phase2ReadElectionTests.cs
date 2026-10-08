@@ -456,7 +456,7 @@ public class Phase2ReadElectionTests
             _early = early;
         }
 
-        public void Send(string sender, string recipient, object payload)
+        public bool Send(string sender, string recipient, object payload)
         {
             if (payload is AppendEntriesResponse { Success: true } ack
                 && _logs.TryGetValue(sender, out IRaftLog? log)
@@ -465,7 +465,7 @@ public class Phase2ReadElectionTests
                 _early.Add(sender + ":" + ack.MatchIndex + "<" + log.DurableIndex);
             }
 
-            _inner.Send(sender, recipient, payload);
+            return _inner.Send(sender, recipient, payload);
         }
     }
 }

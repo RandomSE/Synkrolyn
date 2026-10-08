@@ -35,6 +35,14 @@ public sealed class InMemoryKvStore : IKvStore
         ArgumentNullException.ThrowIfNull(command);
         if (command.Length == 0)
         {
+            lock (_gate)
+            {
+                if (index > _appliedThrough)
+                {
+                    _appliedThrough = index;
+                }
+            }
+
             return;
         }
 
@@ -66,6 +74,7 @@ public sealed class InMemoryKvStore : IKvStore
                 {
                     if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
                     {
+                        _appliedThrough = Math.Max(_appliedThrough, index);
                         return;
                     }
 
@@ -81,6 +90,7 @@ public sealed class InMemoryKvStore : IKvStore
                     _map = _map.Remove(decoded.Key);
                 }
 
+                _appliedThrough = Math.Max(_appliedThrough, index);
                 return;
             }
         }

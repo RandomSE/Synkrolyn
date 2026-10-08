@@ -118,6 +118,12 @@ public sealed class KvClient
 
     private long? ProposeWait(byte[] command)
     {
+        if (_applyWaiter is { Indeterminate: true })
+        {
+            // A retry would append the command again. The snapshot may already contain it.
+            return null;
+        }
+
         long? index = _raft.Propose(command);
         if (index is null)
         {
@@ -134,6 +140,11 @@ public sealed class KvClient
     private long? Completed()
     {
         if (_pendingIndex is null)
+        {
+            return null;
+        }
+
+        if (_applyWaiter is { Indeterminate: true })
         {
             return null;
         }

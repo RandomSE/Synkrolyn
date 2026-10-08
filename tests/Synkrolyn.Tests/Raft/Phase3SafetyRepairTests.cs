@@ -14,6 +14,40 @@ public class Phase3SafetyRepairTests
     private static readonly TimeSpan Heartbeat = TimeSpan.FromMilliseconds(20);
 
     [Fact]
+    public void TruncateWhileArmedReaderHoldsTheLog_renames()
+    {
+        string dir = Directory.CreateTempSubdirectory("synkrolyn-armed-rename-").FullName;
+        try
+        {
+            var log = new FileRaftLog(dir);
+            log.Append(new LogEntry(1, 1, "a"u8.ToArray()));
+            log.Append(new LogEntry(2, 1, "b"u8.ToArray()));
+            log.Append(new LogEntry(3, 1, "c"u8.ToArray()));
+            log.Force();
+            log.ArmCompaction(1, 1);
+            Assert.True(
+                log.LastArmedShare.HasFlag(FileShare.Delete),
+                "armed reader has no FileShare.Delete, so Windows cannot rename raft.log");
+            // A conflicting suffix rewrites raft.log while the snapshot reader
+            // still has the pre-truncate file open. On Windows that rename fails
+            // unless the reader was opened with FileShare.Delete.
+            log.TruncateFrom(2);
+            Assert.Equal(1, log.LastIndex);
+            Assert.Equal(1, log.Read(1).Term);
+            StagedCompaction staged = log.StageCompaction(1, 1, [9]);
+            staged.Write();
+            log.Dispose();
+            using var reopened = new FileRaftLog(dir);
+            Assert.Equal(1, reopened.LastIndex);
+            Assert.Equal("a"u8.ToArray(), reopened.Read(1).Command);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void ConcurrentAppendAndCompact_onBothLogs_staysContiguous()
     {
         var memoryError = StressLog(new InMemoryRaftLog());
@@ -59,6 +93,38 @@ public class Phase3SafetyRepairTests
     }
 
     [Fact]
+    public void CompactionCommit_doesNotFsyncTheNewFile()
+    {
+        string dir = Directory.CreateTempSubdirectory("synkrolyn-commit-sync-").FullName;
+        try
+        {
+            var log = new FileRaftLog(dir);
+            log.Append(new LogEntry(1, 1, "a"u8.ToArray()));
+            log.Append(new LogEntry(2, 1, "b"u8.ToArray()));
+            log.Append(new LogEntry(3, 1, "c"u8.ToArray()));
+            log.Force();
+            log.ArmCompaction(1, 1);
+            log.Append(new LogEntry(4, 1, "d"u8.ToArray()));
+            StagedCompaction staged = log.StageCompaction(1, 1, [9]);
+            staged.Write();
+            int synced = log.DataSyncCount;
+            staged.Commit();
+            Assert.Equal(synced, log.DataSyncCount);
+            Assert.Equal("d"u8.ToArray(), log.Read(4).Command);
+            log.Force();
+            log.Dispose();
+            using var reopened = new FileRaftLog(dir);
+            Assert.Equal(1, reopened.LastIncludedIndex);
+            Assert.Equal("b"u8.ToArray(), reopened.Read(2).Command);
+            Assert.Equal("d"u8.ToArray(), reopened.Read(4).Command);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void CompactionCommit_runsOnTheRaftThread()
     {
         var cluster = new ClusterHarness();
@@ -80,6 +146,48 @@ public class Phase3SafetyRepairTests
         Assert.True(executorDone.Wait(TimeSpan.FromSeconds(2)));
         leader.Drain();
         Assert.Equal(raftThread, log.CommitThreadId);
+    }
+
+    [Fact]
+    public void SnapshotCoveredProposal_isIndeterminate()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        long? index = cluster.Propose("n1", "once"u8.ToArray());
+        Assert.NotNull(index);
+        cluster.DrainAll();
+        RaftNode leader = cluster.Node("n1");
+        Assert.True(leader.LastApplied >= index);
+        leader.Snapshot();
+        cluster.DrainAll();
+        Assert.True(cluster.Log("n1").LastIncludedIndex >= index);
+        RaftNode.ApplyWaiter waiter = leader.RegisterApplyWaiter(index.Value);
+        Assert.False(waiter.Failed);
+        Assert.False(waiter.Applied);
+        Assert.True(waiter.Indeterminate);
+    }
+
+    [Fact]
+    public void ProposalTerm_matchesTheAppendNotALaterRead()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        RaftNode leader = cluster.Node("n1");
+        long? index = leader.Propose("ours"u8.ToArray());
+        Assert.NotNull(index);
+        cluster.DrainAll();
+        Assert.True(leader.LastApplied >= index);
+        IRaftLog log = cluster.Log("n1");
+        long appendedTerm = log.Read(index.Value).Term;
+        log.TruncateFrom(index.Value);
+        log.Append(new LogEntry(index.Value, appendedTerm + 1, "theirs"u8.ToArray()));
+        RaftNode.ApplyWaiter waiter = leader.RegisterApplyWaiter(index.Value);
+        Assert.Equal(appendedTerm, waiter.Term);
+        Assert.False(waiter.Applied);
     }
 
     [Fact]
@@ -151,6 +259,68 @@ public class Phase3SafetyRepairTests
         Assert.NotEqual("n3", state.VotedFor);
         Assert.True(cluster.Harness.Node("n1").QuorumLeaseValid);
         Assert.Equal("v", cluster.Clients["n1"].BoundedStaleGet("k"));
+    }
+
+    [Fact]
+    public void RestartedFastVoter_insideALongerAdvertisedLease_doesNotGrantAVote()
+    {
+        string dir = Directory.CreateTempSubdirectory("synkrolyn-lease-restart-").FullName;
+        var heartbeat = TimeSpan.FromMilliseconds(20);
+        var cluster = new ClusterHarness();
+        try
+        {
+            var state = new FilePersistentState(dir);
+            var log = new FileRaftLog(dir);
+            cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(600), heartbeat);
+            cluster.AddNode(
+                "n2",
+                ["n1", "n3"],
+                TimeSpan.FromMilliseconds(10_000),
+                heartbeat,
+                state: state,
+                log: log);
+            cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(10_000), heartbeat);
+            cluster.Advance(600);
+            Assert.Equal(Role.Leader, cluster.Node("n1").Role);
+            cluster.Advance(20);
+            Assert.True(cluster.Node("n1").QuorumLeaseValid);
+            Assert.True(state.CurrentTerm > 0);
+            state.Dispose();
+            log.Dispose();
+            var reloaded = new FilePersistentState(dir);
+            var reloadedLog = new FileRaftLog(dir);
+            cluster.Transport.PartitionBidirectional("n1", "n2");
+            cluster.Transport.PartitionBidirectional("n3", "n2");
+            var restarted = new RaftNode(
+                "n2",
+                ["n1", "n3"],
+                cluster.Clock,
+                cluster.Transport,
+                reloaded,
+                reloadedLog,
+                TimeSpan.FromMilliseconds(150),
+                heartbeat);
+            restarted.SetElectionJitter(static timeout => timeout);
+            cluster.Transport.Reregister("n2", restarted.Receive);
+            restarted.Start();
+            cluster.Clock.Advance(200);
+            restarted.Drain();
+            long term = reloaded.CurrentTerm;
+            restarted.Receive(new Envelope(
+                "n3",
+                "n2",
+                new RequestVote(term + 1, "n3", reloadedLog.LastIndex, reloadedLog.LastTerm)));
+            restarted.Drain();
+            Assert.NotEqual("n3", reloaded.VotedFor);
+            Assert.True(cluster.Node("n1").QuorumLeaseValid);
+            reloaded.Dispose();
+            reloadedLog.Dispose();
+        }
+        finally
+        {
+            cluster.CloseDurableHandles();
+            Directory.Delete(dir, true);
+        }
     }
 
     [Fact]
@@ -232,6 +402,55 @@ public class Phase3SafetyRepairTests
     }
 
     [Fact]
+    public void DeadPeer_doesNotBlockTheNextReadRound()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
+        int heartbeats = 0;
+        RaftNode n2 = cluster.Node("n2");
+        cluster.Transport.Reregister("n2", envelope =>
+        {
+            if (envelope.Payload is AppendEntries)
+            {
+                heartbeats++;
+            }
+
+            n2.Receive(envelope);
+        });
+        cluster.Transport.PartitionBidirectional("n1", "n3");
+        cluster.Advance(Heartbeat.Milliseconds);
+        RaftNode leader = cluster.Node("n1");
+        int before = heartbeats;
+        ReadIndexStart? started = leader.BeginReadIndex();
+        Assert.NotNull(started);
+        leader.Drain();
+        Assert.Equal(before + 1, heartbeats);
+        cluster.DrainAll();
+        Assert.True(leader.ReadIndexSatisfied(started.Value.Ticket));
+    }
+
+    [Fact]
+    public void DefaultClockDriftBound_shrinksTheLeaderLease()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(1_000));
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(100);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
+        RaftNode leader = cluster.Node("n1");
+        Assert.True(leader.QuorumLeaseValid);
+        cluster.Transport.PartitionBidirectional("n1", "n2");
+        cluster.Advance(99);
+        Assert.False(leader.QuorumLeaseValid);
+    }
+
+    [Fact]
     public void SkewedFollowerClock_leaderLeaseShrinksByDriftBound()
     {
         var leaderClock = new FakeClock();
@@ -293,6 +512,17 @@ public class Phase3SafetyRepairTests
         leaderClock.Advance(20);
         leader.Drain();
         Assert.False(leader.QuorumLeaseValid);
+    }
+
+    [Fact]
+    public void ApplyAtOrBelowLastApplied_isSkipped()
+    {
+        var store = new InMemoryKvStore();
+        store.Apply(1, KvCommandCodec.EncodePut("k", "old"));
+        store.Apply(1, KvCommandCodec.EncodePut("k", "newer"));
+        Assert.Equal("old", store.Get("k"));
+        store.Apply(2, KvCommandCodec.EncodePut("k", "next"));
+        Assert.Equal("next", store.Get("k"));
     }
 
     [Fact]
