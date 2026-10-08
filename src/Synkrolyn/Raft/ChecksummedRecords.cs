@@ -61,6 +61,49 @@ internal static class ChecksummedRecords
 
         return payload;
     }
+
+    /// <summary>Writes <paramref name="payload"/> as one or more capped records.</summary>
+    public static void WriteRecords(Stream channel, byte[] payload)
+    {
+        ArgumentNullException.ThrowIfNull(channel);
+        ArgumentNullException.ThrowIfNull(payload);
+        int offset = 0;
+        do
+        {
+            int length = Math.Min(MaxPayloadBytes, payload.Length - offset);
+            byte[] slice = payload.AsSpan(offset, length).ToArray();
+            channel.Write(Frame(slice));
+            offset += length;
+        }
+        while (offset < payload.Length);
+    }
+
+    /// <summary>Concatenates every checksummed record in <paramref name="framed"/>.</summary>
+    public static byte[] ReadRecords(byte[] framed)
+    {
+        ArgumentNullException.ThrowIfNull(framed);
+        var payload = new List<byte>(framed.Length);
+        int pos = 0;
+        while (pos < framed.Length)
+        {
+            if (framed.Length - pos < 8)
+            {
+                throw new InvalidOperationException("incomplete checksummed record");
+            }
+
+            int length = BinaryPrimitives.ReadInt32BigEndian(framed.AsSpan(pos));
+            int record = 4 + length + 4;
+            if (length < 0 || length > MaxPayloadBytes || pos + record > framed.Length)
+            {
+                throw new InvalidOperationException("incomplete checksummed record");
+            }
+
+            payload.AddRange(Unframe(framed.AsSpan(pos, record).ToArray()));
+            pos += record;
+        }
+
+        return payload.ToArray();
+    }
 }
 
 /// <summary>Big-endian writers and readers used by durable records and RPC frames.</summary>

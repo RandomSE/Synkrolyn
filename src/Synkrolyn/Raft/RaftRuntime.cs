@@ -33,6 +33,7 @@ public sealed class RaftRuntime : IDisposable
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _productionJitter = productionJitter;
         _transport.SetWakeup(Wakeup);
+        _node.SetDrainWakeup(Wakeup);
     }
 
     /// <summary>Alias of the production constructor.</summary>
@@ -104,6 +105,14 @@ public sealed class RaftRuntime : IDisposable
         catch (Exception ex)
         {
             _uncaught = ex;
+            try
+            {
+                _node.StopAfterRaftThreadFault();
+            }
+            catch (Exception stop)
+            {
+                _uncaught = new AggregateException(ex, stop);
+            }
         }
     }
 

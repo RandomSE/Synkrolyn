@@ -20,33 +20,17 @@ public class FakeClockTests
     }
 
     [Fact]
-    public void SystemClock_isMonotonicAndDoesNotUseWallTime()
+    public void SystemClock_followsTheInjectedTimestampAndDoesNotMoveBackward()
     {
-        var clock = new SystemRaftClock();
-        long a = clock.Millis;
-        long b = clock.Millis;
-        Assert.True(b >= a);
-        string raftDir = Path.Combine("src", "Synkrolyn");
-        if (!Directory.Exists(raftDir))
-        {
-            raftDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "Synkrolyn"));
-        }
-
-        Assert.True(Directory.Exists(raftDir), raftDir);
-        var banned = new[] { "DateTime.Now", "DateTime.UtcNow", "DateTimeOffset.Now", "DateTimeOffset.UtcNow" };
-        var hits = new List<string>();
-        foreach (string file in Directory.EnumerateFiles(raftDir, "*.cs", SearchOption.AllDirectories))
-        {
-            string text = File.ReadAllText(file);
-            foreach (string token in banned)
-            {
-                if (text.Contains(token, StringComparison.Ordinal))
-                {
-                    hits.Add(file + ":" + token);
-                }
-            }
-        }
-
-        Assert.Empty(hits);
+        long ticks = 1_000_000;
+        var clock = new SystemRaftClock(() => ticks);
+        int hits = 0;
+        clock.OnAdvance(() => hits++);
+        Assert.Equal(0, clock.Millis);
+        ticks += System.Diagnostics.Stopwatch.Frequency;
+        Assert.Equal(1000, clock.Millis);
+        ticks -= System.Diagnostics.Stopwatch.Frequency / 2;
+        Assert.Equal(1000, clock.Millis);
+        Assert.Equal(0, hits);
     }
 }

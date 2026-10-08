@@ -146,6 +146,25 @@ public sealed class KvClusterTests
     }
 
     [Fact]
+    public void Put_isObservedWhenTheSameNodeCommitsItAfterSteppingDown()
+    {
+        using var cluster = NewCluster();
+        ElectLeaderN1(cluster);
+        cluster.Harness.Isolate("n1");
+        Assert.Null(cluster.Clients["n1"].Put("k", "v"));
+        Assert.Equal(2, cluster.Harness.Log("n1").LastIndex);
+        cluster.Harness.Node("n1").StepDownForTest();
+        cluster.Harness.Heal("n1");
+        for (int i = 0; i < 30 && cluster.Harness.Node("n1").LastApplied < 2; i++)
+        {
+            cluster.Harness.Advance(20);
+        }
+
+        Assert.Equal("v", cluster.Clients["n1"].Get("k"));
+        Assert.NotNull(cluster.Clients["n1"].AwaitCommitted());
+    }
+
+    [Fact]
     public void StateMachineSafety_sameIndexSameKvEffect()
     {
         using var cluster = NewCluster();
@@ -334,7 +353,7 @@ public sealed class ReadIndexTests
         cluster.Harness.Advance(20);
         Assert.Equal("v", cluster.Clients["n2"].BoundedStaleGet("k"));
         cluster.Harness.Isolate("n2");
-        cluster.Harness.Advance(RaftNode.PreVoteLeaderLeaseFactor * 20);
+        cluster.Harness.Advance(400);
         Assert.Equal(Role.Follower, cluster.Harness.Node("n2").Role);
         Assert.False(cluster.Harness.Node("n2").FollowerReadLeaseValid);
         Assert.Null(cluster.Clients["n2"].BoundedStaleGet("k"));
@@ -348,7 +367,7 @@ public sealed class ReadIndexTests
         using var cluster = new KvClusterTests.KvFixture(Heartbeat);
         Elect(cluster);
         Assert.Equal(1, cluster.Harness.Node("n1").CommitIndex);
-        Assert.Equal(1, cluster.Harness.Node("n1").BeginReadIndex());
+        Assert.Equal(1, cluster.Harness.Node("n1").BeginReadIndex()?.Index);
         Assert.Null(cluster.Harness.TakeLinearizableGet(cluster.Clients["n1"], "n1", "k"));
         cluster.Clients["n1"].Put("k", "v");
         cluster.Harness.DrainAll();

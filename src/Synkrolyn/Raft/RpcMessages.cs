@@ -1,11 +1,18 @@
 namespace Synkrolyn.Raft;
 
 /// <summary>RequestVote RPC, including the PreVote probe flag.</summary>
-public sealed record RequestVote(long Term, string CandidateId, long LastLogIndex, long LastLogTerm, bool PreVote)
+public sealed record RequestVote(
+    long Term,
+    string CandidateId,
+    long LastLogIndex,
+    long LastLogTerm,
+    bool PreVote,
+    long Round = 0,
+    bool LeadershipTransfer = false)
 {
     /// <summary>A real vote request. <see cref="PreVote"/> is false.</summary>
     public RequestVote(long term, string candidateId, long lastLogIndex, long lastLogTerm)
-        : this(term, candidateId, lastLogIndex, lastLogTerm, false)
+        : this(term, candidateId, lastLogIndex, lastLogTerm, false, 0)
     {
     }
 
@@ -25,16 +32,16 @@ public sealed record RequestVote(long Term, string CandidateId, long LastLogInde
 }
 
 /// <summary>RequestVote result. <see cref="PreVote"/> answers must not count as real votes.</summary>
-public sealed record RequestVoteResponse(long Term, bool VoteGranted, bool PreVote)
+public sealed record RequestVoteResponse(long Term, bool VoteGranted, bool PreVote, long Round = 0)
 {
     /// <summary>A real vote response.</summary>
     public RequestVoteResponse(long term, bool voteGranted)
-        : this(term, voteGranted, false)
+        : this(term, voteGranted, false, 0)
     {
     }
 }
 
-/// <summary>AppendEntries RPC. An empty entry list is a heartbeat.</summary>
+/// <summary>AppendEntries RPC. An empty entry list is a heartbeat. <see cref="LeaseBoundMillis"/> is the leader's read-lease window.</summary>
 public sealed record AppendEntries(
     long Term,
     string LeaderId,
@@ -42,7 +49,8 @@ public sealed record AppendEntries(
     long PrevLogTerm,
     IReadOnlyList<LogEntry> Entries,
     long LeaderCommit,
-    long Stamp)
+    long Stamp,
+    long LeaseBoundMillis = 0)
 {
     /// <summary>AppendEntries with stamp 0.</summary>
     public AppendEntries(
@@ -71,7 +79,8 @@ public sealed record AppendEntriesResponse(
     long XLen,
     long XTerm,
     long XIndex,
-    long Stamp)
+    long Stamp,
+    long PrevLogIndex = 0)
 {
     /// <summary>Success or rejection with no fast-backup hint and stamp 0.</summary>
     public AppendEntriesResponse(long term, bool success, long matchIndex)
@@ -147,7 +156,13 @@ public sealed class InstallSnapshot
 }
 
 /// <summary>InstallSnapshot reply. Installed index and term echo the follower's snapshot generation.</summary>
-public sealed record InstallSnapshotResponse(long Term, bool Success, bool Done, long InstalledIndex, long InstalledTerm)
+public sealed record InstallSnapshotResponse(
+    long Term,
+    bool Success,
+    bool Done,
+    long InstalledIndex,
+    long InstalledTerm,
+    long NextOffset = 0)
 {
     /// <summary>In-progress or failed reply. Installed index and term are zero.</summary>
     public InstallSnapshotResponse(long term, bool success, bool done)

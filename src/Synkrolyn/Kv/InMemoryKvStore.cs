@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Text;
+using Synkrolyn.Raft;
 
 namespace Synkrolyn.Kv;
 
@@ -11,9 +13,21 @@ public sealed class InMemoryKvStore : IKvStore
 {
     private static readonly byte[] SerialMagic = "PTCS"u8.ToArray();
     private const int SerialSnapshotVersion = 1;
-    private readonly Dictionary<string, string> _map = [];
-    private readonly Dictionary<string, long> _clientSerials = [];
-    private Dictionary<string, string>? _lastSnapMap;
+    private readonly object _gate = new();
+    private ImmutableDictionary<string, string> _map = ImmutableDictionary<string, string>.Empty;
+    private ImmutableDictionary<string, long> _clientSerials = ImmutableDictionary<string, long>.Empty;
+    private ImmutableDictionary<string, string>? _lastSnapMap;
+    private int _epoch;
+    private long _appliedThrough = -1;
+
+    /// <summary>Runs while snapshot bytes are encoded. Tests block here. Production leaves it null.</summary>
+    internal Action? WhileEncoding { get; set; }
+
+    /// <summary>
+    /// Runs once in the gap after the epoch is sampled and before the mutation is
+    /// published. Tests restore or snapshot there. Production leaves it null.
+    /// </summary>
+    internal Action? AfterEpochSample { get; set; }
 
     /// <inheritdoc />
     public void Apply(long index, byte[] command)
@@ -21,86 +35,184 @@ public sealed class InMemoryKvStore : IKvStore
         ArgumentNullException.ThrowIfNull(command);
         if (command.Length == 0)
         {
+            lock (_gate)
+            {
+                if (index > _appliedThrough)
+                {
+                    _appliedThrough = index;
+                }
+            }
+
             return;
         }
 
         KvCommandCodec.Command decoded = KvCommandCodec.Decode(command);
-        if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
+        while (true)
         {
-            if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
+            int seen;
+            lock (_gate)
             {
-                return;
+                seen = _epoch;
             }
 
-            _clientSerials[decoded.ClientId] = decoded.Serial;
-        }
+            Action? overlap = AfterEpochSample;
+            AfterEpochSample = null;
+            overlap?.Invoke();
+            lock (_gate)
+            {
+                if (seen != _epoch)
+                {
+                    continue;
+                }
 
-        if (decoded.Operation == KvCommandCodec.Op.Put)
-        {
-            _map[decoded.Key] = decoded.Value;
-        }
-        else
-        {
-            _map.Remove(decoded.Key);
+                if (index <= _appliedThrough)
+                {
+                    return;
+                }
+
+                if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
+                {
+                    if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
+                    {
+                        _appliedThrough = Math.Max(_appliedThrough, index);
+                        return;
+                    }
+
+                    _clientSerials = _clientSerials.SetItem(decoded.ClientId, decoded.Serial);
+                }
+
+                if (decoded.Operation == KvCommandCodec.Op.Put)
+                {
+                    _map = _map.SetItem(decoded.Key, decoded.Value);
+                }
+                else
+                {
+                    _map = _map.Remove(decoded.Key);
+                }
+
+                _appliedThrough = Math.Max(_appliedThrough, index);
+                return;
+            }
         }
     }
 
     /// <inheritdoc />
     public byte[] Snapshot()
     {
-        byte[] bytes = EncodeMapLocked();
-        _lastSnapMap = new Dictionary<string, string>(_map);
-        return bytes;
+        lock (_gate)
+        {
+            WhileEncoding?.Invoke();
+            byte[] bytes = Encode(_map, _clientSerials);
+            _lastSnapMap = _map;
+            return bytes;
+        }
+    }
+
+    /// <inheritdoc />
+    public StateCapture CaptureState()
+    {
+        lock (_gate)
+        {
+            ImmutableDictionary<string, string> map = _map;
+            ImmutableDictionary<string, long> serials = _clientSerials;
+            ImmutableDictionary<string, string>? baseline = _lastSnapMap;
+            return StateCapture.Frozen(
+                () =>
+                {
+                    WhileEncoding?.Invoke();
+                    return Encode(map, serials);
+                },
+                baseIndex => EncodeDelta(map, serials, baseline, baseIndex),
+                () =>
+                {
+                    lock (_gate)
+                    {
+                        _lastSnapMap = map;
+                    }
+                });
+        }
     }
 
     /// <summary>Bytes for disk persist. Does not move the delta base.</summary>
-    public byte[] EncodeMapForPersist() => EncodeMapLocked();
+    public byte[] EncodeMapForPersist()
+    {
+        lock (_gate)
+        {
+            return Encode(_map, _clientSerials);
+        }
+    }
 
     /// <inheritdoc />
     public byte[] SnapshotDelta(long baseIndex)
     {
-        if (_lastSnapMap is null)
+        lock (_gate)
         {
-            return Snapshot();
+            return EncodeDelta(_map, _clientSerials, _lastSnapMap, baseIndex);
+        }
+    }
+
+    private static byte[] EncodeDelta(
+        ImmutableDictionary<string, string> map,
+        ImmutableDictionary<string, long> serials,
+        ImmutableDictionary<string, string>? baseline,
+        long baseIndex)
+    {
+        if (baseline is null)
+        {
+            return Encode(map, serials);
         }
 
         var puts = new Dictionary<string, string>();
         var deletes = new List<string>();
-        foreach ((string key, string value) in _map)
+        foreach ((string key, string value) in map)
         {
-            if (!_lastSnapMap.TryGetValue(key, out string? prev) || prev != value)
+            if (!baseline.TryGetValue(key, out string? prev) || prev != value)
             {
                 puts[key] = value;
             }
         }
 
-        foreach (string key in _lastSnapMap.Keys)
+        foreach (string key in baseline.Keys)
         {
-            if (!_map.ContainsKey(key))
+            if (!map.ContainsKey(key))
             {
                 deletes.Add(key);
             }
         }
 
-        return KvSnapshotDelta.Encode(baseIndex, puts, deletes, _clientSerials);
+        return KvSnapshotDelta.Encode(baseIndex, puts, deletes, serials);
     }
 
     /// <inheritdoc />
     public void Restore(byte[] snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        if (KvSnapshotDelta.IsDelta(snapshot))
+        lock (_gate)
         {
-            throw new ArgumentException("delta snapshot requires a base");
-        }
+            _epoch++;
+            if (KvSnapshotDelta.IsDelta(snapshot))
+            {
+                throw new ArgumentException("delta snapshot requires a base");
+            }
 
-        RestoreFull(snapshot);
+            RestoreFull(snapshot);
+        }
     }
 
     /// <inheritdoc />
     public void RestoreChecked(long lastIncludedIndex, long lastApplied, byte[] snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_gate)
+        {
+            _epoch++;
+            _appliedThrough = Math.Max(_appliedThrough, lastIncludedIndex);
+            RestoreCheckedLocked(lastIncludedIndex, lastApplied, snapshot);
+        }
+    }
+
+    private void RestoreCheckedLocked(long lastIncludedIndex, long lastApplied, byte[] snapshot)
+    {
         if (KvSnapshotDelta.IsDelta(snapshot))
         {
             if (_lastSnapMap is null
@@ -111,8 +223,12 @@ public sealed class InMemoryKvStore : IKvStore
                 throw new ArgumentException("delta snapshot requires a matching base");
             }
 
-            KvSnapshotDelta.ApplyTo(_map, _clientSerials, snapshot);
-            _lastSnapMap = new Dictionary<string, string>(_map);
+            var map = _map.ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
+            var serials = _clientSerials.ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
+            KvSnapshotDelta.ApplyTo(map, serials, snapshot);
+            _map = map.ToImmutableDictionary();
+            _clientSerials = serials.ToImmutableDictionary();
+            _lastSnapMap = _map;
             return;
         }
 
@@ -123,13 +239,16 @@ public sealed class InMemoryKvStore : IKvStore
     public string? Get(string key)
     {
         KvCommandCodec.RequireKey(key);
-        return _map.GetValueOrDefault(key);
+        lock (_gate)
+        {
+            return _map.GetValueOrDefault(key);
+        }
     }
 
-    private byte[] EncodeMapLocked()
+    private static byte[] Encode(ImmutableDictionary<string, string> map, ImmutableDictionary<string, long> serials)
     {
-        byte[] mapBytes = EncodeMapOnly();
-        var clients = _clientSerials.Keys.OrderBy(static id => id, StringComparer.Ordinal).ToList();
+        byte[] mapBytes = EncodeMapOnly(map);
+        var clients = serials.Keys.OrderBy(static id => id, StringComparer.Ordinal).ToList();
         int serialSize = 4;
         var ids = new List<byte[]>(clients.Count);
         foreach (string id in clients)
@@ -151,22 +270,22 @@ public sealed class InMemoryKvStore : IKvStore
         for (int i = 0; i < clients.Count; i++)
         {
             WriteBytes(buf, ref pos, ids[i]);
-            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), _clientSerials[clients[i]]);
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), serials[clients[i]]);
             pos += 8;
         }
 
         return buf;
     }
 
-    private byte[] EncodeMapOnly()
+    private static byte[] EncodeMapOnly(ImmutableDictionary<string, string> map)
     {
-        var keys = _map.Keys.OrderBy(static key => key, StringComparer.Ordinal).ToList();
+        var keys = map.Keys.OrderBy(static key => key, StringComparer.Ordinal).ToList();
         int size = 4;
         var encoded = new List<byte[]>(keys.Count * 2);
         foreach (string key in keys)
         {
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            byte[] valueBytes = Encoding.UTF8.GetBytes(_map[key]);
+            byte[] valueBytes = Encoding.UTF8.GetBytes(map[key]);
             encoded.Add(keyBytes);
             encoded.Add(valueBytes);
             size += 8 + keyBytes.Length + valueBytes.Length;
@@ -202,14 +321,14 @@ public sealed class InMemoryKvStore : IKvStore
         else
         {
             RestoreMap(snapshot, ref pos);
-            _clientSerials.Clear();
+            _clientSerials = ImmutableDictionary<string, long>.Empty;
             if (pos != snapshot.Length)
             {
                 throw new ArgumentException("trailing bytes after kv snapshot");
             }
         }
 
-        _lastSnapMap = new Dictionary<string, string>(_map);
+        _lastSnapMap = _map;
     }
 
     private void RestoreMap(byte[] snapshot, ref int pos)
@@ -226,13 +345,15 @@ public sealed class InMemoryKvStore : IKvStore
             throw new ArgumentException("negative kv snapshot count");
         }
 
-        _map.Clear();
+        var restored = ImmutableDictionary.CreateBuilder<string, string>();
         for (int i = 0; i < count; i++)
         {
             string key = ReadUtf8(snapshot, ref pos);
             string value = ReadUtf8(snapshot, ref pos);
-            _map[key] = value;
+            restored[key] = value;
         }
+
+        _map = restored.ToImmutable();
     }
 
     private void RestoreSerials(byte[] snapshot, ref int pos)
@@ -249,7 +370,7 @@ public sealed class InMemoryKvStore : IKvStore
             throw new ArgumentException("negative kv serial count");
         }
 
-        _clientSerials.Clear();
+        var restored = ImmutableDictionary.CreateBuilder<string, long>();
         for (int i = 0; i < count; i++)
         {
             string clientId = ReadUtf8(snapshot, ref pos);
@@ -258,9 +379,11 @@ public sealed class InMemoryKvStore : IKvStore
                 throw new ArgumentException("truncated kv serial");
             }
 
-            _clientSerials[clientId] = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            restored[clientId] = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
             pos += 8;
         }
+
+        _clientSerials = restored.ToImmutable();
 
         if (pos != snapshot.Length)
         {
@@ -286,7 +409,7 @@ public sealed class InMemoryKvStore : IKvStore
         return true;
     }
 
-    private static bool MapsEqual(Dictionary<string, string> left, Dictionary<string, string> right)
+    private static bool MapsEqual(ImmutableDictionary<string, string> left, ImmutableDictionary<string, string> right)
     {
         if (left.Count != right.Count)
         {

@@ -22,6 +22,23 @@ internal static class LogCompaction
                 "lastIncludedIndex " + lastIncludedIndex + " is before current " + currentLastIncluded);
         }
 
+        // Figure 13 steps 6-7: keep the suffix only when the entry at lastIncludedIndex has the same term.
+        for (int i = 0; i < entries.Count; i++)
+        {
+            if (entries[i].Index != lastIncludedIndex)
+            {
+                continue;
+            }
+
+            if (entries[i].Term != lastIncludedTerm)
+            {
+                entries.Clear();
+                return;
+            }
+
+            break;
+        }
+
         entries.RemoveAll(entry => entry.Index <= lastIncludedIndex);
         if (entries.Count > 0 && entries[0].Index != lastIncludedIndex + 1)
         {

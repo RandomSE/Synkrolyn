@@ -228,8 +228,17 @@ public sealed class DurableRestartTests : IDisposable
         Assert.Equal(0, _cluster.Node("n1").CommitIndex);
         Assert.Null(_clients["n1"].Get("k"));
 
-        _cluster.Advance(80);
+        // Each restarted voter with term > 0 treats start as leader contact and
+        // refuses votes for its own election timeout. n2 and n3 use 400 ms.
+        long elapsed = 0;
+        for (int i = 0; i < 80 && _cluster.Leaders().Count == 0; i++)
+        {
+            _cluster.Advance(10);
+            elapsed += 10;
+        }
+
         Assert.Single(_cluster.Leaders());
+        Assert.InRange(elapsed, 400, 480);
         string leaderId = _cluster.Leaders()[0].NodeId;
         _clients[leaderId].Put("k2", "v2");
         _cluster.DrainAll();
@@ -363,9 +372,19 @@ public sealed class DurableRestartTests : IDisposable
 
     private void Restart(string id, IEnumerable<string> peers, TimeSpan election)
     {
+        if (_cluster!.State(id) is IDisposable openState)
+        {
+            openState.Dispose();
+        }
+
+        if (_cluster.Log(id) is IDisposable openLog)
+        {
+            openLog.Dispose();
+        }
+
         var store = new InMemoryKvStore();
         _stores[id] = store;
-        var node = _cluster!.ReplaceNode(id, peers, election, Heartbeat, store, new FilePersistentState(Dir(id)), new FileRaftLog(Dir(id)));
+        var node = _cluster.ReplaceNode(id, peers, election, Heartbeat, store, new FilePersistentState(Dir(id)), new FileRaftLog(Dir(id)));
         _clients[id] = new KvClient(node, store);
     }
 

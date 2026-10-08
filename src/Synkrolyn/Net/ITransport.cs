@@ -6,6 +6,12 @@ namespace Synkrolyn.Net;
 /// </summary>
 public interface ITransport
 {
-    /// <summary>Sends <paramref name="payload"/> from <paramref name="sender"/> to <paramref name="recipient"/>.</summary>
-    void Send(string sender, string recipient, object payload);
+    /// <summary>
+    /// Sends <paramref name="payload"/> from <paramref name="sender"/> to <paramref name="recipient"/>.
+    /// False when the transport did not accept the frame (unknown peer, partition, or a failed enqueue).
+    /// </summary>
+    bool Send(string sender, string recipient, object payload);
+
+    /// <summary>True when <paramref name="nodeId"/> is a known peer. The default accepts every id.</summary>
+    bool HasPeer(string nodeId) => true;
 }

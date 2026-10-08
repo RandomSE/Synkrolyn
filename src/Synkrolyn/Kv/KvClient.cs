@@ -14,6 +14,8 @@ public sealed class KvClient
     private long _nextSerial;
     private long? _pendingIndex;
     private RaftNode.ApplyWaiter? _applyWaiter;
+    private long _readTicket;
+    private bool _readTicketOpen;
 
     /// <summary>Creates a client without exactly-once serials.</summary>
     public KvClient(RaftNode raft, IKvStore store)
@@ -70,8 +72,36 @@ public sealed class KvClient
             return _store.Get(key);
         }
 
-        _raft.BeginReadIndex();
-        return _raft.ReadIndexSatisfied() ? _store.Get(key) : null;
+        if (_readTicketOpen)
+        {
+            if (_raft.ReadIndexSatisfied(_readTicket))
+            {
+                _readTicketOpen = false;
+                return _store.Get(key);
+            }
+
+            if (_raft.ReadTicketPending(_readTicket) && _raft.Role == Role.Leader)
+            {
+                return null;
+            }
+
+            _readTicketOpen = false;
+        }
+
+        if (_raft.Role != Role.Leader || _raft.BeginReadIndex() is not ReadIndexStart started)
+        {
+            return null;
+        }
+
+        _readTicket = started.Ticket;
+        _readTicketOpen = true;
+        if (_raft.ReadIndexSatisfied(_readTicket))
+        {
+            _readTicketOpen = false;
+            return _store.Get(key);
+        }
+
+        return null;
     }
 
     /// <summary>Bounded-stale lease read. Not linearizable.</summary>
@@ -88,6 +118,12 @@ public sealed class KvClient
 
     private long? ProposeWait(byte[] command)
     {
+        if (_applyWaiter is { Indeterminate: true })
+        {
+            // A retry would append the command again. The snapshot may already contain it.
+            return null;
+        }
+
         long? index = _raft.Propose(command);
         if (index is null)
         {
@@ -108,14 +144,19 @@ public sealed class KvClient
             return null;
         }
 
-        if (_raft.Role != Role.Leader || _applyWaiter is { Failed: true })
+        if (_applyWaiter is { Indeterminate: true })
+        {
+            return null;
+        }
+
+        if (_applyWaiter is { Failed: true })
         {
             _pendingIndex = null;
             _applyWaiter = null;
             return null;
         }
 
-        if (_applyWaiter is { Applied: true } || _raft.AwaitCommitted(_pendingIndex.Value))
+        if (_applyWaiter is { Applied: true })
         {
             return _pendingIndex;
         }

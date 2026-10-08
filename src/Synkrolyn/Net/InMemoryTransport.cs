@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Synkrolyn.Raft;
 
 namespace Synkrolyn.Net;
@@ -51,10 +52,10 @@ public sealed class InMemoryTransport : ITransport
     }
 
     /// <inheritdoc />
-    public void Send(string sender, string recipient, object payload) => Send(sender, recipient, payload, TimeSpan.Zero);
+    public bool Send(string sender, string recipient, object payload) => Send(sender, recipient, payload, TimeSpan.Zero);
 
     /// <summary>Sends after <paramref name="delay"/> on this transport's clock. Zero delivers immediately unless a link delay applies.</summary>
-    public void Send(string sender, string recipient, object payload, TimeSpan delay)
+    public bool Send(string sender, string recipient, object payload, TimeSpan delay)
     {
         if (delay < TimeSpan.Zero)
         {
@@ -62,11 +63,16 @@ public sealed class InMemoryTransport : ITransport
         }
 
         RequireRegistered(sender);
-        RequireRegistered(recipient);
         ArgumentNullException.ThrowIfNull(payload);
+        if (!_handlers.ContainsKey(recipient))
+        {
+            Trace.WriteLine("drop send to unknown node id: " + recipient);
+            return false;
+        }
+
         if (IsPartitioned(sender, recipient) || ConsumeDrop(sender, recipient))
         {
-            return;
+            return false;
         }
 
         var envelope = new Envelope(sender, recipient, payload);
@@ -80,11 +86,12 @@ public sealed class InMemoryTransport : ITransport
         if (total == TimeSpan.Zero)
         {
             Deliver(envelope);
-            return;
+            return true;
         }
 
         long due = checked(_clock.Millis + (long)total.TotalMilliseconds);
         _delayed.Add(new Delayed(due, _nextSeq++, envelope));
+        return true;
     }
 
     /// <summary>Holds the next send on this directed link until the clock reaches the delay.</summary>
@@ -229,6 +236,9 @@ public sealed class InMemoryTransport : ITransport
 
         return extra;
     }
+
+    /// <inheritdoc />
+    public bool HasPeer(string nodeId) => _handlers.ContainsKey(nodeId);
 
     private bool IsPartitioned(string a, string b) => _partitions.Contains(Partition.Of(a, b));
 
