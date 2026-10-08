@@ -253,35 +253,68 @@ public class SocketDeliveryTests
         byte[] command = new byte[256 * 1024];
         command[0] = 4;
         client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        // The peer never reads. A blocking send timeout does not fire on Windows,
-        // so the writer has to notice the stall itself and send the frame again.
+        // The peer never reads. A blocking send timeout does not fire on Windows.
+        // Either the writer drops that socket and sends the frame again, or the
+        // kernel already accepted the bytes and the writer is not holding them.
+        // A writer that stays blocked with neither outcome fails.
         byte[]? payload = null;
         var started = System.Diagnostics.Stopwatch.StartNew();
-        while (payload is null && started.Elapsed < TimeSpan.FromSeconds(3))
+        var budget = TimeSpan.FromSeconds(3);
+        int bufferedFrame = command.Length + 128;
+        while (payload is null && started.Elapsed < budget)
         {
-            int leftUs = Math.Max(1, (int)(TimeSpan.FromSeconds(3) - started.Elapsed).TotalMilliseconds) * 1000;
-            if (!listener.Server.Poll(leftUs, SelectMode.SelectRead))
+            TimeSpan left = budget - started.Elapsed;
+            int sliceUs = Math.Max(1, (int)Math.Min(left.TotalMilliseconds, 50)) * 1000;
+            if (listener.Server.Poll(sliceUs, SelectMode.SelectRead))
             {
-                break;
+                using TcpClient retry = listener.AcceptTcpClient();
+                retry.ReceiveBufferSize = 1024 * 1024;
+                payload = ReadAppend(retry, budget - started.Elapsed, command);
             }
 
-            using TcpClient retry = listener.AcceptTcpClient();
-            retry.ReceiveBufferSize = 1024 * 1024;
-            byte[]? frame = ReadOneFrame(retry, TimeSpan.FromSeconds(2)).Frame;
-            if (frame is null)
+            if (payload is null && Buffered(accepted) >= bufferedFrame)
             {
-                continue;
-            }
-
-            if (new RpcWireCodec().Decode(frame).Payload is AppendEntries append)
-            {
-                Assert.Equal(4, append.Entries[0].Command[0]);
-                Assert.Equal(command.Length, append.Entries[0].Command.Length);
-                payload = frame;
+                payload = ReadAppend(accepted, budget - started.Elapsed, command);
             }
         }
 
         Assert.True(payload is not null, "writer blocked holding the frame");
+    }
+
+    private static int Buffered(TcpClient client)
+    {
+        try
+        {
+            return client.Available;
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>Reads until the large append is found. A leading vote on a retry is skipped.</summary>
+    private static byte[]? ReadAppend(TcpClient client, TimeSpan budget, byte[] command)
+    {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        while (started.Elapsed < budget)
+        {
+            FrameRead read = ReadOneFrame(client, budget - started.Elapsed);
+            if (read.Closed || read.Frame is null)
+            {
+                return null;
+            }
+
+            if (new RpcWireCodec().Decode(read.Frame).Payload is AppendEntries append
+                && append.Entries.Count == 1
+                && append.Entries[0].Command.Length == command.Length
+                && append.Entries[0].Command[0] == command[0])
+            {
+                return read.Frame;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
