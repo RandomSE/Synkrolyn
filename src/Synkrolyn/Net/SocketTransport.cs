@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 
 namespace Synkrolyn.Net;
@@ -360,6 +361,16 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             byte[]? inflight = null;
             Task<bool>? queued = null;
+            int lastUnsent = -1;
+            long unsentProgress = System.Diagnostics.Stopwatch.GetTimestamp();
+            byte[]? Deliver(byte[] payload)
+            {
+                bool ok = SendUntil(peer, payload, pause, watch);
+                lastUnsent = -1;
+                unsentProgress = System.Diagnostics.Stopwatch.GetTimestamp();
+                return ok ? payload : null;
+            }
+
             while (_running)
             {
                 // Write can return after the kernel has copied the bytes and before the
@@ -370,14 +381,14 @@ public sealed class SocketTransport : ITransport, IDisposable
                 {
                     DropOutbound(peer);
                     pause.Wait(5);
-                    inflight = SendUntil(peer, inflight, pause, watch) ? inflight : null;
+                    inflight = Deliver(inflight);
                     continue;
                 }
 
                 if (channel.Reader.TryRead(out byte[]? frame))
                 {
                     queued = null;
-                    inflight = SendUntil(peer, frame, pause, watch) ? frame : null;
+                    inflight = Deliver(frame);
                     continue;
                 }
 
@@ -392,7 +403,19 @@ public sealed class SocketTransport : ITransport, IDisposable
                         return;
                     }
 
-                    inflight = SendUntil(peer, frame, pause, watch) ? frame : null;
+                    inflight = Deliver(frame);
+                    continue;
+                }
+
+                // The kernel accepted this frame and the peer stopped reading.
+                // The bytes sit in the send queue, so a poll never runs. A queue
+                // that does not shrink is the same dead window as a send that
+                // does not return.
+                if (inflight is not null && UnsentStalled(peer, ref lastUnsent, ref unsentProgress))
+                {
+                    DropOutbound(peer);
+                    pause.Wait(5);
+                    inflight = Deliver(inflight);
                     continue;
                 }
 
@@ -455,14 +478,7 @@ public sealed class SocketTransport : ITransport, IDisposable
                 continue;
             }
 
-            try
-            {
-                socket.Close();
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
-            {
-                // The writer already dropped this socket.
-            }
+            AbortStuckSend(socket);
         }
     }
 
@@ -770,6 +786,176 @@ public sealed class SocketTransport : ITransport, IDisposable
         public long Stamp = System.Diagnostics.Stopwatch.GetTimestamp();
 
         public volatile bool Stop;
+    }
+
+    /// <summary>
+    /// True when bytes already accepted by the kernel have not left the send
+    /// queue for <see cref="SendStallMillis"/>. The caller drops the socket and
+    /// sends the frame again.
+    /// </summary>
+    private bool UnsentStalled(string peer, ref int lastUnsent, ref long unsentProgress)
+    {
+        Socket? socket;
+        lock (_gate)
+        {
+            if (!_outbound.TryGetValue(peer, out TcpClient? client))
+            {
+                return false;
+            }
+
+            try
+            {
+                socket = client.Client;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+        }
+
+        int? unsent = UnsentBytes(socket);
+        if (unsent is null)
+        {
+            return false;
+        }
+
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (unsent.Value == 0 || lastUnsent < 0 || unsent.Value < lastUnsent)
+        {
+            lastUnsent = unsent.Value;
+            unsentProgress = now;
+            return false;
+        }
+
+        lastUnsent = unsent.Value;
+        return System.Diagnostics.Stopwatch.GetElapsedTime(unsentProgress).TotalMilliseconds >= SendStallMillis;
+    }
+
+    /// <summary>Bytes still in the kernel send queue, or null when this OS will not say.</summary>
+    private static int? UnsentBytes(Socket socket)
+    {
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                // SIOCOUTQ / TIOCOUTQ. Data the peer has not taken yet.
+                if (StallNative.Ioctl(checked((int)socket.Handle), 0x5411, out int queued) == 0)
+                {
+                    return queued;
+                }
+
+                return null;
+            }
+
+            if (!OperatingSystem.IsWindows())
+            {
+                return null;
+            }
+
+            uint version = 0;
+            int rc = StallNative.WsaIoctl(
+                socket.Handle,
+                StallNative.SioTcpInfo,
+                ref version,
+                sizeof(uint),
+                out StallNative.TcpInfoV0 info,
+                Marshal.SizeOf<StallNative.TcpInfoV0>(),
+                out _,
+                IntPtr.Zero,
+                IntPtr.Zero);
+            if (rc != 0 || info.State > 12 || info.Mss < 500 || info.Mss > 65535)
+            {
+                return null;
+            }
+
+            return info.BytesInFlight > int.MaxValue ? int.MaxValue : (int)info.BytesInFlight;
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Unblocks a send that is stuck inside the call. <see cref="Socket.Close()"/>
+    /// can wait on the same lock the send holds, so this shuts the handle down
+    /// directly. The writer then drops the socket and sends the frame again.
+    /// </summary>
+    private static void AbortStuckSend(Socket socket)
+    {
+        try
+        {
+            IntPtr handle = socket.Handle;
+            if (handle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            int rc = OperatingSystem.IsWindows()
+                ? StallNative.ShutdownWin(handle, StallNative.ShutRdwr)
+                : StallNative.Shutdown(checked((int)handle), StallNative.ShutRdwr);
+            if (rc != 0)
+            {
+                socket.Close();
+            }
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+        {
+            // The writer already dropped this socket.
+        }
+    }
+
+    private static class StallNative
+    {
+        internal const int ShutRdwr = 2;
+
+        /// <summary><c>SIO_TCP_INFO</c>, <c>_WSAIORW(IOC_VENDOR, 39)</c>.</summary>
+        internal const int SioTcpInfo = unchecked((int)0xD8000027);
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct TcpInfoV0
+        {
+            public uint State;
+            public uint Mss;
+            public ulong ConnectionTimeMs;
+            public byte TimestampsEnabled;
+            public uint RttUs;
+            public uint MinRttUs;
+            public uint BytesInFlight;
+            public uint Cwnd;
+            public uint SndWnd;
+            public uint RcvWnd;
+            public uint RcvBuf;
+            public ulong BytesOut;
+            public ulong BytesIn;
+            public uint BytesReordered;
+            public uint BytesRetrans;
+            public uint FastRetrans;
+            public uint DupAcksIn;
+            public uint TimeoutEpisodes;
+            public byte SynRetrans;
+        }
+
+        [DllImport("libc", EntryPoint = "ioctl", SetLastError = true)]
+        internal static extern int Ioctl(int fd, nuint request, out int value);
+
+        [DllImport("libc", EntryPoint = "shutdown", SetLastError = true)]
+        internal static extern int Shutdown(int fd, int how);
+
+        [DllImport("ws2_32.dll", EntryPoint = "shutdown", SetLastError = true)]
+        internal static extern int ShutdownWin(IntPtr socket, int how);
+
+        [DllImport("ws2_32.dll", EntryPoint = "WSAIoctl", SetLastError = true)]
+        internal static extern int WsaIoctl(
+            IntPtr socket,
+            int controlCode,
+            ref uint inValue,
+            int inLength,
+            out TcpInfoV0 info,
+            int outLength,
+            out int bytesReturned,
+            IntPtr overlapped,
+            IntPtr completion);
     }
 
     private static bool IsLive(TcpClient client)

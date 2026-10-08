@@ -281,6 +281,48 @@ public class SocketDeliveryTests
         Assert.True(payload is not null, "writer blocked holding the frame");
     }
 
+    [Fact]
+    public void KernelQueuedSend_toASilentPeer_isSentAgain()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        listener.Start();
+        using var client = new SocketTransport("a", new RpcWireCodec());
+        client.Bind();
+        client.Start();
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
+        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        accepted.ReceiveBufferSize = 1024;
+        Assert.True(WaitFor(() => Outbound(client) is not null));
+        TcpClient outbound = Outbound(client)!;
+        // Large enough that the kernel accepts the whole frame. The peer never
+        // reads, so those bytes sit in the send queue. That is not delivery.
+        outbound.Client.SendBufferSize = 1024 * 1024;
+        byte[] command = new byte[64 * 1024];
+        command[0] = 4;
+        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
+        byte[]? payload = null;
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var budget = TimeSpan.FromSeconds(3);
+        while (payload is null && started.Elapsed < budget)
+        {
+            TimeSpan left = budget - started.Elapsed;
+            int sliceUs = Math.Max(1, (int)Math.Min(left.TotalMilliseconds, 50)) * 1000;
+            if (!listener.Server.Poll(sliceUs, SelectMode.SelectRead))
+            {
+                continue;
+            }
+
+            using TcpClient retry = listener.AcceptTcpClient();
+            retry.ReceiveBufferSize = 1024 * 1024;
+            payload = ReadAppend(retry, budget - started.Elapsed, command);
+        }
+
+        Assert.True(payload is not null, "writer blocked holding the frame");
+    }
+
     private static int Buffered(TcpClient client)
     {
         try
