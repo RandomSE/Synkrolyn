@@ -138,17 +138,16 @@ public sealed class KvClient
             return null;
         }
 
-        if (_applyWaiter is { Applied: true } || _raft.AwaitCommitted(_pendingIndex.Value))
-        {
-            return _pendingIndex;
-        }
-
-        // A step-down used to drop the index here. The entry can still commit
-        // after this node wins again. Truncation is what fails the waiter.
         if (_applyWaiter is { Failed: true })
         {
             _pendingIndex = null;
             _applyWaiter = null;
+            return null;
+        }
+
+        if (_applyWaiter is { Applied: true })
+        {
+            return _pendingIndex;
         }
 
         return null;

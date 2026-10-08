@@ -47,6 +47,13 @@ public sealed class FileKvStore : IKvStore, IDisposable
     }
 
     /// <inheritdoc />
+    public StateCapture CaptureState()
+    {
+        EnsureOpen();
+        return _inner.CaptureState();
+    }
+
+    /// <inheritdoc />
     public byte[] Snapshot()
     {
         EnsureOpen();

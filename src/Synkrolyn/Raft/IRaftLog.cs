@@ -43,8 +43,49 @@ public interface IRaftLog
     void CompactThrough(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot);
 
     /// <summary>
+    /// O(1) capture of the suffix through <paramref name="lastIncludedIndex"/>. The background
+    /// writer then reads only that capture. The default has nothing to freeze.
+    /// </summary>
+    void ArmCompaction(long lastIncludedIndex, long lastIncludedTerm)
+    {
+    }
+
+    /// <summary>
+    /// One locked view of the suffix an AppendEntries send needs. A concurrent
+    /// compaction cannot slip between the prefix check and the entry reads.
+    /// </summary>
+    ReplicationBatch ReadForReplication(long nextIndex, int maxEntries, int maxBytes)
+    {
+        long included = LastIncludedIndex;
+        if (included > 0 && nextIndex <= included)
+        {
+            return new ReplicationBatch(true, 0, 0, []);
+        }
+
+        long prevIndex = nextIndex - 1;
+        long prevTerm = prevIndex == 0 ? 0 : prevIndex == included ? LastIncludedTerm : Read(prevIndex).Term;
+        var entries = new List<LogEntry>();
+        long last = Math.Min(LastIndex, nextIndex + maxEntries - 1);
+        int bytes = 0;
+        for (long i = nextIndex; i <= last; i++)
+        {
+            LogEntry entry = Read(i);
+            if (entries.Count > 0 && bytes + entry.Command.Length > maxBytes)
+            {
+                break;
+            }
+
+            entries.Add(entry);
+            bytes += entry.Command.Length;
+        }
+
+        return new ReplicationBatch(false, prevIndex, prevTerm, entries);
+    }
+
+    /// <summary>
     /// Copies the suffix at <paramref name="lastIncludedIndex"/>. <see cref="StagedCompaction.Write"/>
-    /// runs off the Raft thread. <see cref="StagedCompaction.Commit"/> publishes the result on it.
+    /// runs off the Raft thread and reads only an immutable capture. <see cref="StagedCompaction.Commit"/>
+    /// publishes the result on the Raft thread.
     /// </summary>
     StagedCompaction StageCompaction(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot)
     {
@@ -59,6 +100,13 @@ public interface IRaftLog
     /// <summary>Durability barrier. File logs share one fsync across the pending batch.</summary>
     void Force();
 }
+
+/// <summary>Prev-log term and entries for one AppendEntries, read under one lock.</summary>
+public readonly record struct ReplicationBatch(
+    bool NeedsSnapshot,
+    long PrevIndex,
+    long PrevTerm,
+    IReadOnlyList<LogEntry> Entries);
 
 /// <summary>Compaction whose file write is separate from the in-memory swap.</summary>
 public sealed class StagedCompaction

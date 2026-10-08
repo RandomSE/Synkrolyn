@@ -562,8 +562,13 @@ public sealed class SocketTransport : ITransport, IDisposable
                     throw new SocketException((int)args.SocketError);
                 }
 
-                // The 75 ms budget is the connect. A large frame on a slow link must be
-                // allowed to finish; a send timeout would tear it and retry forever.
+                // ConnectAsync leaves the native socket non-blocking, and the managed
+                // Blocking flag can already read true, so assigning true is a no-op.
+                // A full send buffer then fails the write and the writer drops a live
+                // slow reader mid-frame. Toggle so the native mode follows, and never
+                // time out a send: the peer being slow is not a dead socket.
+                raw.Blocking = false;
+                raw.Blocking = true;
                 raw.SendTimeout = 0;
                 return client;
             }
@@ -593,7 +598,37 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
 
             Socket socket = client.Client;
-            return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+            if (!socket.Poll(0, SelectMode.SelectRead) || socket.Available > 0)
+            {
+                return true;
+            }
+
+            // Poll said readable with nothing queued. A slow peer that only reads
+            // still looks like that, and a blocking peek would wait forever. A
+            // one-millisecond peek either sees a byte, times out (still live), or
+            // observes a shutdown. Peek can also return 0 with no socket error on
+            // a live connection; a real reset or dispose leaves an error.
+            int previous = socket.ReceiveTimeout;
+            try
+            {
+                socket.ReceiveTimeout = 1;
+                int peeked = socket.Receive(new byte[1], SocketFlags.Peek);
+                if (peeked > 0)
+                {
+                    return true;
+                }
+
+                object? rawErr = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                return rawErr is not int code || code == 0;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.TimedOut or SocketError.IOPending or SocketError.TryAgain)
+            {
+                return true;
+            }
+            finally
+            {
+                socket.ReceiveTimeout = previous;
+            }
         }
         catch (Exception)
         {

@@ -224,7 +224,7 @@ public class Phase123ReviewTests
     }
 
     [Fact]
-    public void RestartedNode_withALog_grantsAVoteBeforeHearingALeader()
+    public void RestartedNode_insideTheLease_doesNotGrantAVote()
     {
         var cluster = new ClusterHarness();
         var state = new InMemoryPersistentState();
@@ -241,7 +241,7 @@ public class Phase123ReviewTests
         RaftNode restarted = cluster.Node("n1");
         restarted.Receive(new Envelope("n2", "n1", new RequestVote(4, "n2", 1, 3)));
         restarted.Drain();
-        Assert.Equal("n2", cluster.State("n1").VotedFor);
+        Assert.Null(cluster.State("n1").VotedFor);
     }
 
     [Fact]
@@ -329,7 +329,7 @@ public class Phase123ReviewTests
     }
 
     [Fact]
-    public void Item3_concurrentReads_doNotBroadcastPerRead()
+    public void Item3_concurrentReads_shareOneRound()
     {
         var cluster = new ClusterHarness();
         cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
@@ -337,6 +337,7 @@ public class Phase123ReviewTests
         cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(400), Heartbeat);
         cluster.Advance(80);
         Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
         int heartbeats = 0;
         RaftNode n2 = cluster.Node("n2");
         cluster.Transport.Reregister("n2", envelope =>
@@ -355,7 +356,8 @@ public class Phase123ReviewTests
             Assert.NotNull(leader.BeginReadIndex());
         }
 
-        Assert.Equal(before, heartbeats);
+        leader.Drain();
+        Assert.Equal(before + 1, heartbeats);
     }
 
     [Fact]
@@ -386,26 +388,32 @@ public class Phase123ReviewTests
     }
 
     [Fact]
-    public void Item3_unsatisfiedReads_doNotGrowWithoutBound()
+    public void Item3_unsatisfiedReads_stayUntilTheRoundOrStepDown()
     {
         var cluster = new ClusterHarness();
         cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
         cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
         cluster.Advance(80);
         Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
-        Assert.NotNull(leader.BeginReadIndex());
-        cluster.Advance(20);
-        long kept = leader.CurrentReadTicket;
-        Assert.True(leader.ReadTicketPending(kept));
+        var tickets = new List<long>();
         cluster.Transport.PartitionBidirectional("n1", "n2");
-        for (int i = 0; i < 100; i++)
+        for (int i = 0; i < 80; i++)
         {
-            Assert.NotNull(leader.BeginReadIndex());
+            ReadIndexStart? started = leader.BeginReadIndex();
+            Assert.NotNull(started);
+            tickets.Add(started.Value.Ticket);
+            Assert.True(leader.ReadTicketPending(started.Value.Ticket));
         }
 
-        Assert.True(leader.ReadTicketPending(kept));
-        Assert.True(PendingReadCount(leader) < 100, "pending " + PendingReadCount(leader));
+        Assert.Equal(80, PendingReadCount(leader));
+        cluster.Transport.HealBidirectional("n1", "n2");
+        cluster.Advance(20);
+        foreach (long ticket in tickets)
+        {
+            Assert.True(leader.ReadIndexSatisfied(ticket), "ticket " + ticket);
+        }
     }
 
     [Fact]

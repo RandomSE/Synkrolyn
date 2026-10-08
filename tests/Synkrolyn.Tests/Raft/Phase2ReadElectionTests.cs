@@ -61,7 +61,8 @@ public class Phase2ReadElectionTests
         int before = heartbeats;
         Assert.NotNull(leader.BeginReadIndex());
         Assert.NotNull(leader.BeginReadIndex());
-        Assert.Equal(before, heartbeats);
+        // An idle leader starts one round. The second read piggybacks on it.
+        Assert.Equal(before + 1, heartbeats);
     }
 
     [Fact]

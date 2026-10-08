@@ -33,6 +33,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     private byte[] _snapshot = [];
     private int _forceCount;
     private int _diskReadCount;
+    private ArmedCapture? _armed;
     private readonly Action<FileStream>? _afterForceWrite;
 
     /// <summary>Opens or creates the log under <paramref name="directory"/>.</summary>
@@ -134,6 +135,8 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         lock (this)
         {
             _closed = true;
+            _armed?.DisposeReader();
+            _armed = null;
             ClearPending();
             _channel?.Dispose();
             _channel = null;
@@ -146,26 +149,44 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     {
         lock (this)
         {
+            return ReadUnlocked(index);
+        }
+    }
+
+    /// <inheritdoc />
+    public ReplicationBatch ReadForReplication(long nextIndex, int maxEntries, int maxBytes)
+    {
+        lock (this)
+        {
             EnsureOpen();
-            RequirePositive(index);
-            if (index <= _lastIncludedIndex)
+            if (_lastIncludedIndex > 0 && nextIndex <= _lastIncludedIndex)
             {
-                throw new InvalidOperationException("log entry at index " + index + " was compacted");
+                return new ReplicationBatch(true, 0, 0, []);
             }
 
-            if (index > LastIndex)
+            long prevIndex = nextIndex - 1;
+            long prevTerm = prevIndex == 0
+                ? 0
+                : prevIndex == _lastIncludedIndex
+                    ? _lastIncludedTerm
+                    : ReadUnlocked(prevIndex).Term;
+            var entries = new List<LogEntry>();
+            long end = LastIndexUnlocked();
+            long last = Math.Min(end, nextIndex + maxEntries - 1);
+            int bytes = 0;
+            for (long i = nextIndex; i <= last; i++)
             {
-                throw new KeyNotFoundException("no log entry at index " + index);
+                LogEntry entry = ReadUnlocked(i);
+                if (entries.Count > 0 && bytes + entry.Command.Length > maxBytes)
+                {
+                    break;
+                }
+
+                entries.Add(entry);
+                bytes += entry.Command.Length;
             }
 
-            long forcedEnd = ForcedEndIndex();
-            if (index <= forcedEnd)
-            {
-                return ReadForced(index);
-            }
-
-            int slot = checked((int)(index - forcedEnd - 1));
-            return _pendingEntries[slot];
+            return new ReplicationBatch(false, prevIndex, prevTerm, entries);
         }
     }
 
@@ -299,16 +320,133 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     }
 
     /// <inheritdoc />
+    public void ArmCompaction(long lastIncludedIndex, long lastIncludedTerm)
+    {
+        lock (this)
+        {
+            EnsureOpen();
+            _armed?.DisposeReader();
+            _armed = CaptureSuffix(lastIncludedIndex, lastIncludedTerm);
+        }
+    }
+
+    /// <inheritdoc />
     public StagedCompaction StageCompaction(long lastIncludedIndex, long lastIncludedTerm, byte[] snapshot)
     {
         lock (this)
         {
             EnsureOpen();
+            if (_armed is ArmedCapture armed && armed.Index == lastIncludedIndex)
+            {
+                _armed = null;
+                var captured = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), [], _dir);
+                return new StagedCompaction(
+                    () =>
+                    {
+                        try
+                        {
+                            captured.SetKept(ReadCaptured(armed));
+                            captured.Write();
+                        }
+                        finally
+                        {
+                            armed.DisposeReader();
+                        }
+                    },
+                    () => CommitJob(captured));
+            }
+
             List<LogEntry> kept = CopyVisible();
             LogCompaction.Apply(kept, _lastIncludedIndex, lastIncludedIndex, lastIncludedTerm, snapshot);
             var job = new CompactJob(lastIncludedIndex, lastIncludedTerm, (byte[])snapshot.Clone(), kept, _dir);
             return new StagedCompaction(() => job.Write(), () => CommitJob(job));
         }
+    }
+
+    private ArmedCapture CaptureSuffix(long index, long term)
+    {
+        long firstKept = index + 1;
+        long fileEnd = Channel.Length;
+        long keptOffset = fileEnd;
+        long forcedEnd = ForcedEndIndex();
+        if (_forcedCount > 0 && firstKept >= _forcedBaseIndex && firstKept <= forcedEnd)
+        {
+            int slot = checked((int)(firstKept - _forcedBaseIndex));
+            keptOffset = _forcedOffsets[slot];
+        }
+
+        return new ArmedCapture(
+            index,
+            term,
+            fileEnd,
+            keptOffset,
+            _pendingEntries.ToList(),
+            new FileStream(_file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+    }
+
+    private static List<LogEntry> ReadCaptured(ArmedCapture armed)
+    {
+        var kept = new List<LogEntry>();
+        FileStream reader = armed.Reader;
+        long pos = armed.KeptOffset;
+        reader.Position = pos;
+        while (pos < armed.FileEnd)
+        {
+            byte[] header = new byte[4];
+            ReadFully(reader, header);
+            int length = BinaryPrimitives.ReadInt32BigEndian(header);
+            if (length < 0 || length > ChecksummedRecords.MaxPayloadBytes)
+            {
+                throw new InvalidOperationException("invalid log record length: " + length);
+            }
+
+            byte[] payload = new byte[length];
+            ReadFully(reader, payload);
+            byte[] crcBuf = new byte[4];
+            ReadFully(reader, crcBuf);
+            int crc = BinaryPrimitives.ReadInt32BigEndian(crcBuf);
+            if (crc != ChecksummedRecords.Crc32(payload))
+            {
+                throw new InvalidOperationException("log checksum mismatch at offset " + pos);
+            }
+
+            kept.Add(Decode(payload));
+            pos += 4L + length + 4L;
+        }
+
+        foreach (LogEntry entry in armed.PendingEntries)
+        {
+            if (entry.Index > armed.Index)
+            {
+                kept.Add(entry);
+            }
+        }
+
+        return kept;
+    }
+
+    private LogEntry ReadUnlocked(long index)
+    {
+        EnsureOpen();
+        RequirePositive(index);
+        if (index <= _lastIncludedIndex)
+        {
+            throw new InvalidOperationException("log entry at index " + index + " was compacted");
+        }
+
+        if (index > LastIndexUnlocked())
+        {
+            throw new KeyNotFoundException("no log entry at index " + index);
+        }
+
+        long forcedEnd = ForcedEndIndex();
+        if (index <= forcedEnd)
+        {
+            return ReadForced(index);
+        }
+
+        int slot = checked((int)(index - forcedEnd - 1));
+        return _pendingEntries[slot];
     }
 
     private void CommitJob(CompactJob job)
@@ -370,6 +508,8 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             }
 
             _closed = true;
+            _armed?.DisposeReader();
+            _armed = null;
             _channel?.Dispose();
             _channel = null;
             _directoryLock.Dispose();
@@ -788,7 +928,9 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
         public byte[] Snapshot { get; }
 
-        public List<LogEntry> Kept { get; }
+        public List<LogEntry> Kept { get; private set; }
+
+        public void SetKept(List<LogEntry> kept) => Kept = kept ?? throw new ArgumentNullException(nameof(kept));
 
         public bool Written => _written;
 
@@ -912,5 +1054,32 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
             channel.Flush(flushToDisk: true);
         }
+    }
+
+    private sealed class ArmedCapture
+    {
+        public ArmedCapture(long index, long term, long fileEnd, long keptOffset, List<LogEntry> pendingEntries, FileStream reader)
+        {
+            Index = index;
+            Term = term;
+            FileEnd = fileEnd;
+            KeptOffset = keptOffset;
+            PendingEntries = pendingEntries;
+            Reader = reader;
+        }
+
+        public long Index { get; }
+
+        public long Term { get; }
+
+        public long FileEnd { get; }
+
+        public long KeptOffset { get; }
+
+        public List<LogEntry> PendingEntries { get; }
+
+        public FileStream Reader { get; }
+
+        public void DisposeReader() => Reader.Dispose();
     }
 }

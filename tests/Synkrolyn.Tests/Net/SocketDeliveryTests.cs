@@ -115,67 +115,99 @@ public class SocketDeliveryTests
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var frames = new ConcurrentQueue<byte[]>();
-        using var stop = new ManualResetEventSlim(false);
-        var reader = new Thread(() =>
-        {
-            using TcpClient accepted = listener.AcceptTcpClient();
-            accepted.ReceiveBufferSize = 1024;
-            accepted.ReceiveTimeout = 1000;
-            NetworkStream stream = accepted.GetStream();
-            var decoder = new FrameCodec.Decoder();
-            byte[] buf = new byte[8192];
-            using var pause = new ManualResetEventSlim(false);
-            int paced = 0;
-            while (!stop.IsSet)
-            {
-                int n;
-                try
-                {
-                    n = stream.Read(buf, 0, buf.Length);
-                }
-                catch (IOException)
-                {
-                    continue;
-                }
-
-                if (n <= 0)
-                {
-                    return;
-                }
-
-                foreach (byte[] payload in decoder.Push(buf.AsSpan(0, n).ToArray()))
-                {
-                    frames.Enqueue(payload);
-                    stop.Set();
-                }
-
-                // A few pauses keep the sender blocked longer than the old 75 ms
-                // write cap without stretching the whole frame out to seconds.
-                if (paced < 4)
-                {
-                    paced++;
-                    pause.Wait(20);
-                }
-            }
-        });
-        reader.IsBackground = true;
-        reader.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
         byte[] command = new byte[64 * 1024];
         command[0] = 9;
+        var started = System.Diagnostics.Stopwatch.StartNew();
         client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        bool arrived = WaitFor(() => !frames.IsEmpty, TimeSpan.FromSeconds(3));
-        stop.Set();
-        Assert.True(arrived);
-        Assert.True(frames.TryDequeue(out byte[]? payload));
+
+        // Read on this thread so a paused background reader cannot eat the 3 s
+        // budget. The listener accepts once; a writer that drops a live socket
+        // and connects again leaves a second connection or a different port.
+        int waitUs = (int)Remaining(started).TotalMilliseconds * 1000;
+        Assert.True(listener.Server.Poll(waitUs, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        Assert.False(listener.Pending());
+        // The handshake can complete before the writer publishes the socket.
+        Assert.True(WaitFor(() => OutboundIsBlocking(client), Remaining(started)));
+        int remainMs = Math.Max(1, (int)Remaining(started).TotalMilliseconds);
+        accepted.ReceiveTimeout = remainMs;
+        var decoder = new FrameCodec.Decoder();
+        byte[] buf = new byte[8192];
+        byte[]? payload = null;
+        NetworkStream stream = accepted.GetStream();
+        while (payload is null && started.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            int n;
+            try
+            {
+                n = stream.Read(buf, 0, buf.Length);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (n <= 0)
+            {
+                break;
+            }
+
+            foreach (byte[] frame in decoder.Push(buf.AsSpan(0, n).ToArray()))
+            {
+                payload = frame;
+            }
+        }
+
+        Assert.False(listener.Pending());
+        Assert.Equal(((IPEndPoint)accepted.Client.RemoteEndPoint!).Port, OutboundLocalPort(client));
+        Assert.NotNull(payload);
         IMessageCodec.Decoded decoded = new RpcWireCodec().Decode(payload);
         var append = Assert.IsType<AppendEntries>(decoded.Payload);
         Assert.Equal(9, append.Entries[0].Command[0]);
         Assert.Equal(command.Length, append.Entries[0].Command.Length);
+    }
+
+    private static int OutboundLocalPort(SocketTransport transport)
+    {
+        TcpClient? client = Outbound(transport);
+        return client is null ? -1 : ((IPEndPoint)client.Client.LocalEndPoint!).Port;
+    }
+
+    private static bool OutboundIsBlocking(SocketTransport transport)
+    {
+        TcpClient? client = Outbound(transport);
+        if (client is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return client.Client.Blocking;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    private static TcpClient? Outbound(SocketTransport transport)
+    {
+        var outbound = (Dictionary<string, TcpClient>)typeof(SocketTransport)
+            .GetField("_outbound", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(transport)!;
+        try
+        {
+            return outbound.TryGetValue("b", out TcpClient? client) ? client : null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     private static int InboundUnread(SocketTransport transport)
@@ -197,6 +229,12 @@ public class SocketDeliveryTests
         }
 
         return unread;
+    }
+
+    private static TimeSpan Remaining(System.Diagnostics.Stopwatch started)
+    {
+        TimeSpan left = TimeSpan.FromSeconds(3) - started.Elapsed;
+        return left > TimeSpan.Zero ? left : TimeSpan.Zero;
     }
 
     private static bool WaitFor(Func<bool> condition) => WaitFor(condition, TimeSpan.FromSeconds(2));
