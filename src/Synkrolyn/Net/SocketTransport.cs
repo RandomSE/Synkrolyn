@@ -603,31 +603,30 @@ public sealed class SocketTransport : ITransport, IDisposable
                 return true;
             }
 
-            // Poll said readable with nothing queued. A slow peer that only reads
-            // still looks like that, and a blocking peek would wait forever. A
-            // one-millisecond peek either sees a byte, times out (still live), or
-            // observes a shutdown. Peek can also return 0 with no socket error on
-            // a live connection; a real reset or dispose leaves an error.
-            int previous = socket.ReceiveTimeout;
+            // Poll said readable with nothing queued. On Windows that is true for a
+            // peer that has not sent. A blocking peek would wait forever, and a
+            // receive timeout of 1 ms stores WSAETIMEDOUT and looks like a dead
+            // socket, so the writer would reconnect and tear a live frame. Peek
+            // without blocking. A zero-byte peek is a shutdown only when the socket
+            // error says so.
             try
             {
-                socket.ReceiveTimeout = 1;
+                socket.Blocking = false;
                 int peeked = socket.Receive(new byte[1], SocketFlags.Peek);
                 if (peeked > 0)
                 {
                     return true;
                 }
 
-                object? rawErr = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
-                return rawErr is not int code || code == 0;
+                return !IsHardDisconnect(SocketErrorCode(socket));
             }
-            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.TimedOut or SocketError.IOPending or SocketError.TryAgain)
+            catch (SocketException ex) when (!IsHardDisconnect(ex.SocketErrorCode))
             {
                 return true;
             }
             finally
             {
-                socket.ReceiveTimeout = previous;
+                socket.Blocking = true;
             }
         }
         catch (Exception)
@@ -635,6 +634,23 @@ public sealed class SocketTransport : ITransport, IDisposable
             return false;
         }
     }
+
+    private static SocketError SocketErrorCode(Socket socket)
+    {
+        object? raw = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+        return raw is int code ? (SocketError)code : SocketError.Success;
+    }
+
+    private static bool IsHardDisconnect(SocketError error) =>
+        error is SocketError.ConnectionReset
+            or SocketError.ConnectionAborted
+            or SocketError.Shutdown
+            or SocketError.Disconnecting
+            or SocketError.NotConnected
+            or SocketError.HostDown
+            or SocketError.NetworkDown
+            or SocketError.NetworkReset
+            or SocketError.ConnectionRefused;
 
     private void ReadLoop(TcpClient client)
     {
