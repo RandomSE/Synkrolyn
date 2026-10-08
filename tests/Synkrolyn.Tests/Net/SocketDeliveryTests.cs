@@ -184,16 +184,12 @@ public class SocketDeliveryTests
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
         client.Send("a", "b", new RequestVote(1, "a", 0, 0));
-        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
-        using TcpClient accepted = listener.AcceptTcpClient();
-        byte[]? first = ReadOneFrame(accepted, TimeSpan.FromSeconds(2));
+        using TcpClient accepted = AcceptFrame(listener, TimeSpan.FromSeconds(2), out byte[]? first);
         Assert.NotNull(first);
         // FIN only. The socket can still take our bytes, so a write failure is
         // not what marks it dead. A zero-byte peek with no socket error is a close.
         accepted.Client.Shutdown(SocketShutdown.Send);
-        Assert.True(WaitFor(() => listener.Pending(), TimeSpan.FromSeconds(2)));
-        using TcpClient again = listener.AcceptTcpClient();
-        byte[]? resent = ReadOneFrame(again, TimeSpan.FromSeconds(2));
+        using TcpClient again = AcceptFrame(listener, TimeSpan.FromSeconds(2), out byte[]? resent);
         Assert.NotNull(resent);
         var vote = Assert.IsType<RequestVote>(new RpcWireCodec().Decode(resent).Payload);
         Assert.Equal(1, vote.Term);
@@ -211,7 +207,7 @@ public class SocketDeliveryTests
         client.Send("a", "b", new RequestVote(1, "a", 0, 0));
         Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
         using TcpClient accepted = listener.AcceptTcpClient();
-        Assert.NotNull(ReadOneFrame(accepted, TimeSpan.FromSeconds(2)));
+        Assert.NotNull(ReadOneFrame(accepted, TimeSpan.FromSeconds(2)).Frame);
         int entered = SocketTransport.ProbeEntered;
         using var stall = new ManualResetEventSlim(false);
         using var released = new ManualResetEventSlim(false);
@@ -257,19 +253,83 @@ public class SocketDeliveryTests
         byte[] command = new byte[256 * 1024];
         command[0] = 4;
         client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        // The peer never reads. The writer must drop that socket and connect
-        // again instead of blocking inside Write while it still holds the frame.
-        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead), "writer blocked holding the frame");
-        using TcpClient retry = listener.AcceptTcpClient();
-        retry.ReceiveBufferSize = 1024 * 1024;
-        byte[]? payload = ReadOneFrame(retry, TimeSpan.FromSeconds(2));
-        Assert.NotNull(payload);
-        var append = Assert.IsType<AppendEntries>(new RpcWireCodec().Decode(payload).Payload);
-        Assert.Equal(4, append.Entries[0].Command[0]);
-        Assert.Equal(command.Length, append.Entries[0].Command.Length);
+        // The peer never reads. A blocking send timeout does not fire on Windows,
+        // so the writer has to notice the stall itself and send the frame again.
+        byte[]? payload = null;
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        while (payload is null && started.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            int leftUs = Math.Max(1, (int)(TimeSpan.FromSeconds(3) - started.Elapsed).TotalMilliseconds) * 1000;
+            if (!listener.Server.Poll(leftUs, SelectMode.SelectRead))
+            {
+                break;
+            }
+
+            using TcpClient retry = listener.AcceptTcpClient();
+            retry.ReceiveBufferSize = 1024 * 1024;
+            byte[]? frame = ReadOneFrame(retry, TimeSpan.FromSeconds(2)).Frame;
+            if (frame is null)
+            {
+                continue;
+            }
+
+            if (new RpcWireCodec().Decode(frame).Payload is AppendEntries append)
+            {
+                Assert.Equal(4, append.Entries[0].Command[0]);
+                Assert.Equal(command.Length, append.Entries[0].Command.Length);
+                payload = frame;
+            }
+        }
+
+        Assert.True(payload is not null, "writer blocked holding the frame");
     }
 
-    private static byte[]? ReadOneFrame(TcpClient client, TimeSpan budget)
+    /// <summary>
+    /// Accepts until a frame arrives. A connect the 75 ms budget aborted can sit
+    /// in the backlog and close with no bytes; that socket is not the frame.
+    /// </summary>
+    private static TcpClient AcceptFrame(TcpListener listener, TimeSpan budget, out byte[]? frame)
+    {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        while (started.Elapsed < budget)
+        {
+            int leftUs = Math.Max(1, (int)(budget - started.Elapsed).TotalMilliseconds) * 1000;
+            if (!listener.Server.Poll(leftUs, SelectMode.SelectRead))
+            {
+                break;
+            }
+
+            TcpClient accepted = listener.AcceptTcpClient();
+            TimeSpan left = budget - started.Elapsed;
+            if (left <= TimeSpan.Zero)
+            {
+                accepted.Dispose();
+                break;
+            }
+
+            FrameRead read = ReadOneFrame(accepted, left);
+            if (read.Closed)
+            {
+                accepted.Dispose();
+                continue;
+            }
+
+            frame = read.Frame;
+            return accepted;
+        }
+
+        frame = null;
+        throw new InvalidOperationException("no frame arrived");
+    }
+
+    private readonly struct FrameRead
+    {
+        public byte[]? Frame { get; init; }
+
+        public bool Closed { get; init; }
+    }
+
+    private static FrameRead ReadOneFrame(TcpClient client, TimeSpan budget)
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
         client.ReceiveTimeout = Math.Max(1, (int)budget.TotalMilliseconds);
@@ -290,16 +350,16 @@ public class SocketDeliveryTests
 
             if (n <= 0)
             {
-                return null;
+                return new FrameRead { Closed = true };
             }
 
             foreach (byte[] frame in decoder.Push(buf.AsSpan(0, n).ToArray()))
             {
-                return frame;
+                return new FrameRead { Frame = frame };
             }
         }
 
-        return null;
+        return new FrameRead();
     }
 
     private static TcpClient? Outbound(SocketTransport transport)

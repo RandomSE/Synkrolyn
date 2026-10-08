@@ -430,9 +430,7 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
 
             TcpClient client = EnsureOutbound(peer);
-            NetworkStream stream = client.GetStream();
-            stream.Write(frame);
-            stream.Flush();
+            WriteFrame(client.Client, frame);
             if (!OutboundLive(peer))
             {
                 // The peer reset while the bytes were only in the socket buffer.
@@ -591,12 +589,9 @@ public sealed class SocketTransport : ITransport, IDisposable
                 // ConnectAsync leaves the native socket non-blocking, and the managed
                 // Blocking flag can already read true, so assigning true is a no-op.
                 // A full send buffer then fails the write and the writer drops a live
-                // slow reader mid-frame. Toggle so the native mode follows. A send
-                // that makes no progress still ends, so a silent peer cannot pin the
-                // frame; a peer that is reading drains the buffer and the write returns.
+                // slow reader mid-frame. Toggle so the native mode follows.
                 raw.Blocking = false;
                 raw.Blocking = true;
-                raw.SendTimeout = SendStallMillis;
                 ArmDeadPeerTimeout(raw);
                 return client;
             }
@@ -623,6 +618,79 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     /// <summary>How many liveness probes have started. Tests use this to see the probe is inside.</summary>
     internal static int ProbeEntered;
+
+    /// <summary>
+    /// Writes <paramref name="frame"/> or throws. A blocking send timeout does not
+    /// fire on Windows, so this socket is non-blocking and the wait is ours. Any
+    /// progress restarts the stall clock. A peer that keeps reading finishes. A
+    /// peer that accepts nothing for <see cref="SendStallMillis"/> throws, and the
+    /// caller drops the socket and sends the whole frame again.
+    /// </summary>
+    private static void WriteFrame(Socket socket, byte[] frame)
+    {
+        // Assigning the current Blocking value is a no-op, so toggle first.
+        socket.Blocking = true;
+        socket.Blocking = false;
+        var idle = System.Diagnostics.Stopwatch.StartNew();
+        int offset = 0;
+        try
+        {
+            while (offset < frame.Length)
+            {
+                int sent = 0;
+                bool blocked = false;
+                try
+                {
+                    sent = socket.Send(frame, offset, frame.Length - offset, SocketFlags.None);
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
+                {
+                    blocked = true;
+                }
+
+                if (!blocked && sent == 0)
+                {
+                    throw new IOException("peer closed during send");
+                }
+
+                if (sent > 0)
+                {
+                    offset += sent;
+                    idle.Restart();
+                    continue;
+                }
+
+                if (idle.ElapsedMilliseconds >= SendStallMillis)
+                {
+                    throw new IOException("send made no progress for " + SendStallMillis + " ms");
+                }
+
+                int remain = SendStallMillis - (int)idle.ElapsedMilliseconds;
+                int slice = Math.Min(remain, 50);
+                if (!socket.Poll(slice * 1000, SelectMode.SelectWrite)
+                    && idle.ElapsedMilliseconds >= SendStallMillis)
+                {
+                    throw new IOException("send made no progress for " + SendStallMillis + " ms");
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                socket.Blocking = false;
+                socket.Blocking = true;
+            }
+            catch (ObjectDisposedException)
+            {
+                // The peer socket was dropped while the write unwound.
+            }
+            catch (SocketException)
+            {
+                // The peer socket was dropped while the write unwound.
+            }
+        }
+    }
 
     private static bool IsLive(TcpClient client)
     {

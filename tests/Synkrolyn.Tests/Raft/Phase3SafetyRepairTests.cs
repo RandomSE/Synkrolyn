@@ -17,9 +17,10 @@ public class Phase3SafetyRepairTests
     public void TruncateWhileArmedReaderHoldsTheLog_renames()
     {
         string dir = Directory.CreateTempSubdirectory("synkrolyn-armed-rename-").FullName;
+        FileRaftLog? log = null;
         try
         {
-            var log = new FileRaftLog(dir);
+            log = new FileRaftLog(dir);
             log.Append(new LogEntry(1, 1, "a"u8.ToArray()));
             log.Append(new LogEntry(2, 1, "b"u8.ToArray()));
             log.Append(new LogEntry(3, 1, "c"u8.ToArray()));
@@ -28,21 +29,23 @@ public class Phase3SafetyRepairTests
             Assert.True(
                 log.LastArmedShare.HasFlag(FileShare.Delete),
                 "armed reader has no FileShare.Delete, so Windows cannot rename raft.log");
-            // A conflicting suffix rewrites raft.log while the snapshot reader
-            // still has the pre-truncate file open. On Windows that rename fails
-            // unless the reader was opened with FileShare.Delete.
+            // The capture is the suffix bytes. TruncateFrom renames raft.log
+            // while that capture is still in hand. On Windows an open handle
+            // without FILE_SHARE_DELETE fails that rename and the node stops.
             log.TruncateFrom(2);
             Assert.Equal(1, log.LastIndex);
             Assert.Equal(1, log.Read(1).Term);
             StagedCompaction staged = log.StageCompaction(1, 1, [9]);
             staged.Write();
             log.Dispose();
+            log = null;
             using var reopened = new FileRaftLog(dir);
             Assert.Equal(1, reopened.LastIndex);
             Assert.Equal("a"u8.ToArray(), reopened.Read(1).Command);
         }
         finally
         {
+            log?.Dispose();
             Directory.Delete(dir, true);
         }
     }

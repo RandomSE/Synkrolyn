@@ -56,7 +56,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         _directoryLock = DataDirectoryLock.Acquire(directory, "raft.log");
         _file = Path.Combine(directory, FileName);
         _snapshotFile = Path.Combine(directory, SnapshotFileName);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, LogShare);
         try
         {
             LoadSnapshot();
@@ -145,7 +145,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         lock (this)
         {
             _closed = true;
-            _armed?.DisposeReader();
             _armed = null;
             ClearPending();
             _channel?.Dispose();
@@ -329,8 +328,14 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         staged.Commit();
     }
 
-    /// <summary>Share mode of the armed snapshot reader. Tests check that a rename can replace the log.</summary>
+    /// <summary>
+    /// Share mode of every <c>raft.log</c> handle. Includes delete so Windows can
+    /// rename the file. The snapshot capture itself is bytes, not a live handle.
+    /// </summary>
     internal FileShare LastArmedShare { get; private set; }
+
+    /// <summary>Read, write, and delete. A rename must not fail while a handle is open.</summary>
+    private const FileShare LogShare = FileShare.ReadWrite | FileShare.Delete;
 
     /// <inheritdoc />
     public void ArmCompaction(long lastIncludedIndex, long lastIncludedTerm)
@@ -338,7 +343,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         lock (this)
         {
             EnsureOpen();
-            _armed?.DisposeReader();
             _armed = CaptureSuffix(lastIncludedIndex, lastIncludedTerm);
         }
     }
@@ -356,15 +360,8 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
                 return new StagedCompaction(
                     () =>
                     {
-                        try
-                        {
-                            captured.SetKept(ReadCaptured(armed));
-                            captured.Write();
-                        }
-                        finally
-                        {
-                            armed.DisposeReader();
-                        }
+                        captured.SetKept(ReadCaptured(armed));
+                        captured.Write();
                     },
                     () => CommitJob(captured));
             }
@@ -388,47 +385,63 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             keptOffset = _forcedOffsets[slot];
         }
 
-        // FileShare.Delete lets Windows MoveFileEx replace raft.log while this
-        // reader still holds the pre-truncate bytes. Without it the rename fails
-        // and the Raft thread fail-stops. Linux keeps the old inode either way.
-        LastArmedShare = FileShare.ReadWrite | FileShare.Delete;
-        return new ArmedCapture(
-            index,
-            term,
-            fileEnd,
-            keptOffset,
-            _pendingEntries.ToList(),
-            new FileStream(_file, FileMode.Open, FileAccess.Read, LastArmedShare));
+        // Copy the suffix and drop the file position. A handle left open on
+        // raft.log, even with FileShare.Delete, is what Windows refuses to
+        // replace. The bytes stay valid after TruncateFrom renames the file.
+        int suffixLength = checked((int)(fileEnd - keptOffset));
+        byte[] suffix = suffixLength == 0 ? [] : new byte[suffixLength];
+        if (suffixLength > 0)
+        {
+            FileStream channel = Channel;
+            long restore = channel.Position;
+            try
+            {
+                channel.Position = keptOffset;
+                ReadFully(channel, suffix);
+            }
+            finally
+            {
+                channel.Position = restore;
+            }
+        }
+
+        LastArmedShare = LogShare;
+        return new ArmedCapture(index, term, suffix, _pendingEntries.ToList());
     }
 
     private static List<LogEntry> ReadCaptured(ArmedCapture armed)
     {
         var kept = new List<LogEntry>();
-        FileStream reader = armed.Reader;
-        long pos = armed.KeptOffset;
-        reader.Position = pos;
-        while (pos < armed.FileEnd)
+        ReadOnlySpan<byte> rest = armed.Suffix;
+        while (rest.Length > 0)
         {
-            byte[] header = new byte[4];
-            ReadFully(reader, header);
-            int length = BinaryPrimitives.ReadInt32BigEndian(header);
+            if (rest.Length < 4)
+            {
+                throw new IOException("unexpected end of raft log");
+            }
+
+            int length = BinaryPrimitives.ReadInt32BigEndian(rest);
+            rest = rest[4..];
             if (length < 0 || length > ChecksummedRecords.MaxPayloadBytes)
             {
                 throw new InvalidOperationException("invalid log record length: " + length);
             }
 
-            byte[] payload = new byte[length];
-            ReadFully(reader, payload);
-            byte[] crcBuf = new byte[4];
-            ReadFully(reader, crcBuf);
-            int crc = BinaryPrimitives.ReadInt32BigEndian(crcBuf);
+            int record = length + 4;
+            if (rest.Length < record)
+            {
+                throw new IOException("unexpected end of raft log");
+            }
+
+            byte[] payload = rest[..length].ToArray();
+            int crc = BinaryPrimitives.ReadInt32BigEndian(rest.Slice(length, 4));
             if (crc != ChecksummedRecords.Crc32(payload))
             {
-                throw new InvalidOperationException("log checksum mismatch at offset " + pos);
+                throw new InvalidOperationException("log checksum mismatch in captured suffix");
             }
 
             kept.Add(Decode(payload));
-            pos += 4L + length + 4L;
+            rest = rest[record..];
         }
 
         foreach (LogEntry entry in armed.PendingEntries)
@@ -552,7 +565,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             }
 
             _closed = true;
-            _armed?.DisposeReader();
             _armed = null;
             _channel?.Dispose();
             _channel = null;
@@ -797,7 +809,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
         _channel?.Dispose();
         FilePersistentState.Replace(tmp, _file);
-        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        _channel = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, LogShare);
         _channel.Position = _channel.Length;
         _forcedOffsets = newOffsets;
         _forcedCount = newCount;
@@ -1018,7 +1030,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             channel = null;
             FilePersistentState.Replace(_snapshotTmp, snapshotFile);
             FilePersistentState.Replace(_entriesTmp, logFile);
-            channel = new FileStream(logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+            channel = new FileStream(logFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, LogShare);
             channel.Position = channel.Length;
             forcedOffsets = _offsets;
             forcedCount = _count;
@@ -1086,28 +1098,20 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
     private sealed class ArmedCapture
     {
-        public ArmedCapture(long index, long term, long fileEnd, long keptOffset, List<LogEntry> pendingEntries, FileStream reader)
+        public ArmedCapture(long index, long term, byte[] suffix, List<LogEntry> pendingEntries)
         {
             Index = index;
             Term = term;
-            FileEnd = fileEnd;
-            KeptOffset = keptOffset;
+            Suffix = suffix;
             PendingEntries = pendingEntries;
-            Reader = reader;
         }
 
         public long Index { get; }
 
         public long Term { get; }
 
-        public long FileEnd { get; }
-
-        public long KeptOffset { get; }
+        public byte[] Suffix { get; }
 
         public List<LogEntry> PendingEntries { get; }
-
-        public FileStream Reader { get; }
-
-        public void DisposeReader() => Reader.Dispose();
     }
 }
