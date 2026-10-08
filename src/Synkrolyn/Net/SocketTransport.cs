@@ -1,14 +1,16 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Threading.Channels;
+using Synkrolyn.Raft;
 
 namespace Synkrolyn.Net;
 
 /// <summary>
 /// Localhost TCP transport. <see cref="Send"/> enqueues a framed payload and does not
-/// block the caller on a socket write. I/O threads only enqueue Raft work.
+/// block the caller on a socket write. Each peer has its own writer. A peer is closed
+/// only when no frame has arrived from it for <see cref="PeerDeadTimeout"/>, or when
+/// its socket is already shut. I/O threads only enqueue Raft work.
 /// </summary>
 public sealed class SocketTransport : ITransport, IDisposable
 {
@@ -17,14 +19,15 @@ public sealed class SocketTransport : ITransport, IDisposable
     private readonly Dictionary<string, IPEndPoint> _peers = [];
     private readonly HashSet<string> _disabled = [];
     private readonly Dictionary<string, TcpClient> _outbound = [];
-    private readonly Dictionary<string, Channel<byte[]>> _peerQueues = [];
+    private readonly Dictionary<string, PeerLink> _links = [];
+    private readonly Dictionary<string, long> _lastInbound = [];
     private readonly Dictionary<string, Thread> _writers = [];
     private readonly List<TcpClient> _inbound = [];
     private readonly object _gate = new();
 
     /// <summary>
-    /// A blocked connect or send fails inside this budget. The socket fixture's
-    /// shortest election timeout is 120 ms, so one stall must end before CheckQuorum
+    /// A blocked connect fails inside this budget. The socket fixture's shortest
+    /// election timeout is 120 ms, so one refused connect ends before CheckQuorum
     /// steps the leader down while the same frame is still being retried.
     /// </summary>
     private const int IoBudgetMillis = 75;
@@ -35,13 +38,11 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// </summary>
     private const int ProbeMillis = 5;
 
-    /// <summary>
-    /// A send that makes no progress for this long is a dead window, not a slow
-    /// reader. The writer drops that socket and sends the same frame again.
-    /// Loopback to a peer that is still reading finishes inside it. The 75 ms
-    /// connect budget stays connect-only.
-    /// </summary>
-    private const int SendStallMillis = 1000;
+    /// <summary>How often the per-peer checker looks for a silent socket.</summary>
+    private const int PeerCheckMillis = 25;
+
+    /// <summary>Matches the host election timeout when the caller does not set one.</summary>
+    private long _peerDeadMillis = 150;
 
     private Action<Envelope>? _handler;
     private Action _wakeup = static () => { };
@@ -60,6 +61,23 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         _nodeId = nodeId;
         _codec = codec ?? throw new ArgumentNullException(nameof(codec));
+    }
+
+    /// <summary>
+    /// How long a peer may send nothing before its socket is closed. An ack or any
+    /// other inbound frame restarts the wait. Send progress does not. Callers set
+    /// this to the node's election timeout, the same window CheckQuorum already
+    /// uses, so closing the socket does not move failover earlier.
+    /// </summary>
+    public TimeSpan PeerDeadTimeout
+    {
+        get => TimeSpan.FromMilliseconds(Volatile.Read(ref _peerDeadMillis));
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, TimeSpan.Zero);
+
+            Volatile.Write(ref _peerDeadMillis, (long)value.TotalMilliseconds);
+        }
     }
 
     /// <summary>Binds an ephemeral localhost port.</summary>
@@ -122,7 +140,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         foreach (TcpClient client in clients)
         {
-            client.Dispose();
+            CloseSocket(client);
         }
     }
 
@@ -147,13 +165,16 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// <summary>Closes sockets to <paramref name="peerId"/> and drops further sends.</summary>
     public void DisconnectPeer(string peerId)
     {
+        TcpClient? client;
         lock (_gate)
         {
             _disabled.Add(peerId);
-            if (_outbound.Remove(peerId, out TcpClient? client))
-            {
-                client.Dispose();
-            }
+            _outbound.Remove(peerId, out client);
+        }
+
+        if (client is not null)
+        {
+            CloseSocket(client);
         }
     }
 
@@ -221,34 +242,60 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
         }
 
-        byte[] body = _codec.Encode(sender, payload);
-        return PeerQueue(recipient).Writer.TryWrite(FrameCodec.Encode(body));
+        byte[] frame = FrameCodec.Encode(_codec.Encode(sender, payload));
+        PeerLink link = LinkFor(recipient);
+        if (payload is AppendEntries)
+        {
+            // The leader rebuilds AppendEntries from nextIndex. An older heartbeat
+            // that has not been handed to the socket is replaced, so a stuck peer
+            // cannot queue an unbounded run of the same replication.
+            lock (link.Slot)
+            {
+                link.PendingAppend = frame;
+                link.AppendGeneration++;
+            }
+
+            link.Poke.Set();
+            return true;
+        }
+
+        bool queued = link.Others.Writer.TryWrite(frame);
+        if (queued)
+        {
+            link.Poke.Set();
+        }
+
+        return queued;
     }
 
-    private Channel<byte[]> PeerQueue(string recipient)
+    private PeerLink LinkFor(string recipient)
     {
+        Thread? spawned = null;
+        PeerLink link;
         lock (_gate)
         {
-            if (_peerQueues.TryGetValue(recipient, out Channel<byte[]>? existing))
+            if (_links.TryGetValue(recipient, out PeerLink? existing))
             {
                 return existing;
             }
 
-            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+            link = new PeerLink();
+            if (_lastInbound.TryGetValue(recipient, out long heard))
             {
-                SingleReader = true,
-                FullMode = BoundedChannelFullMode.DropOldest,
-            });
-            _peerQueues[recipient] = channel;
-            var thread = new Thread(() => WriteLoop(recipient, channel))
+                link.LastInboundTicks = heard;
+            }
+
+            _links[recipient] = link;
+            spawned = new Thread(() => WriteLoop(recipient, link))
             {
                 IsBackground = true,
                 Name = "synkrolyn-write-" + _nodeId + "-" + recipient,
             };
-            _writers[recipient] = thread;
-            thread.Start();
-            return channel;
+            _writers[recipient] = spawned;
         }
+
+        spawned.Start();
+        return link;
     }
 
     /// <inheritdoc />
@@ -266,36 +313,45 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         _acceptor?.Join(1000);
 
-        Channel<byte[]>[] channels;
+        PeerLink[] links;
         Thread[] writers;
         TcpClient[] inbound;
+        TcpClient[] outbound;
         lock (_gate)
         {
-            channels = _peerQueues.Values.ToArray();
+            links = _links.Values.ToArray();
             writers = _writers.Values.ToArray();
             inbound = _inbound.ToArray();
+            outbound = _outbound.Values.ToArray();
             _inbound.Clear();
-            foreach (TcpClient client in _outbound.Values)
-            {
-                client.Dispose();
-            }
-
             _outbound.Clear();
         }
 
-        foreach (Channel<byte[]> channel in channels)
+        foreach (TcpClient client in outbound)
         {
-            channel.Writer.TryComplete();
+            CloseSocket(client);
+        }
+
+        foreach (PeerLink link in links)
+        {
+            link.Others.Writer.TryComplete();
+            link.Poke.Set();
+            link.Stop.Set();
         }
 
         foreach (TcpClient client in inbound)
         {
-            client.Dispose();
+            CloseSocket(client);
         }
 
         foreach (Thread writer in writers)
         {
             writer.Join(1000);
+        }
+
+        foreach (PeerLink link in links)
+        {
+            link.Dispose();
         }
 
         GC.SuppressFinalize(this);
@@ -346,173 +402,163 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private void WriteLoop(string peer, Channel<byte[]> channel)
+    private void WriteLoop(string peer, PeerLink link)
     {
-        using var pause = new ManualResetEventSlim(false);
-        using var watchStop = new ManualResetEventSlim(false);
-        var watch = new SendWatch();
-        var watchdog = new Thread(() => WatchStalledSend(watch, watchStop))
+        var checker = new Thread(() => WatchPeer(peer, link))
         {
             IsBackground = true,
-            Name = "synkrolyn-send-watch-" + _nodeId + "-" + peer,
+            Name = "synkrolyn-dead-" + _nodeId + "-" + peer,
         };
-        watchdog.Start();
+        checker.Start();
+        using var pause = new ManualResetEventSlim(false);
         try
         {
             byte[]? inflight = null;
-            Task<bool>? queued = null;
-            int lastUnsent = -1;
-            long unsentProgress = System.Diagnostics.Stopwatch.GetTimestamp();
-            byte[]? Deliver(byte[] payload)
-            {
-                bool ok = SendUntil(peer, payload, pause, watch);
-                lastUnsent = -1;
-                unsentProgress = System.Diagnostics.Stopwatch.GetTimestamp();
-                return ok ? payload : null;
-            }
-
+            bool inflightAppend = false;
+            long inflightGeneration = 0;
             while (_running)
             {
-                // Write can return after the kernel has copied the bytes and before the
-                // peer's Read. DropInbound then discards them, IsLive still passed, and
-                // nothing else will resend a frame Raft already handed off. Hold the
-                // last frame and resend it when that socket dies, before any newer one.
+                // The last frame stays here until a newer one replaces it or the
+                // socket dies. A reset discards bytes the kernel had accepted, and
+                // nothing else will resend a frame Raft already handed off.
                 if (inflight is not null && !OutboundLive(peer))
                 {
                     DropOutbound(peer);
-                    pause.Wait(5);
-                    inflight = Deliver(inflight);
-                    continue;
-                }
-
-                if (channel.Reader.TryRead(out byte[]? frame))
-                {
-                    queued = null;
-                    inflight = Deliver(frame);
-                    continue;
-                }
-
-                if (inflight is null)
-                {
-                    try
+                    if (inflightAppend && Superseded(link, inflightGeneration))
                     {
-                        frame = channel.Reader.ReadAsync().AsTask().GetAwaiter().GetResult();
+                        inflight = null;
                     }
-                    catch (Exception ex) when (ex is ChannelClosedException || ex.GetBaseException() is ChannelClosedException)
+                    else if (!SendUntil(peer, link, inflight, inflightAppend, inflightGeneration, pause))
                     {
-                        return;
+                        inflight = null;
                     }
 
-                    inflight = Deliver(frame);
                     continue;
                 }
 
-                // The kernel accepted this frame and the peer stopped reading.
-                // The bytes sit in the send queue, so a poll never runs. A queue
-                // that does not shrink is the same dead window as a send that
-                // does not return.
-                if (inflight is not null && UnsentStalled(peer, ref lastUnsent, ref unsentProgress))
+                if (link.Others.Reader.TryRead(out byte[]? other))
                 {
-                    DropOutbound(peer);
-                    pause.Wait(5);
-                    inflight = Deliver(inflight);
-                    continue;
-                }
-
-                queued ??= channel.Reader.WaitToReadAsync().AsTask();
-                if (queued.IsCompleted)
-                {
-                    if (!queued.IsCompletedSuccessfully || !queued.Result)
+                    inflight = other;
+                    inflightAppend = false;
+                    inflightGeneration = 0;
+                    if (!SendUntil(peer, link, other, false, 0, pause))
                     {
-                        return;
+                        inflight = null;
                     }
 
-                    queued = null;
+                    continue;
+                }
+
+                byte[]? append = TakeAppend(link, out long generation);
+                if (append is not null)
+                {
+                    inflight = append;
+                    inflightAppend = true;
+                    inflightGeneration = generation;
+                    if (!SendUntil(peer, link, append, true, generation, pause))
+                    {
+                        inflight = null;
+                    }
+
+                    continue;
+                }
+
+                link.Poke.Reset();
+                if (HasQueued(link))
+                {
                     continue;
                 }
 
                 // Park until the next frame or a short probe. A frame that arrives
                 // during the wait is taken immediately; an idle writer does not spin.
-                queued.Wait(ProbeMillis);
+                link.Poke.Wait(ProbeMillis);
             }
         }
         finally
         {
-            watch.Stop = true;
-            watchStop.Set();
-            watchdog.Join(1000);
+            link.Stop.Set();
+            checker.Join(1000);
         }
     }
 
     /// <summary>
-    /// Closes a socket whose blocking send has not returned a chunk for
-    /// <see cref="SendStallMillis"/>. The wait is this thread's own event, so it
-    /// does not wake or consume the writer's retry pause.
+    /// Closes a socket that has not delivered an inbound frame for
+    /// <see cref="PeerDeadTimeout"/>. The close runs on this thread so a
+    /// <see cref="Socket.SendAsync(SocketAsyncEventArgs)"/> parked on the writer
+    /// completes with an error. Send progress is not a reason to close.
     /// </summary>
-    private static void WatchStalledSend(SendWatch watch, ManualResetEventSlim stop)
+    private void WatchPeer(string peer, PeerLink link)
     {
-        while (!watch.Stop)
+        while (_running && !link.Stop.Wait(PeerCheckMillis))
         {
-            if (stop.Wait(200))
-            {
-                return;
-            }
-
-            Socket? socket = Volatile.Read(ref watch.Socket);
-            if (socket is null || watch.Stop)
+            if (!PeerSilent(link))
             {
                 continue;
             }
 
-            long stamp = Interlocked.Read(ref watch.Stamp);
-            if (System.Diagnostics.Stopwatch.GetElapsedTime(stamp).TotalMilliseconds < SendStallMillis)
+            TcpClient? client;
+            lock (_gate)
+            {
+                _outbound.TryGetValue(peer, out client);
+            }
+
+            if (client is null || !PeerSilent(link))
             {
                 continue;
             }
 
-            // A chunk that finished while this thread was sampling moved the stamp.
-            // Closing then would drop a live reader.
-            if (!ReferenceEquals(Volatile.Read(ref watch.Socket), socket)
-                || Interlocked.Read(ref watch.Stamp) != stamp)
-            {
-                continue;
-            }
-
-            AbortStuckSend(socket);
+            DropOutbound(peer, client);
+            link.Poke.Set();
         }
     }
 
-    private bool SendUntil(string peer, byte[] frame, ManualResetEventSlim pause, SendWatch watch)
+    private bool SendUntil(
+        string peer,
+        PeerLink link,
+        byte[] frame,
+        bool append,
+        long generation,
+        ManualResetEventSlim pause)
     {
-        while (_running && !TrySend(peer, frame, watch))
+        while (_running)
+        {
+            if (IsDisabled(peer) || (append && Superseded(link, generation)))
+            {
+                return false;
+            }
+
+            if (TrySend(peer, link, frame))
+            {
+                return true;
+            }
+
+            if (!_running || IsDisabled(peer) || (append && Superseded(link, generation)))
+            {
+                return false;
+            }
+
+            pause.Wait(5);
+        }
+
+        return false;
+    }
+
+    private bool TrySend(string peer, PeerLink link, byte[] frame)
+    {
+        try
         {
             if (IsDisabled(peer))
             {
                 return false;
             }
 
-            DropOutbound(peer);
-            pause.Wait(5);
-        }
-
-        return _running && !IsDisabled(peer);
-    }
-
-    private bool TrySend(string peer, byte[] frame, SendWatch watch)
-    {
-        try
-        {
-            if (IsDisabled(peer))
-            {
-                return true;
-            }
-
+            EnsureWindow(link);
             TcpClient client = EnsureOutbound(peer);
-            WriteFrame(client.Client, frame, watch);
+            SendAll(client.Client, frame);
             if (!OutboundLive(peer))
             {
                 // The peer reset while the bytes were only in the socket buffer.
-                DropOutbound(peer);
+                DropOutbound(peer, client);
                 return false;
             }
 
@@ -523,6 +569,83 @@ public sealed class SocketTransport : ITransport, IDisposable
             // Any send failure, including a connect abort, leaves the writer alive.
             DropOutbound(peer);
             return false;
+        }
+    }
+
+    private static void EnsureWindow(PeerLink link)
+    {
+        lock (link.Slot)
+        {
+            if (link.WindowStartTicks == 0)
+            {
+                link.WindowStartTicks = Stopwatch.GetTimestamp();
+            }
+        }
+    }
+
+    private static void RestartWindow(PeerLink link)
+    {
+        lock (link.Slot)
+        {
+            link.WindowStartTicks = Stopwatch.GetTimestamp();
+        }
+    }
+
+    private bool PeerSilent(PeerLink link)
+    {
+        long timeout = Volatile.Read(ref _peerDeadMillis);
+        long lastIn;
+        long window;
+        lock (link.Slot)
+        {
+            lastIn = link.LastInboundTicks;
+            window = link.WindowStartTicks;
+        }
+
+        long basis = lastIn > window ? lastIn : window;
+        if (basis == 0 || timeout <= 0)
+        {
+            return false;
+        }
+
+        return Stopwatch.GetElapsedTime(basis).TotalMilliseconds >= timeout;
+    }
+
+    private static byte[]? TakeAppend(PeerLink link, out long generation)
+    {
+        lock (link.Slot)
+        {
+            if (link.PendingAppend is null)
+            {
+                generation = 0;
+                return null;
+            }
+
+            byte[] frame = link.PendingAppend;
+            generation = link.AppendGeneration;
+            link.PendingAppend = null;
+            return frame;
+        }
+    }
+
+    private static bool Superseded(PeerLink link, long generation)
+    {
+        lock (link.Slot)
+        {
+            return link.AppendGeneration != generation;
+        }
+    }
+
+    private static bool HasQueued(PeerLink link)
+    {
+        if (link.Others.Reader.TryPeek(out _))
+        {
+            return true;
+        }
+
+        lock (link.Slot)
+        {
+            return link.PendingAppend is not null;
         }
     }
 
@@ -550,14 +673,57 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private void DropOutbound(string peer)
+    private void DropOutbound(string peer, TcpClient? expected = null)
     {
+        TcpClient? client;
         lock (_gate)
         {
-            if (_outbound.Remove(peer, out TcpClient? client))
+            if (!_outbound.TryGetValue(peer, out client))
             {
-                client.Dispose();
+                client = null;
             }
+            else if (expected is not null && !ReferenceEquals(client, expected))
+            {
+                client = null;
+            }
+            else
+            {
+                _outbound.Remove(peer);
+            }
+
+            if (client is not null && _links.TryGetValue(peer, out PeerLink? link))
+            {
+                RestartWindow(link);
+            }
+        }
+
+        if (client is not null)
+        {
+            CloseSocket(client);
+        }
+    }
+
+    private static void CloseSocket(TcpClient client)
+    {
+        try
+        {
+            // Closing from this thread completes a SendAsync parked on the writer.
+            // A blocking Socket.Send can hold the same lock Close waits on; the
+            // async send does not.
+            client.Client.Close();
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+        {
+            // The writer already dropped this socket.
+        }
+
+        try
+        {
+            client.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already closed.
         }
     }
 
@@ -591,7 +757,7 @@ public sealed class SocketTransport : ITransport, IDisposable
                 }
             }
 
-            existing.Dispose();
+            CloseSocket(existing);
         }
 
         if (Volatile.Read(ref _failConnects) > 0 && Interlocked.Decrement(ref _failConnects) >= 0)
@@ -604,19 +770,19 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             if (_disabled.Contains(peerId))
             {
-                socket.Dispose();
+                CloseSocket(socket);
                 throw new IOException("peer disabled: " + peerId);
             }
 
             if (_outbound.TryGetValue(peerId, out TcpClient? raced) && raced.Connected)
             {
-                socket.Dispose();
+                CloseSocket(socket);
                 return raced;
             }
 
             if (_outbound.Remove(peerId, out TcpClient? stale))
             {
-                stale.Dispose();
+                CloseSocket(stale);
             }
 
             _outbound[peerId] = socket;
@@ -670,7 +836,7 @@ public sealed class SocketTransport : ITransport, IDisposable
                 // slow reader mid-frame. Toggle so the native mode follows.
                 raw.Blocking = false;
                 raw.Blocking = true;
-                ArmDeadPeerTimeout(raw);
+                ArmKeepAlive(raw);
                 return client;
             }
             finally
@@ -698,264 +864,44 @@ public sealed class SocketTransport : ITransport, IDisposable
     internal static int ProbeEntered;
 
     /// <summary>
-    /// Writes <paramref name="frame"/> or throws. The socket is non-blocking for
-    /// the write: a blocking send copies into the kernel and returns while a tiny
-    /// window never delivers the tail, and on Windows that same call does not
-    /// return at all when the window is full. A would-block waits in
-    /// <see cref="Socket.Poll(int, SelectMode)"/>. No progress for
-    /// <see cref="SendStallMillis"/> throws. If the send call itself never
-    /// returns, <see cref="WatchStalledSend"/> closes the socket. The caller
-    /// sends the whole frame again.
+    /// Writes <paramref name="frame"/> or throws. The wait is only this peer's
+    /// writer. Closing the socket from the checker unblocks it. A partial copy
+    /// into the kernel is not a reason to reconnect: the peer is still reading.
     /// </summary>
-    private static void WriteFrame(Socket socket, byte[] frame, SendWatch watch)
+    private static void SendAll(Socket socket, byte[] frame)
     {
-        // Assigning the current Blocking value is a no-op, so toggle first.
-        socket.Blocking = true;
-        socket.Blocking = false;
-        var idle = System.Diagnostics.Stopwatch.StartNew();
-        int offset = 0;
-        try
+        using var done = new ManualResetEventSlim(false);
+        using var args = new SocketAsyncEventArgs();
+        args.Completed += (_, _) =>
         {
-            while (offset < frame.Length)
-            {
-                int sent = 0;
-                bool blocked = false;
-                Volatile.Write(ref watch.Socket, socket);
-                Interlocked.Exchange(ref watch.Stamp, System.Diagnostics.Stopwatch.GetTimestamp());
-                try
-                {
-                    sent = socket.Send(frame, offset, frame.Length - offset, SocketFlags.None);
-                }
-                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
-                {
-                    blocked = true;
-                }
-                finally
-                {
-                    // A poll wait is not a send that failed to return. Leave the
-                    // socket visible only while Send can be stuck inside the call.
-                    Volatile.Write(ref watch.Socket, null);
-                }
-
-                if (!blocked && sent == 0)
-                {
-                    throw new IOException("peer closed during send");
-                }
-
-                if (sent > 0)
-                {
-                    offset += sent;
-                    idle.Restart();
-                    continue;
-                }
-
-                if (idle.ElapsedMilliseconds >= SendStallMillis)
-                {
-                    throw new IOException("send made no progress for " + SendStallMillis + " ms");
-                }
-
-                int remain = SendStallMillis - (int)idle.ElapsedMilliseconds;
-                int slice = Math.Min(remain, 50);
-                if (!socket.Poll(slice * 1000, SelectMode.SelectWrite)
-                    && idle.ElapsedMilliseconds >= SendStallMillis)
-                {
-                    throw new IOException("send made no progress for " + SendStallMillis + " ms");
-                }
-            }
-        }
-        finally
-        {
-            Volatile.Write(ref watch.Socket, null);
             try
             {
-                socket.Blocking = false;
-                socket.Blocking = true;
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
-            {
-                // The peer socket was dropped while the write unwound.
-            }
-        }
-    }
-
-    /// <summary>The socket a writer is blocked in, and when that send last returned.</summary>
-    private sealed class SendWatch
-    {
-        public Socket? Socket;
-
-        public long Stamp = System.Diagnostics.Stopwatch.GetTimestamp();
-
-        public volatile bool Stop;
-    }
-
-    /// <summary>
-    /// True when bytes already accepted by the kernel have not left the send
-    /// queue for <see cref="SendStallMillis"/>. The caller drops the socket and
-    /// sends the frame again.
-    /// </summary>
-    private bool UnsentStalled(string peer, ref int lastUnsent, ref long unsentProgress)
-    {
-        Socket? socket;
-        lock (_gate)
-        {
-            if (!_outbound.TryGetValue(peer, out TcpClient? client))
-            {
-                return false;
-            }
-
-            try
-            {
-                socket = client.Client;
+                done.Set();
             }
             catch (ObjectDisposedException)
             {
-                return false;
+                // The writer is already leaving this send.
             }
-        }
+        };
 
-        int? unsent = UnsentBytes(socket);
-        if (unsent is null)
+        int offset = 0;
+        while (offset < frame.Length)
         {
-            return false;
-        }
-
-        long now = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (unsent.Value == 0 || lastUnsent < 0 || unsent.Value < lastUnsent)
-        {
-            lastUnsent = unsent.Value;
-            unsentProgress = now;
-            return false;
-        }
-
-        lastUnsent = unsent.Value;
-        return System.Diagnostics.Stopwatch.GetElapsedTime(unsentProgress).TotalMilliseconds >= SendStallMillis;
-    }
-
-    /// <summary>Bytes still in the kernel send queue, or null when this OS will not say.</summary>
-    private static int? UnsentBytes(Socket socket)
-    {
-        try
-        {
-            if (OperatingSystem.IsLinux())
+            done.Reset();
+            args.SetBuffer(frame, offset, frame.Length - offset);
+            bool pending = socket.SendAsync(args);
+            if (pending)
             {
-                // SIOCOUTQ / TIOCOUTQ. Data the peer has not taken yet.
-                if (StallNative.Ioctl(checked((int)socket.Handle), 0x5411, out int queued) == 0)
-                {
-                    return queued;
-                }
-
-                return null;
+                done.Wait();
             }
 
-            if (!OperatingSystem.IsWindows())
+            if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
             {
-                return null;
+                throw new IOException("send failed: " + args.SocketError);
             }
 
-            uint version = 0;
-            int rc = StallNative.WsaIoctl(
-                socket.Handle,
-                StallNative.SioTcpInfo,
-                ref version,
-                sizeof(uint),
-                out StallNative.TcpInfoV0 info,
-                Marshal.SizeOf<StallNative.TcpInfoV0>(),
-                out _,
-                IntPtr.Zero,
-                IntPtr.Zero);
-            if (rc != 0 || info.State > 12 || info.Mss < 500 || info.Mss > 65535)
-            {
-                return null;
-            }
-
-            return info.BytesInFlight > int.MaxValue ? int.MaxValue : (int)info.BytesInFlight;
+            offset += args.BytesTransferred;
         }
-        catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
-        {
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Unblocks a send that is stuck inside the call. <see cref="Socket.Close()"/>
-    /// can wait on the same lock the send holds, so this shuts the handle down
-    /// directly. The writer then drops the socket and sends the frame again.
-    /// </summary>
-    private static void AbortStuckSend(Socket socket)
-    {
-        try
-        {
-            IntPtr handle = socket.Handle;
-            if (handle == IntPtr.Zero)
-            {
-                return;
-            }
-
-            int rc = OperatingSystem.IsWindows()
-                ? StallNative.ShutdownWin(handle, StallNative.ShutRdwr)
-                : StallNative.Shutdown(checked((int)handle), StallNative.ShutRdwr);
-            if (rc != 0)
-            {
-                socket.Close();
-            }
-        }
-        catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
-        {
-            // The writer already dropped this socket.
-        }
-    }
-
-    private static class StallNative
-    {
-        internal const int ShutRdwr = 2;
-
-        /// <summary><c>SIO_TCP_INFO</c>, <c>_WSAIORW(IOC_VENDOR, 39)</c>.</summary>
-        internal const int SioTcpInfo = unchecked((int)0xD8000027);
-
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct TcpInfoV0
-        {
-            public uint State;
-            public uint Mss;
-            public ulong ConnectionTimeMs;
-            public byte TimestampsEnabled;
-            public uint RttUs;
-            public uint MinRttUs;
-            public uint BytesInFlight;
-            public uint Cwnd;
-            public uint SndWnd;
-            public uint RcvWnd;
-            public uint RcvBuf;
-            public ulong BytesOut;
-            public ulong BytesIn;
-            public uint BytesReordered;
-            public uint BytesRetrans;
-            public uint FastRetrans;
-            public uint DupAcksIn;
-            public uint TimeoutEpisodes;
-            public byte SynRetrans;
-        }
-
-        [DllImport("libc", EntryPoint = "ioctl", SetLastError = true)]
-        internal static extern int Ioctl(int fd, nuint request, out int value);
-
-        [DllImport("libc", EntryPoint = "shutdown", SetLastError = true)]
-        internal static extern int Shutdown(int fd, int how);
-
-        [DllImport("ws2_32.dll", EntryPoint = "shutdown", SetLastError = true)]
-        internal static extern int ShutdownWin(IntPtr socket, int how);
-
-        [DllImport("ws2_32.dll", EntryPoint = "WSAIoctl", SetLastError = true)]
-        internal static extern int WsaIoctl(
-            IntPtr socket,
-            int controlCode,
-            ref uint inValue,
-            int inLength,
-            out TcpInfoV0 info,
-            int outLength,
-            out int bytesReturned,
-            IntPtr overlapped,
-            IntPtr completion);
     }
 
     private static bool IsLive(TcpClient client)
@@ -1012,36 +958,20 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private static void ArmDeadPeerTimeout(Socket raw)
+    /// <summary>
+    /// Enables keepalive at the OS default intervals. <c>TCP_USER_TIMEOUT</c> and
+    /// <c>TCP_MAXRT</c> stay at the OS default: a one-second cap aborts a live peer
+    /// that has only stopped draining.
+    /// </summary>
+    private static void ArmKeepAlive(Socket raw)
     {
-        raw.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         try
         {
-            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 1);
-            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
-            raw.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+            raw.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         }
         catch (SocketException)
         {
-            // This OS has no per-socket keepalive timers. A blocked write still ends.
-        }
-
-        try
-        {
-            if (OperatingSystem.IsLinux())
-            {
-                // TCP_USER_TIMEOUT (18), milliseconds. Unacked data aborts a half-open peer.
-                raw.SetSocketOption(SocketOptionLevel.Tcp, (SocketOptionName)18, SendStallMillis);
-            }
-            else if (OperatingSystem.IsWindows())
-            {
-                // TCP_MAXRT (5), seconds.
-                raw.SetSocketOption(SocketOptionLevel.Tcp, (SocketOptionName)5, Math.Max(1, SendStallMillis / 1000));
-            }
-        }
-        catch (SocketException)
-        {
-            // Keepalive and the send stall still bound a peer that stops answering.
+            // The OS keeps its default. The peer-dead close is what unblocks a send.
         }
     }
 
@@ -1077,6 +1007,7 @@ public sealed class SocketTransport : ITransport, IDisposable
                         return;
                     }
 
+                    NoteInbound(decoded.From);
                     _handler?.Invoke(new Envelope(decoded.From, _nodeId, decoded.Payload));
                     _wakeup();
                 }
@@ -1094,6 +1025,57 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
 
             client.Dispose();
+        }
+    }
+
+    private void NoteInbound(string peer)
+    {
+        if (string.IsNullOrWhiteSpace(peer))
+        {
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        lock (_gate)
+        {
+            _lastInbound[peer] = now;
+            if (_links.TryGetValue(peer, out PeerLink? link))
+            {
+                lock (link.Slot)
+                {
+                    link.LastInboundTicks = now;
+                }
+            }
+        }
+    }
+
+    /// <summary>One peer's outbound queue. AppendEntries collapse to the latest unsent frame.</summary>
+    private sealed class PeerLink : IDisposable
+    {
+        public readonly Channel<byte[]> Others = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.DropOldest,
+        });
+
+        public readonly object Slot = new();
+
+        public readonly ManualResetEventSlim Poke = new(false);
+
+        public readonly ManualResetEventSlim Stop = new(false);
+
+        public byte[]? PendingAppend;
+
+        public long AppendGeneration;
+
+        public long LastInboundTicks;
+
+        public long WindowStartTicks;
+
+        public void Dispose()
+        {
+            Poke.Dispose();
+            Stop.Dispose();
         }
     }
 }

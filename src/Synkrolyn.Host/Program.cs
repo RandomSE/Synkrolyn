@@ -32,6 +32,8 @@ static async Task<HostCluster> StartClusterAsync(CancellationToken cancellationT
     {
         var codec = new RpcWireCodec();
         var transport = new SocketTransport(id, codec);
+        var election = TimeSpan.FromMilliseconds(150);
+        transport.PeerDeadTimeout = election;
         transport.Bind();
         var store = new InMemoryKvStore();
         var peers = ids.Where(other => other != id).ToArray();
@@ -42,7 +44,7 @@ static async Task<HostCluster> StartClusterAsync(CancellationToken cancellationT
             transport,
             new InMemoryPersistentState(),
             new InMemoryRaftLog(),
-            TimeSpan.FromMilliseconds(150),
+            election,
             TimeSpan.FromMilliseconds(40),
             store);
         node.SetClockDriftBound(RaftNode.DefaultClockDriftBound);

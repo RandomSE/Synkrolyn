@@ -147,6 +147,7 @@ internal sealed class SocketCluster : IDisposable
             string[] peers = ids.Where(other => other != id).ToArray();
             var clock = new SystemRaftClock();
             var store = new InMemoryKvStore();
+            transports[i].PeerDeadTimeout = elections[i];
             var node = new RaftNode(id, peers, clock, transports[i], new InMemoryPersistentState(), new InMemoryRaftLog(), elections[i], heartbeat, store);
             RaftRuntime runtime = RaftRuntime.ForTests(node, transports[i], clock);
             runtime.Start();

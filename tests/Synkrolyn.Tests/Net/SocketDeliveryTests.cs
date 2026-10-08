@@ -18,6 +18,7 @@ public class SocketDeliveryTests
         server.SetHandler(received.Enqueue);
         server.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, server.LocalPort));
@@ -43,6 +44,7 @@ public class SocketDeliveryTests
         int closedPort = ((IPEndPoint)closed.LocalEndpoint).Port;
         closed.Stop();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, closedPort));
@@ -71,6 +73,7 @@ public class SocketDeliveryTests
         });
         server.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, server.LocalPort));
@@ -100,6 +103,7 @@ public class SocketDeliveryTests
         server.SetHandler(received.Enqueue);
         server.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, server.LocalPort));
@@ -116,6 +120,7 @@ public class SocketDeliveryTests
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
@@ -180,6 +185,7 @@ public class SocketDeliveryTests
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
@@ -201,6 +207,7 @@ public class SocketDeliveryTests
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
         client.Bind();
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
@@ -236,103 +243,105 @@ public class SocketDeliveryTests
     [Fact]
     public void SilentPeer_doesNotHoldAFrameForever()
     {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
-        listener.Start();
+        using var silentListener = new TcpListener(IPAddress.Loopback, 0);
+        silentListener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        silentListener.Start();
+        var heard = new ConcurrentQueue<Envelope>();
+        using var other = new SocketTransport("c", new RpcWireCodec());
+        other.Bind();
+        other.SetHandler(heard.Enqueue);
+        other.Start();
         using var client = new SocketTransport("a", new RpcWireCodec());
+        // Shorter than the old 1 s progress rule, and the release budget below is
+        // this timeout plus a small margin. A writer that waits a full second, or
+        // never unblocks, fails.
+        var peerDead = TimeSpan.FromMilliseconds(400);
+        SetPeerDead(client, peerDead);
         client.Bind();
         client.Start();
-        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)silentListener.LocalEndpoint).Port));
+        client.SetPeer("c", new IPEndPoint(IPAddress.Loopback, other.LocalPort));
         client.Send("a", "b", new RequestVote(1, "a", 0, 0));
-        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
-        using TcpClient accepted = listener.AcceptTcpClient();
+        Assert.True(silentListener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = silentListener.AcceptTcpClient();
         accepted.ReceiveBufferSize = 1024;
         Assert.True(WaitFor(() => Outbound(client) is not null));
-        TcpClient outbound = Outbound(client)!;
-        outbound.Client.SendBufferSize = 1024;
+        Outbound(client)!.Client.SendBufferSize = 1024;
         byte[] command = new byte[256 * 1024];
         command[0] = 4;
-        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        // The peer never reads. A blocking send timeout does not fire on Windows.
-        // Either the writer drops that socket and sends the frame again, or the
-        // kernel already accepted the bytes and the writer is not holding them.
-        // A writer that stays blocked with neither outcome fails.
-        byte[]? payload = null;
+        var caller = System.Diagnostics.Stopwatch.StartNew();
+        Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0)));
+        Assert.True(caller.Elapsed < TimeSpan.FromMilliseconds(50), "Raft thread waited on the silent socket");
+        caller.Restart();
+        client.SetPeer("d", new IPEndPoint(IPAddress.Loopback, 1));
+        Assert.True(caller.Elapsed < TimeSpan.FromMilliseconds(50), "Raft thread waited on the silent socket");
+        caller.Restart();
+        Assert.True(client.Send("a", "c", new RequestVote(2, "a", 1, 1)));
+        Assert.True(caller.Elapsed < TimeSpan.FromMilliseconds(50), "a send to another peer waited on the silent socket");
+        Assert.True(
+            WaitFor(() => heard.Any(envelope => envelope.Payload is RequestVote vote && vote.Term == 2), TimeSpan.FromMilliseconds(200)),
+            "a frame to another peer was delayed by the silent send");
         var started = System.Diagnostics.Stopwatch.StartNew();
-        var budget = TimeSpan.FromSeconds(3);
-        int bufferedFrame = command.Length + 128;
-        while (payload is null && started.Elapsed < budget)
+        var budget = peerDead + TimeSpan.FromMilliseconds(250);
+        bool released = false;
+        while (!released && started.Elapsed < budget)
         {
             TimeSpan left = budget - started.Elapsed;
-            int sliceUs = Math.Max(1, (int)Math.Min(left.TotalMilliseconds, 50)) * 1000;
-            if (listener.Server.Poll(sliceUs, SelectMode.SelectRead))
-            {
-                using TcpClient retry = listener.AcceptTcpClient();
-                retry.ReceiveBufferSize = 1024 * 1024;
-                payload = ReadAppend(retry, budget - started.Elapsed, command);
-            }
-
-            if (payload is null && Buffered(accepted) >= bufferedFrame)
-            {
-                payload = ReadAppend(accepted, budget - started.Elapsed, command);
-            }
-        }
-
-        Assert.True(payload is not null, "writer blocked holding the frame");
-    }
-
-    [Fact]
-    public void KernelQueuedSend_toASilentPeer_isSentAgain()
-    {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
-        listener.Start();
-        using var client = new SocketTransport("a", new RpcWireCodec());
-        client.Bind();
-        client.Start();
-        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
-        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
-        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
-        using TcpClient accepted = listener.AcceptTcpClient();
-        accepted.ReceiveBufferSize = 1024;
-        Assert.True(WaitFor(() => Outbound(client) is not null));
-        TcpClient outbound = Outbound(client)!;
-        // Large enough that the kernel accepts the whole frame. The peer never
-        // reads, so those bytes sit in the send queue. That is not delivery.
-        outbound.Client.SendBufferSize = 1024 * 1024;
-        byte[] command = new byte[64 * 1024];
-        command[0] = 4;
-        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        byte[]? payload = null;
-        var started = System.Diagnostics.Stopwatch.StartNew();
-        var budget = TimeSpan.FromSeconds(3);
-        while (payload is null && started.Elapsed < budget)
-        {
-            TimeSpan left = budget - started.Elapsed;
-            int sliceUs = Math.Max(1, (int)Math.Min(left.TotalMilliseconds, 50)) * 1000;
-            if (!listener.Server.Poll(sliceUs, SelectMode.SelectRead))
+            int sliceUs = Math.Max(1, (int)Math.Min(Math.Max(left.TotalMilliseconds, 1), 20)) * 1000;
+            if (!silentListener.Server.Poll(sliceUs, SelectMode.SelectRead))
             {
                 continue;
             }
 
-            using TcpClient retry = listener.AcceptTcpClient();
-            retry.ReceiveBufferSize = 1024 * 1024;
-            payload = ReadAppend(retry, budget - started.Elapsed, command);
+            using TcpClient retry = silentListener.AcceptTcpClient();
+            released = true;
         }
 
-        Assert.True(payload is not null, "writer blocked holding the frame");
+        Assert.True(released, "silent peer was not released within the peer-dead timeout");
     }
 
-    private static int Buffered(TcpClient client)
+    [Fact]
+    public void SlowButLiveReader_pauseOverOneSecond_keepsTheFrameOnOneConnection()
     {
-        try
-        {
-            return client.Available;
-        }
-        catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
-        {
-            return 0;
-        }
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        listener.Start();
+        using var client = new SocketTransport("a", new RpcWireCodec());
+        // Longer than the pause, so a peer that is only slow is not dead.
+        SetPeerDead(client, TimeSpan.FromSeconds(8));
+        client.Bind();
+        client.Start();
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
+        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        accepted.ReceiveBufferSize = 1024;
+        Assert.False(listener.Pending());
+        Assert.True(WaitFor(() => Outbound(client) is not null));
+        Outbound(client)!.Client.SendBufferSize = 1024;
+        Assert.NotNull(ReadOneFrame(accepted, TimeSpan.FromSeconds(2)).Frame);
+        byte[] command = new byte[256 * 1024];
+        command[0] = 6;
+        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
+        // Longer than the old 1 s no-progress drop, shorter than the peer-dead timeout.
+        new ManualResetEventSlim(false).Wait(1500);
+        Assert.False(listener.Pending());
+        byte[]? payload = ReadAppend(accepted, TimeSpan.FromSeconds(3), command);
+        Assert.False(listener.Pending());
+        Assert.NotNull(payload);
+        var append = Assert.IsType<AppendEntries>(new RpcWireCodec().Decode(payload).Payload);
+        Assert.Equal(6, append.Entries[0].Command[0]);
+        Assert.Equal(command.Length, append.Entries[0].Command.Length);
+    }
+
+    /// <summary>
+    /// Sets the peer-dead timeout when this build has one. Older builds keep the
+    /// 1 s progress rule, which is what these tests reject.
+    /// </summary>
+    private static void SetPeerDead(SocketTransport transport, TimeSpan timeout)
+    {
+        PropertyInfo? property = typeof(SocketTransport).GetProperty("PeerDeadTimeout");
+        property?.SetValue(transport, timeout);
     }
 
     /// <summary>

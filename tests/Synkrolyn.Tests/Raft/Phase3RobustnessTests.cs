@@ -216,6 +216,106 @@ public class Phase3RobustnessTests
     }
 
     [Fact]
+    public void InstallSnapshot_resentOffsetZero_doesNotRestart()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.Advance(80);
+        Assert.Equal(Role.Leader, cluster.Node("n1").Role);
+        RaftNode follower = cluster.Node("n2");
+        long term = cluster.Node("n1").CurrentTerm;
+        var replies = new List<InstallSnapshotResponse>();
+        cluster.Transport.Reregister("n1", envelope =>
+        {
+            if (envelope.Payload is InstallSnapshotResponse response)
+            {
+                replies.Add(response);
+            }
+        });
+        byte[] chunk = new byte[8];
+        follower.Receive(new Envelope("n1", "n2", new InstallSnapshot(term, "n1", 20, term, 0, chunk, false)));
+        follower.Drain();
+        follower.Receive(new Envelope("n1", "n2", new InstallSnapshot(term, "n1", 20, term, 8, chunk, false)));
+        follower.Drain();
+        Assert.Equal(16, replies[^1].NextOffset);
+        int beforeResend = replies.Count;
+        follower.Receive(new Envelope("n1", "n2", new InstallSnapshot(term, "n1", 20, term, 0, chunk, false)));
+        follower.Drain();
+        Assert.Equal(16, replies[^1].NextOffset);
+        Assert.True(replies.Count > beforeResend);
+        follower.Receive(new Envelope("n1", "n2", new InstallSnapshot(term, "n1", 20, term, 16, chunk, false)));
+        follower.Drain();
+        Assert.Equal(24, replies[^1].NextOffset);
+    }
+
+    [Fact]
+    public void InstallSnapshot_droppedConnection_resumesFromLastAckedOffset()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.AddNode("n3", ["n1", "n2"], TimeSpan.FromMilliseconds(400), Heartbeat);
+        cluster.Advance(80);
+        RaftNode leader = cluster.Node("n1");
+        Assert.Equal(Role.Leader, leader.Role);
+        leader.SnapshotChunkSize = 16;
+        cluster.Propose("n1", "alpha-value"u8.ToArray());
+        cluster.Propose("n1", "beta-value-that-is-longer"u8.ToArray());
+        leader.Snapshot();
+        cluster.DrainAll();
+        Assert.True(cluster.Log("n1").SnapshotBytes().Length > 16);
+        cluster.ReplaceNode(
+            "n3",
+            ["n1", "n2"],
+            TimeSpan.FromMilliseconds(400),
+            Heartbeat,
+            IStateMachine.NoOp(),
+            new InMemoryPersistentState(),
+            new InMemoryRaftLog());
+        var offsets = new List<long>();
+        RaftNode n3 = cluster.Node("n3");
+        cluster.Transport.Reregister("n3", envelope =>
+        {
+            if (envelope.Payload is not InstallSnapshot snap)
+            {
+                n3.Receive(envelope);
+                return;
+            }
+
+            offsets.Add(snap.Offset);
+            // The first chunk is delivered. The first try at every later offset is
+            // the connection dying mid-install. A repeat of that same offset is the
+            // resume, and it must not have fallen back to offset 0.
+            int seen = 0;
+            foreach (long offset in offsets)
+            {
+                if (offset == snap.Offset)
+                {
+                    seen++;
+                }
+            }
+
+            if (snap.Offset == 0 || seen > 1)
+            {
+                n3.Receive(envelope);
+            }
+        });
+        cluster.Transport.Reregister("n1", leader.Receive);
+        for (int i = 0; i < 40 && !ResumedFromAck(offsets); i++)
+        {
+            cluster.Advance(20);
+        }
+
+        Assert.True(offsets.Count >= 2, "snapshot transfer did not resume");
+        Assert.Equal(0, offsets[0]);
+        long resumed = offsets[1];
+        Assert.NotEqual(0, resumed);
+        Assert.Contains(resumed, offsets.Skip(2));
+        Assert.DoesNotContain(0L, offsets.Skip(1));
+    }
+
+    [Fact]
     public void Finding7_applyOverlappingRestore_keepsTheCommand()
     {
         var store = new InMemoryKvStore();
@@ -460,6 +560,26 @@ public class Phase3RobustnessTests
         // One millisecond. An open socket returns false. A reset or a FIN is readable with nothing buffered.
         bool closed = raw.Client.Poll(1_000, SelectMode.SelectRead) && raw.Client.Available == 0;
         Assert.True(closed);
+    }
+
+    private static bool ResumedFromAck(List<long> offsets)
+    {
+        if (offsets.Count < 2 || offsets[1] == 0)
+        {
+            return false;
+        }
+
+        long resumed = offsets[1];
+        int seen = 0;
+        foreach (long offset in offsets)
+        {
+            if (offset == resumed)
+            {
+                seen++;
+            }
+        }
+
+        return seen >= 2;
     }
 
     private sealed class BlockingMachine : IStateMachine
