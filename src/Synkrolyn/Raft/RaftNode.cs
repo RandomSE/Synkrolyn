@@ -1548,7 +1548,9 @@ public sealed class RaftNode
             && CandidateLogUpToDate(request)
             && !VoteBlockedByLeaderContact(request))
         {
-            if (_preCandidate && string.CompareOrdinal(request.CandidateId, _nodeId) >= 0)
+            if (_preCandidate
+                && string.CompareOrdinal(request.CandidateId, _nodeId) >= 0
+                && !CandidateLogStrictlyNewer(request))
             {
                 _lastPreVoteGranted = false;
                 _transport.Send(_nodeId, from, new RequestVoteResponse(CurrentTermLocked(), false, true, request.Round));
@@ -2988,6 +2990,17 @@ public sealed class RaftNode
         }
 
         return request.LastLogIndex >= _log.LastIndex;
+    }
+
+    private bool CandidateLogStrictlyNewer(RequestVote request)
+    {
+        long localTerm = _log.LastTerm;
+        if (request.LastLogTerm != localTerm)
+        {
+            return request.LastLogTerm > localTerm;
+        }
+
+        return request.LastLogIndex > _log.LastIndex;
     }
 
     private void ResetElectionDeadline()
