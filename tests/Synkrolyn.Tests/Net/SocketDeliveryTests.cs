@@ -395,11 +395,11 @@ public class SocketDeliveryTests
         bool blocked = false;
         foreach (int commandLength in new[] { 256 * 1024, 512 * 1024, 900_000 })
         {
-            int waits = SocketTransport.SendWaits;
+            int waits = client.SendWaits;
             byte[] command = new byte[commandLength];
             command[0] = 4;
-            client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-            if (WaitFor(() => SocketTransport.SendWaits > waits, TimeSpan.FromMilliseconds(500)))
+            Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0)));
+            if (WaitFor(() => client.SendWaits > waits, TimeSpan.FromMilliseconds(500)))
             {
                 blocked = true;
                 break;
@@ -407,15 +407,15 @@ public class SocketDeliveryTests
         }
 
         Assert.True(blocked, "send never blocked on the silent reader");
-        int dones = SocketTransport.SendDones;
-        SocketTransport.AbortTicks = 0;
+        int dones = client.SendDones;
+        client.AbortTicks = 0;
         SetPeerDead(client, TimeSpan.FromMilliseconds(1));
         Assert.True(
-            WaitFor(() => System.Threading.Volatile.Read(ref SocketTransport.AbortTicks) != 0, TimeSpan.FromSeconds(2)),
+            WaitFor(() => System.Threading.Volatile.Read(ref client.AbortTicks) != 0, TimeSpan.FromSeconds(2)),
             "peer-dead abort did not run");
-        long abort = System.Threading.Volatile.Read(ref SocketTransport.AbortTicks);
+        long abort = System.Threading.Volatile.Read(ref client.AbortTicks);
         Assert.True(
-            WaitFor(() => SocketTransport.SendDones > dones, TimeSpan.FromMilliseconds(250)),
+            WaitFor(() => client.SendDones > dones, TimeSpan.FromMilliseconds(250)),
             "blocked send still pending 250 ms after the abort at " + abort);
     }
 

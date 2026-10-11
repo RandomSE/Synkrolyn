@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Synkrolyn.Raft;
 
@@ -583,7 +584,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             EnsureWindow(link);
             TcpClient client = EnsureOutbound(peer);
-            SendAll(client.Client, frame);
+            SendAll(client.Client, frame, () => PeerSilent(link) || !_running);
             if (!OutboundLive(peer))
             {
                 // The peer reset while the bytes were only in the socket buffer.
@@ -721,10 +722,9 @@ public sealed class SocketTransport : ITransport, IDisposable
                 _outbound.Remove(peer);
             }
 
-            if (client is not null && _links.TryGetValue(peer, out PeerLink? link))
-            {
-                RestartWindow(link);
-            }
+            // The silence window stays as it is until the replacement socket is
+            // stored. Restarting it here would hide a peer that is already dead
+            // while this send is still stuck.
         }
 
         if (client is not null)
@@ -733,10 +733,10 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
     }
 
-    private static void CloseSocket(TcpClient client)
+    private void CloseSocket(TcpClient client)
     {
-        // Close() alone leaves SendAsync pending on Linux. Shutdown wakes it,
-        // then Dispose releases the handle. AbortTicks is the test's t0.
+        // AbortTicks is the test's t0. CancelIoEx completes a Windows overlapped
+        // send that Close leaves pending. Shutdown does the same on Linux.
         Volatile.Write(ref AbortTicks, Stopwatch.GetTimestamp());
         Socket? socket = null;
         try
@@ -750,23 +750,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         if (socket is not null)
         {
-            try
-            {
-                socket.Shutdown(SocketShutdown.Both);
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException or NullReferenceException)
-            {
-                // The writer already dropped this socket.
-            }
-
-            try
-            {
-                socket.Dispose();
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
-            {
-                // Already closed.
-            }
+            NativeCancel.Cancel(socket);
         }
 
         try
@@ -837,6 +821,14 @@ public sealed class SocketTransport : ITransport, IDisposable
                 CloseSocket(stale);
             }
 
+            // The silence window starts when this connection exists. Time spent
+            // refusing the connect is not a quiet peer, and the new socket gets
+            // one full peer-dead interval.
+            if (_links.TryGetValue(peerId, out PeerLink? link))
+            {
+                RestartWindow(link);
+            }
+
             _outbound[peerId] = socket;
             return socket;
         }
@@ -845,65 +837,48 @@ public sealed class SocketTransport : ITransport, IDisposable
     private static TcpClient ConnectWithin(IPEndPoint address, TimeSpan budget)
     {
         var client = new TcpClient();
-        var done = new ManualResetEventSlim(false);
         try
         {
             Socket raw = client.Client;
             raw.NoDelay = true;
-            var args = new SocketAsyncEventArgs { RemoteEndPoint = address };
+            // A non-blocking connect finishes on this thread. ConnectAsync's
+            // callback needs the thread pool, and under a loaded suite that
+            // callback misses the budget and the handshake is aborted before
+            // the listener can accept it.
+            raw.Blocking = false;
             try
             {
-                args.Completed += (_, _) =>
-                {
-                    try
-                    {
-                        done.Set();
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        // The budget already elapsed and the event was released.
-                    }
-                };
-                bool pending = raw.ConnectAsync(args);
-                if (!pending)
-                {
-                    done.Set();
-                }
-
-                if (!done.Wait(budget))
-                {
-                    client.Dispose();
-                    done.Wait(50);
-                    throw new TimeoutException("connect exceeded " + (int)budget.TotalMilliseconds + " ms");
-                }
-
-                if (args.SocketError != SocketError.Success)
-                {
-                    throw new SocketException((int)args.SocketError);
-                }
-
-                // ConnectAsync leaves the native socket non-blocking, and the managed
-                // Blocking flag can already read true, so assigning true is a no-op.
-                // A full send buffer then fails the write and the writer drops a live
-                // slow reader mid-frame. Toggle so the native mode follows.
-                raw.Blocking = false;
-                raw.Blocking = true;
-                ArmKeepAlive(raw);
-                return client;
+                raw.Connect(address);
             }
-            finally
+            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.InProgress or SocketError.IOPending)
             {
-                args.Dispose();
+                // The handshake is in progress.
             }
+
+            int micros = Math.Max(1, (int)(budget.TotalMilliseconds * 1000));
+            if (!raw.Poll(micros, SelectMode.SelectWrite))
+            {
+                throw new TimeoutException("connect exceeded " + (int)budget.TotalMilliseconds + " ms");
+            }
+
+            int error = (int)raw.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
+            if (error != 0)
+            {
+                throw new SocketException(error);
+            }
+
+            // Leave the socket non-blocking. SendAsync on a blocking socket can
+            // sit inside the call while the window is full, where another thread's
+            // close waits on the same lock. A pending SendAsync does not.
+            raw.Blocking = true;
+            raw.Blocking = false;
+            ArmKeepAlive(raw);
+            return client;
         }
         catch
         {
             client.Dispose();
             throw;
-        }
-        finally
-        {
-            done.Dispose();
         }
     }
 
@@ -916,13 +891,13 @@ public sealed class SocketTransport : ITransport, IDisposable
     internal static int ProbeEntered;
 
     /// <summary>Pending send waits that have started. Tests use this to see a writer blocked in send.</summary>
-    internal static int SendWaits;
+    internal int SendWaits;
 
     /// <summary>Pending send waits that have returned. Tests compare this with <see cref="SendWaits"/>.</summary>
-    internal static int SendDones;
+    internal int SendDones;
 
     /// <summary>Timestamp of the latest socket abort, or 0. Tests measure send completion against it.</summary>
-    internal static long AbortTicks;
+    internal long AbortTicks;
 
     private static readonly Queue<string> Notes = new();
 
@@ -959,64 +934,156 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     /// <summary>
     /// Writes <paramref name="frame"/> or throws. The wait is only this peer's
-    /// writer. Closing the socket from the checker unblocks it. A partial copy
-    /// into the kernel is not a reason to reconnect: the peer is still reading.
+    /// writer. <paramref name="abort"/> is polled while the send is pending.
+    /// A silent peer cancels the overlapped send and completes this wait with
+    /// <see cref="OperationCanceledException"/>, so the writer does not depend
+    /// on the OS finishing the callback. A partial copy into the kernel is not
+    /// a reason to reconnect: the peer is still reading.
     /// </summary>
-    private static void SendAll(Socket socket, byte[] frame)
+    private void SendAll(Socket socket, byte[] frame, Func<bool> abort)
     {
-        using var done = new ManualResetEventSlim(false);
-        using var args = new SocketAsyncEventArgs();
-        args.Completed += (_, _) =>
-        {
-            try
-            {
-                done.Set();
-            }
-            catch (ObjectDisposedException)
-            {
-                // The writer is already leaving this send.
-            }
-        };
-
         int offset = 0;
         while (offset < frame.Length)
         {
-            done.Reset();
-            args.SetBuffer(frame, offset, frame.Length - offset);
-            bool pending = socket.SendAsync(args);
-            if (pending)
+            if (abort())
             {
-                Interlocked.Increment(ref SendWaits);
-                done.Wait();
-                Interlocked.Increment(ref SendDones);
+                throw new OperationCanceledException();
             }
 
-            if (args.SocketError is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
+            var args = new SocketAsyncEventArgs();
+            var done = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            args.Completed += (_, e) =>
             {
-                // The window is full. The peer is still reading. Wait for space
-                // instead of dropping the socket.
+                if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
+                {
+                    done.TrySetException(new IOException("send failed: " + e.SocketError));
+                }
+                else
+                {
+                    done.TrySetResult(e.BytesTransferred);
+                }
+
+                e.Dispose();
+            };
+
+            bool pending;
+            try
+            {
+                args.SetBuffer(frame, offset, frame.Length - offset);
+                pending = socket.SendAsync(args);
+            }
+            catch
+            {
+                args.Dispose();
+                throw;
+            }
+
+            if (!pending)
+            {
                 try
                 {
-                    socket.Poll(5_000, SelectMode.SelectWrite);
+                    if (args.SocketError is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
+                    {
+                        // The window is full. The peer is still reading. Wait for
+                        // space instead of dropping the socket.
+                        if (!WaitWritable(socket, abort))
+                        {
+                            throw new OperationCanceledException();
+                        }
+
+                        continue;
+                    }
+
+                    if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
+                    {
+                        throw new IOException("send failed: " + args.SocketError);
+                    }
+
+                    offset += args.BytesTransferred;
                 }
-                catch (SocketException ex) when (IsBenign(ex))
+                finally
                 {
-                    // Still a live socket.
-                }
-                catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
-                {
-                    throw new IOException("send aborted");
+                    args.Dispose();
                 }
 
                 continue;
             }
 
-            if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
+            offset += WaitPending(done, socket, abort);
+        }
+    }
+
+    /// <summary>
+    /// Waits for a pending send. A silent peer cancels it from this thread and
+    /// completes the wait even when the native callback does not run.
+    /// </summary>
+    private int WaitPending(TaskCompletionSource<int> done, Socket socket, Func<bool> abort)
+    {
+        Interlocked.Increment(ref SendWaits);
+        try
+        {
+            while (!done.Task.IsCompleted)
             {
-                throw new IOException("send failed: " + args.SocketError);
+                if (done.Task.Wait(20))
+                {
+                    break;
+                }
+
+                if (!abort())
+                {
+                    continue;
+                }
+
+                Volatile.Write(ref AbortTicks, Stopwatch.GetTimestamp());
+                NativeCancel.Cancel(socket);
+                done.TrySetException(new OperationCanceledException());
+                break;
             }
 
-            offset += args.BytesTransferred;
+            return done.Task.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        finally
+        {
+            Interlocked.Increment(ref SendDones);
+        }
+    }
+
+    /// <summary>Waits until <paramref name="socket"/> can take more bytes, or the peer is dead.</summary>
+    private bool WaitWritable(Socket socket, Func<bool> abort)
+    {
+        Interlocked.Increment(ref SendWaits);
+        try
+        {
+            while (!abort())
+            {
+                try
+                {
+                    if (socket.Poll(20_000, SelectMode.SelectWrite))
+                    {
+                        return true;
+                    }
+                }
+                catch (SocketException ex) when (IsBenign(ex))
+                {
+                    return true;
+                }
+                catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+                {
+                    return false;
+                }
+            }
+
+            Volatile.Write(ref AbortTicks, Stopwatch.GetTimestamp());
+            NativeCancel.Cancel(socket);
+            return false;
+        }
+        finally
+        {
+            Interlocked.Increment(ref SendDones);
         }
     }
 
@@ -1173,8 +1240,10 @@ public sealed class SocketTransport : ITransport, IDisposable
         {
             try
             {
-                socket.Blocking = false;
+                // Leave the socket non-blocking so the next SendAsync stays pending
+                // when the window is full instead of blocking inside the call.
                 socket.Blocking = true;
+                socket.Blocking = false;
             }
             catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
             {
@@ -1307,5 +1376,55 @@ public sealed class SocketTransport : ITransport, IDisposable
             Poke.Dispose();
             Stop.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Completes an overlapped send that <see cref="Socket.Close()"/> leaves pending
+    /// on Windows, then shuts the socket down so Linux epoll wakes too.
+    /// </summary>
+    private static class NativeCancel
+    {
+        public static void Cancel(Socket socket)
+        {
+            try
+            {
+                // CancelIoEx(handle, NULL) cancels every overlapped operation on the
+                // socket from this thread. Linux has no kernel32; shutdown covers it.
+                bool cancelled = CancelIoEx(socket.Handle, IntPtr.Zero);
+                if (!cancelled)
+                {
+                    // 1168 is ERROR_NOT_FOUND (nothing pending). 6 is a stale handle.
+                    // Any other code still falls through to shutdown.
+                    _ = Marshal.GetLastWin32Error();
+                }
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or SocketException or ObjectDisposedException or InvalidOperationException)
+            {
+                // Not Windows, or the handle is already gone.
+            }
+
+            try
+            {
+                socket.Shutdown(SocketShutdown.Both);
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException or PlatformNotSupportedException)
+            {
+                // Already shut down.
+            }
+
+            try
+            {
+                socket.Close();
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
+            {
+                // Already closed.
+            }
+        }
+
+#pragma warning disable SYSLIB1054 // LibraryImport needs an unsafe partial type. DllImport stays.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+#pragma warning restore SYSLIB1054
     }
 }
