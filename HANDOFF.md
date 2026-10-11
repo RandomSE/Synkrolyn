@@ -19,16 +19,18 @@ Confidence: 64% | Evidence: Windows push run 37839924014 timed out at "put commi
 
 Hypothesis: after `DropInbound`, a reset outbound send does not fail before `CheckQuorum`. `PeerDeadTimeout` is the election timeout, so the leader can step down while the put is still uncommitted, and a shorter log can win and truncate it. Not confirmed. If CI times out, the new exception text is the evidence. The Put is not retried.
 
-## CI cycle 1 (`5ccadae`)
+## CI
 
-- push 38134006514: Ubuntu pass, Windows fail `BlockedSend_completesWithin250msOfAbort` ("send never blocked on the silent reader").
-- pull_request 38134008733: Ubuntu pass, Windows same failure.
-- `ConnectFailuresAndReset_originalPutStillCommits` passed on that Windows run, so the timeout snapshot was not printed. Root cause still unconfirmed. Confidence: 64%.
+Cycle 1 `5ccadae`: push 38134006514 Ubuntu pass, Windows fail `BlockedSend_completesWithin250msOfAbort` (send never blocked). pull_request 38134008733 same split. `ConnectFailuresAndReset_originalPutStillCommits` passed on that Windows run, so the timeout notes were not printed.
+
+Cycle 2 `1c700da`: push 38134324942 Ubuntu pass, Windows pass. pull_request 38134327957 Ubuntu pass, Windows pass.
+
+Windows put-timeout root cause remains unconfirmed. Confidence: 64% | Evidence: run 37839924014. The one instrumentation round did not observe a failing put after the socket fix.
 
 ## Open items
 
-- Windows did not park `SendAsync` for a 256 KB frame (send buffer absorbed it). The test now grows the frame until a wait starts, still under the 1 MiB cap.
-- Repair cap is 3. Cycle 1 is spent. Cycle 2 is the buffer-fill test fix.
+- If `ConnectFailuresAndReset_originalPutStillCommits` times out again, the exception text has role, term, commit, applied, leader, and drop notes. Do not retry the Put.
+- Repair cap is 3. Two pushes used. Head CI is green.
 
 ## Files
 
