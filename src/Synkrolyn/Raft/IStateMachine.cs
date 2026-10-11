@@ -8,6 +8,12 @@ public interface IStateMachine
     /// <summary>Apply the command at <paramref name="index"/> at most once, in order, only while committed.</summary>
     void Apply(long index, byte[] command);
 
+    /// <summary>
+    /// Highest leader timestamp applied so far. Zero when no timestamp has been applied.
+    /// A new leader adds elapsed time to this value so its timestamps stay on the same clock.
+    /// </summary>
+    long AppliedTimestamp() => 0;
+
     /// <summary>Bytes of applied state through the last applied index.</summary>
     byte[] Snapshot() => [];
 

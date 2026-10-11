@@ -19,6 +19,7 @@ public sealed class InMemoryKvStore : IKvStore
     private ImmutableDictionary<string, long> _clientSerials = ImmutableDictionary<string, long>.Empty;
     private ImmutableDictionary<long, Session> _sessions = ImmutableDictionary<long, Session>.Empty;
     private long _logTime;
+    private KvCommandResult _commandResult;
     private ImmutableDictionary<string, string>? _lastSnapMap;
     private int _epoch;
     private long _appliedThrough = -1;
@@ -278,12 +279,7 @@ public sealed class InMemoryKvStore : IKvStore
         KvCommandCodec.RequireKey(key);
         lock (_gate)
         {
-            if (!_sessions.TryGetValue(clientId, out Session? session))
-            {
-                throw new KvSessionException("unknown session " + clientId);
-            }
-
-            if (IsExpired(session))
+            if (!_sessions.TryGetValue(clientId, out Session? session) || IsExpired(session))
             {
                 throw new KvSessionException("session expired");
             }
@@ -302,14 +298,47 @@ public sealed class InMemoryKvStore : IKvStore
         bool Expired,
         long LogTimeMillis);
 
-    /// <summary>Reads one session. Throws when the id was never registered in this store.</summary>
+    /// <summary>Sessions still in the table. Expired sessions are removed at apply time.</summary>
+    internal int SessionCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _sessions.Count;
+            }
+        }
+    }
+
+    /// <summary>Result of the last session command. Empty entries do not replace it.</summary>
+    internal KvCommandResult CommandResult
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _commandResult;
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public long AppliedTimestamp()
+    {
+        lock (_gate)
+        {
+            return _logTime;
+        }
+    }
+
+    /// <summary>Reads one session. Throws when that session is missing.</summary>
     internal SessionView ReadSession(long clientId)
     {
         lock (_gate)
         {
             if (!_sessions.TryGetValue(clientId, out Session? session))
             {
-                throw new KvSessionException("unknown session " + clientId);
+                throw new KvSessionException("session expired");
             }
 
             return new SessionView(
@@ -527,15 +556,14 @@ public sealed class InMemoryKvStore : IKvStore
         }
 
         NoteTime(decoded.LeaderTimestamp);
-        if (!_sessions.TryGetValue(decoded.SessionId, out Session? session))
+        if (!_sessions.TryGetValue(decoded.SessionId, out Session? session) || IsExpired(session))
         {
-            _appliedThrough = Math.Max(_appliedThrough, index);
-            return true;
-        }
+            if (session is not null)
+            {
+                _sessions = _sessions.Remove(session.Id);
+            }
 
-        if (IsExpired(session))
-        {
-            _appliedThrough = Math.Max(_appliedThrough, index);
+            Finish(index, KvCommandError.SessionExpired, null);
             return true;
         }
 
@@ -548,22 +576,23 @@ public sealed class InMemoryKvStore : IKvStore
         if (decoded.Serial <= session.AckFloor)
         {
             _sessions = _sessions.SetItem(session.Id, session);
-            _appliedThrough = Math.Max(_appliedThrough, index);
+            Finish(index, KvCommandError.None, null);
             return true;
         }
 
         if (decoded.Serial == session.LastSeq && session.LastSeq > 0)
         {
             long active = Math.Max(session.LastActive, decoded.LeaderTimestamp);
-            _sessions = _sessions.SetItem(session.Id, session with { LastActive = active });
-            _appliedThrough = Math.Max(_appliedThrough, index);
+            session = session with { LastActive = active };
+            _sessions = _sessions.SetItem(session.Id, session);
+            Finish(index, KvCommandError.None, session.HasCache ? session.CachedValue : null);
             return true;
         }
 
         if (decoded.Serial != session.LastSeq + 1)
         {
             _sessions = _sessions.SetItem(session.Id, session);
-            _appliedThrough = Math.Max(_appliedThrough, index);
+            Finish(index, KvCommandError.OutOfOrder, null);
             return true;
         }
 
@@ -585,8 +614,14 @@ public sealed class InMemoryKvStore : IKvStore
             CachedValue = decoded.Operation == KvCommandCodec.Op.Put ? decoded.Value : "",
         };
         _sessions = _sessions.SetItem(session.Id, session);
-        _appliedThrough = Math.Max(_appliedThrough, index);
+        Finish(index, KvCommandError.None, session.CachedValue);
         return true;
+    }
+
+    private void Finish(long index, KvCommandError error, string? cached)
+    {
+        _commandResult = new KvCommandResult(index, error, cached);
+        _appliedThrough = Math.Max(_appliedThrough, index);
     }
 
     private void NoteTime(long timestamp)
@@ -594,6 +629,31 @@ public sealed class InMemoryKvStore : IKvStore
         if (timestamp > _logTime)
         {
             _logTime = timestamp;
+            ExpireSessions();
+        }
+    }
+
+    private void ExpireSessions()
+    {
+        if (_sessions.IsEmpty)
+        {
+            return;
+        }
+
+        ImmutableDictionary<long, Session>.Builder? drop = null;
+        foreach (KeyValuePair<long, Session> pair in _sessions)
+        {
+            Session session = pair.Value;
+            if (session.TimeoutMillis > 0 && _logTime - session.LastActive > session.TimeoutMillis)
+            {
+                drop ??= _sessions.ToBuilder();
+                drop.Remove(pair.Key);
+            }
+        }
+
+        if (drop is not null)
+        {
+            _sessions = drop.ToImmutable();
         }
     }
 

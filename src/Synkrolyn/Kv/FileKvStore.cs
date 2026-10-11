@@ -93,6 +93,16 @@ public sealed class FileKvStore : IKvStore, IDisposable
     }
 
     /// <inheritdoc />
+    public long AppliedTimestamp()
+    {
+        EnsureOpen();
+        return _inner.AppliedTimestamp();
+    }
+
+    /// <summary>Result of the last session command applied to the inner store.</summary>
+    internal KvCommandResult CommandResult => _inner.CommandResult;
+
+    /// <inheritdoc />
     public string? GetForSession(long clientId, string key)
     {
         EnsureOpen();

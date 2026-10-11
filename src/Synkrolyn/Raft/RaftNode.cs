@@ -111,6 +111,9 @@ public sealed class RaftNode
     public const double DefaultClockDriftBound = 0.01;
 
     private double _clockDriftBound = DefaultClockDriftBound;
+    private long _leaderClockProcess;
+    private long _leaderClockLogical;
+    private bool _leaderClockAnchored;
     private long _lastAcceptedLeaderCommit;
     private bool _lastPreVoteGranted;
     private Func<long, long> _electionJitter = static timeout => timeout;
@@ -669,7 +672,12 @@ public sealed class RaftNode
         }
     }
 
-    /// <summary>Leader clock for a log entry. Null when this node is not the leader.</summary>
+    /// <summary>
+    /// Leader timestamp for a log entry. Null when this node is not the leader.
+    /// The value is the applied timestamp plus time since this term started, so a
+    /// successor with a different process clock does not move session time backwards
+    /// or jump it forward.
+    /// </summary>
     public long? LeaderMillis()
     {
         lock (_eventLock)
@@ -679,8 +687,41 @@ public sealed class RaftNode
                 return null;
             }
 
-            return _clock.Millis;
+            if (!_leaderClockAnchored)
+            {
+                AnchorLeaderClock();
+            }
+
+            long elapsed = _clock.Millis - _leaderClockProcess;
+            if (elapsed < 0)
+            {
+                elapsed = 0;
+            }
+
+            long stamp = _leaderClockLogical + elapsed;
+            long applied = _stateMachine.AppliedTimestamp();
+            if (applied > stamp)
+            {
+                _leaderClockProcess = _clock.Millis;
+                _leaderClockLogical = applied;
+                stamp = applied;
+            }
+
+            return stamp;
         }
+    }
+
+    /// <summary>
+    /// Binds this term's timestamps to the state-machine clock when one exists,
+    /// otherwise to this process clock.
+    /// </summary>
+    private void AnchorLeaderClock()
+    {
+        long process = _clock.Millis;
+        long applied = _stateMachine.AppliedTimestamp();
+        _leaderClockProcess = process;
+        _leaderClockLogical = applied > 0 ? applied : process;
+        _leaderClockAnchored = true;
     }
 
     /// <summary>True when this node is leader and <see cref="LastApplied"/> has reached <paramref name="index"/>.</summary>
@@ -1246,6 +1287,7 @@ public sealed class RaftNode
         _votesGranted.Clear();
         _role = Role.Leader;
         _leaderId = _nodeId;
+        AnchorLeaderClock();
         _snapshotInFlight.Clear();
         _snapshotNextOffset.Clear();
         _snapshotSentAt.Clear();

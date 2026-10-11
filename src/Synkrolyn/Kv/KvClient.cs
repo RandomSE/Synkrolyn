@@ -25,6 +25,10 @@ public sealed class KvClient
     private long? _registerIndex;
     private RaftNode.ApplyWaiter? _registerWaiter;
     private TaskCompletionSource<long?>? _putAsync;
+    private TimeSpan _sessionTimeout;
+    private bool _reregister;
+    private long _consumedResultIndex = -1;
+    private KvCommandError _lastError;
 
     /// <summary>Creates a client without exactly-once serials.</summary>
     public KvClient(RaftNode raft, IKvStore store)
@@ -45,15 +49,20 @@ public sealed class KvClient
     {
         get
         {
+            Reregister();
             ObserveRegister();
             return _sessionId;
         }
     }
 
+    /// <summary>Error from the last session command. <see cref="KvCommandError.None"/> when that command applied.</summary>
+    public KvCommandError LastError => _lastError;
+
     /// <summary>Proposes a session registration. The applied log index is the client id.</summary>
     public long? Register(TimeSpan sessionTimeout)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(sessionTimeout, TimeSpan.Zero);
+        _sessionTimeout = sessionTimeout;
 
         if (ObserveRegister())
         {
@@ -109,6 +118,7 @@ public sealed class KvClient
     /// <summary>Proposes a put. Null until committed and applied, or when this node is not leader.</summary>
     public long? Put(string key, string value)
     {
+        Reregister();
         if (_sessionId != 0)
         {
             return SessionMutate(put: true, key, value);
@@ -151,6 +161,7 @@ public sealed class KvClient
     /// <summary>Proposes a delete.</summary>
     public long? Delete(string key)
     {
+        Reregister();
         if (_sessionId != 0)
         {
             return SessionMutate(put: false, key, value: "");
@@ -165,12 +176,20 @@ public sealed class KvClient
     /// <summary>Present when the last put or delete is committed and applied on this leader.</summary>
     public long? AwaitCommitted()
     {
+        Reregister();
         long? done = Completed();
-        if (done is not null)
+        if (done is null)
         {
-            Deliver();
+            return null;
         }
 
+        if (!TakeEffect(done.Value))
+        {
+            Reregister();
+            return null;
+        }
+
+        Deliver();
         return done;
     }
 
@@ -279,12 +298,86 @@ public sealed class KvClient
         }
 
         long? index = ProposeNew(_inflight, retrySame: true);
-        if (index is not null)
+        if (index is null)
         {
-            Deliver();
+            return null;
         }
 
+        if (!TakeEffect(index.Value))
+        {
+            Reregister();
+            return null;
+        }
+
+        Deliver();
         return index;
+    }
+
+    private bool TakeEffect(long index)
+    {
+        if (_consumedResultIndex == index)
+        {
+            return _lastError == KvCommandError.None;
+        }
+
+        KvCommandResult result = ReadResult();
+        if (result.Index != index)
+        {
+            return true;
+        }
+
+        _consumedResultIndex = index;
+        _lastError = result.Error;
+        if (result.Error == KvCommandError.None)
+        {
+            return true;
+        }
+
+        _inflight = null;
+        _pendingIndex = null;
+        _applyWaiter = null;
+        if (result.Error == KvCommandError.OutOfOrder)
+        {
+            _seq = _acked;
+        }
+        else if (result.Error == KvCommandError.SessionExpired)
+        {
+            _sessionId = 0;
+            _seq = 0;
+            _acked = 0;
+            _registerCommand = null;
+            _registerIndex = null;
+            _registerWaiter = null;
+            _reregister = true;
+        }
+
+        return false;
+    }
+
+    private KvCommandResult ReadResult()
+    {
+        if (_store is InMemoryKvStore memory)
+        {
+            return memory.CommandResult;
+        }
+
+        if (_store is FileKvStore file)
+        {
+            return file.CommandResult;
+        }
+
+        return default;
+    }
+
+    private void Reregister()
+    {
+        if (!_reregister || _sessionTimeout <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        _reregister = false;
+        Register(_sessionTimeout);
     }
 
     private bool ObserveRegister()
@@ -321,6 +414,12 @@ public sealed class KvClient
         _putAsync = null;
         if (waiter.Applied)
         {
+            if (!TakeEffect(waiter.Index))
+            {
+                tcs?.TrySetResult(null);
+                return;
+            }
+
             Deliver();
             tcs?.TrySetResult(waiter.Index);
             return;
@@ -406,5 +505,34 @@ public sealed class KvClient
         }
 
         return null;
+    }
+
+    /// <summary>Test hook. The next session command uses <paramref name="seq"/>.</summary>
+    internal void PrepareSeqForTest(long seq)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(seq, 0);
+        _seq = seq - 1;
+        _inflight = null;
+        _pendingIndex = null;
+        _applyWaiter = null;
+    }
+
+    /// <summary>Test hook. Points this client at a session that may already be gone.</summary>
+    internal void AttachSessionForTest(long sessionId, TimeSpan timeout)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(sessionId, 0);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
+        _sessionId = sessionId;
+        _sessionTimeout = timeout;
+        _seq = 0;
+        _acked = 0;
+        _inflight = null;
+        _pendingIndex = null;
+        _applyWaiter = null;
+        _registerCommand = null;
+        _registerIndex = null;
+        _registerWaiter = null;
+        _reregister = false;
+        _consumedResultIndex = -1;
     }
 }
