@@ -334,6 +334,77 @@ public class SocketDeliveryTests
         Assert.Equal(command.Length, append.Entries[0].Command.Length);
     }
 
+    [Fact]
+    public void VoteAndSnapshotAck_areNotDroppedFromAFullQueue()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
+        client.Bind();
+        client.Start();
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
+        using TcpClient accepted = AcceptFrame(listener, TimeSpan.FromSeconds(2), out byte[]? first);
+        Assert.NotNull(first);
+        int entered = SocketTransport.ProbeEntered;
+        using var stall = new ManualResetEventSlim(false);
+        SocketTransport.ProbeStall = stall;
+        try
+        {
+            client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [], 0));
+            Assert.True(WaitFor(() => SocketTransport.ProbeEntered > entered));
+            Assert.True(client.Send("a", "b", new RequestVote(9, "a", 1, 1)));
+            Assert.True(client.Send("a", "b", new InstallSnapshotResponse(9, true, true, 4, 1)));
+            for (int i = 0; i < 64; i++)
+            {
+                Assert.True(client.Send("a", "b", new AppendEntriesResponse(1, true, i)));
+            }
+        }
+        finally
+        {
+            stall.Set();
+            SocketTransport.ProbeStall = null;
+        }
+
+        List<object> payloads = ReadPayloads(accepted, TimeSpan.FromSeconds(2));
+        Assert.Contains(payloads, payload => payload is RequestVote vote && vote.Term == 9);
+        Assert.Contains(payloads, payload => payload is InstallSnapshotResponse ack && ack.Term == 9 && ack.Success);
+    }
+
+    [Fact]
+    public void BlockedSend_completesWithin250msOfAbort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        listener.Start();
+        using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
+        client.Bind();
+        client.Start();
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
+        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        accepted.ReceiveBufferSize = 1024;
+        Assert.True(WaitFor(() => Outbound(client) is not null));
+        Outbound(client)!.Client.SendBufferSize = 1024;
+        byte[] command = new byte[256 * 1024];
+        command[0] = 4;
+        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
+        Assert.True(WaitFor(() => SocketTransport.SendWaits > SocketTransport.SendDones), "send never blocked on the silent reader");
+        int dones = SocketTransport.SendDones;
+        SocketTransport.AbortTicks = 0;
+        SetPeerDead(client, TimeSpan.FromMilliseconds(1));
+        Assert.True(
+            WaitFor(() => System.Threading.Volatile.Read(ref SocketTransport.AbortTicks) != 0, TimeSpan.FromSeconds(2)),
+            "peer-dead abort did not run");
+        long abort = System.Threading.Volatile.Read(ref SocketTransport.AbortTicks);
+        Assert.True(
+            WaitFor(() => SocketTransport.SendDones > dones, TimeSpan.FromMilliseconds(250)),
+            "blocked send still pending 250 ms after the abort at " + abort);
+    }
+
     /// <summary>
     /// Sets the peer-dead timeout when this build has one. Older builds keep the
     /// 1 s progress rule, which is what these tests reject.
@@ -501,6 +572,41 @@ public class SocketDeliveryTests
         }
 
         return unread;
+    }
+
+    private static List<object> ReadPayloads(TcpClient client, TimeSpan budget)
+    {
+        var found = new List<object>();
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        client.ReceiveTimeout = Math.Max(1, (int)budget.TotalMilliseconds);
+        var decoder = new FrameCodec.Decoder();
+        var codec = new RpcWireCodec();
+        byte[] buf = new byte[8192];
+        NetworkStream stream = client.GetStream();
+        while (started.Elapsed < budget)
+        {
+            int n;
+            try
+            {
+                n = stream.Read(buf, 0, buf.Length);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (n <= 0)
+            {
+                break;
+            }
+
+            foreach (byte[] frame in decoder.Push(buf.AsSpan(0, n).ToArray()))
+            {
+                found.Add(codec.Decode(frame).Payload);
+            }
+        }
+
+        return found;
     }
 
     private static TimeSpan Remaining(System.Diagnostics.Stopwatch started)

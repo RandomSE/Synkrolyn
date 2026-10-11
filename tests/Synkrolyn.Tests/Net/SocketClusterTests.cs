@@ -41,8 +41,26 @@ public sealed class SocketClusterTests
         }
 
         SocketNode leader = cluster.Leaders()[0];
+        SocketTransport.ClearNotes();
         leader.Client.Put("city", "athens");
-        WaitUntil("put committed", () => leader.Client.AwaitCommitted() is not null);
+        try
+        {
+            WaitUntil("put committed", () => leader.Client.AwaitCommitted() is not null);
+        }
+        catch (TimeoutException)
+        {
+            string snapshot = string.Join(
+                " | ",
+                cluster.Nodes.Select(node =>
+                    node.Id
+                    + " role=" + node.Node.Role
+                    + " term=" + node.Node.CurrentTerm
+                    + " commit=" + node.Node.CommitIndex
+                    + " applied=" + node.Node.LastApplied
+                    + " leader=" + node.Node.LeaderId));
+            throw new TimeoutException("put committed " + snapshot + " notes=" + SocketTransport.RecentNotes());
+        }
+
         long index = leader.Client.AwaitCommitted()!.Value;
         SocketNode follower = cluster.Nodes.First(node => node.Id != leader.Id);
         WaitUntil("follower applied", () => follower.Node.LastApplied >= index);

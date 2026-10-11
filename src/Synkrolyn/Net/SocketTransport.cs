@@ -259,6 +259,20 @@ public sealed class SocketTransport : ITransport, IDisposable
             return true;
         }
 
+        if (payload is RequestVote or RequestVoteResponse or InstallSnapshotResponse)
+        {
+            // Votes and snapshot acks must survive a full replication queue.
+            // AppendEntries already collapse separately. The 64-slot channel
+            // still drops older heartbeats and append replies.
+            bool kept = link.Critical.Writer.TryWrite(frame);
+            if (kept)
+            {
+                link.Poke.Set();
+            }
+
+            return kept;
+        }
+
         bool queued = link.Others.Writer.TryWrite(frame);
         if (queued)
         {
@@ -334,6 +348,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         foreach (PeerLink link in links)
         {
+            link.Critical.Writer.TryComplete();
             link.Others.Writer.TryComplete();
             link.Poke.Set();
             link.Stop.Set();
@@ -436,6 +451,19 @@ public sealed class SocketTransport : ITransport, IDisposable
                     continue;
                 }
 
+                if (link.Critical.Reader.TryRead(out byte[]? critical))
+                {
+                    inflight = critical;
+                    inflightAppend = false;
+                    inflightGeneration = 0;
+                    if (!SendUntil(peer, link, critical, false, 0, pause))
+                    {
+                        inflight = null;
+                    }
+
+                    continue;
+                }
+
                 if (link.Others.Reader.TryRead(out byte[]? other))
                 {
                     inflight = other;
@@ -507,6 +535,7 @@ public sealed class SocketTransport : ITransport, IDisposable
                 continue;
             }
 
+            NoteDrop("silent " + peer);
             DropOutbound(peer, client);
             link.Poke.Set();
         }
@@ -564,9 +593,10 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Any send failure, including a connect abort, leaves the writer alive.
+            NoteDrop(ex is SocketException sock ? "send " + sock.SocketErrorCode : "send " + ex.GetType().Name);
             DropOutbound(peer);
             return false;
         }
@@ -638,7 +668,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     private static bool HasQueued(PeerLink link)
     {
-        if (link.Others.Reader.TryPeek(out _))
+        if (link.Critical.Reader.TryPeek(out _) || link.Others.Reader.TryPeek(out _))
         {
             return true;
         }
@@ -705,23 +735,45 @@ public sealed class SocketTransport : ITransport, IDisposable
 
     private static void CloseSocket(TcpClient client)
     {
+        // Close() alone leaves SendAsync pending on Linux. Shutdown wakes it,
+        // then Dispose releases the handle. AbortTicks is the test's t0.
+        Volatile.Write(ref AbortTicks, Stopwatch.GetTimestamp());
+        Socket? socket = null;
         try
         {
-            // Closing from this thread completes a SendAsync parked on the writer.
-            // A blocking Socket.Send can hold the same lock Close waits on; the
-            // async send does not.
-            client.Client.Close();
+            socket = client.Client;
         }
-        catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+        catch (Exception ex) when (ex is ObjectDisposedException or NullReferenceException or InvalidOperationException)
         {
-            // The writer already dropped this socket.
+            // Dispose already cleared the handle.
+        }
+
+        if (socket is not null)
+        {
+            try
+            {
+                socket.Shutdown(SocketShutdown.Both);
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException or NullReferenceException)
+            {
+                // The writer already dropped this socket.
+            }
+
+            try
+            {
+                socket.Dispose();
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+            {
+                // Already closed.
+            }
         }
 
         try
         {
             client.Dispose();
         }
-        catch (ObjectDisposedException)
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException or NullReferenceException)
         {
             // Already closed.
         }
@@ -863,6 +915,48 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// <summary>How many liveness probes have started. Tests use this to see the probe is inside.</summary>
     internal static int ProbeEntered;
 
+    /// <summary>Pending send waits that have started. Tests use this to see a writer blocked in send.</summary>
+    internal static int SendWaits;
+
+    /// <summary>Pending send waits that have returned. Tests compare this with <see cref="SendWaits"/>.</summary>
+    internal static int SendDones;
+
+    /// <summary>Timestamp of the latest socket abort, or 0. Tests measure send completion against it.</summary>
+    internal static long AbortTicks;
+
+    private static readonly Queue<string> Notes = new();
+
+    /// <summary>Failure-path notes for the connect-reset test. Not on the success path.</summary>
+    internal static string RecentNotes()
+    {
+        lock (Notes)
+        {
+            return string.Join("; ", Notes);
+        }
+    }
+
+    /// <summary>Drops notes recorded by earlier tests.</summary>
+    internal static void ClearNotes()
+    {
+        lock (Notes)
+        {
+            Notes.Clear();
+        }
+    }
+
+    private static void NoteDrop(string reason)
+    {
+        lock (Notes)
+        {
+            if (Notes.Count == 40)
+            {
+                Notes.Dequeue();
+            }
+
+            Notes.Enqueue(reason);
+        }
+    }
+
     /// <summary>
     /// Writes <paramref name="frame"/> or throws. The wait is only this peer's
     /// writer. Closing the socket from the checker unblocks it. A partial copy
@@ -892,7 +986,29 @@ public sealed class SocketTransport : ITransport, IDisposable
             bool pending = socket.SendAsync(args);
             if (pending)
             {
+                Interlocked.Increment(ref SendWaits);
                 done.Wait();
+                Interlocked.Increment(ref SendDones);
+            }
+
+            if (args.SocketError is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
+            {
+                // The window is full. The peer is still reading. Wait for space
+                // instead of dropping the socket.
+                try
+                {
+                    socket.Poll(5_000, SelectMode.SelectWrite);
+                }
+                catch (SocketException ex) when (IsBenign(ex))
+                {
+                    // Still a live socket.
+                }
+                catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+                {
+                    throw new IOException("send aborted");
+                }
+
+                continue;
             }
 
             if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
@@ -910,51 +1026,160 @@ public sealed class SocketTransport : ITransport, IDisposable
         ProbeStall?.Wait();
         try
         {
-            if (!client.Connected)
+            Socket socket = client.Client;
+            if (!socket.Connected)
+            {
+                NoteDrop("not-connected");
+                return false;
+            }
+
+            bool readable;
+            try
+            {
+                readable = socket.Poll(0, SelectMode.SelectRead);
+            }
+            catch (SocketException ex) when (IsBenign(ex))
+            {
+                return true;
+            }
+
+            int available;
+            try
+            {
+                available = readable ? socket.Available : 1;
+            }
+            catch (SocketException ex) when (IsBenign(ex))
+            {
+                return true;
+            }
+
+            if (!readable || available > 0)
+            {
+                return true;
+            }
+
+            // A zero-byte poll is not death. WouldBlock is not death. A socket is
+            // dead here only for a reset or a FIN that peek reports twice. One
+            // empty poll is what dropped a live slow reader.
+            if (HasDisconnectError(socket))
+            {
+                NoteDrop("reset");
+                return false;
+            }
+
+            if (ConfirmedFin(socket))
+            {
+                NoteDrop("fin");
+                return false;
+            }
+
+            return true;
+        }
+        catch (SocketException ex) when (IsBenign(ex))
+        {
+            return true;
+        }
+        catch (SocketException ex) when (IsDisconnect(ex))
+        {
+            NoteDrop(ex.SocketErrorCode.ToString());
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            NoteDrop("disposed");
+            return false;
+        }
+        catch (Exception)
+        {
+            // An unknown probe error is not a dead peer. Silence still closes it.
+            return true;
+        }
+    }
+
+    private static bool IsBenign(SocketException ex) =>
+        ex.SocketErrorCode is SocketError.WouldBlock or SocketError.TimedOut or SocketError.IOPending or SocketError.TryAgain or SocketError.Interrupted;
+
+    private static bool IsDisconnect(SocketException ex) =>
+        ex.SocketErrorCode is SocketError.ConnectionReset
+            or SocketError.ConnectionAborted
+            or SocketError.NotConnected
+            or SocketError.Shutdown
+            or SocketError.Disconnecting
+            or SocketError.NetworkReset
+            or SocketError.NetworkDown;
+
+    private static bool HasDisconnectError(Socket socket)
+    {
+        try
+        {
+            int code = (int)socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
+            if (code == 0)
             {
                 return false;
             }
 
-            Socket socket = client.Client;
-            if (!socket.Poll(0, SelectMode.SelectRead) || socket.Available > 0)
-            {
-                return true;
-            }
-
-            // Poll said readable with nothing queued. On Windows that is also true
-            // for a peer that has not sent. A blocking peek would wait forever, and
-            // a receive timeout stores WSAETIMEDOUT and leaves the socket
-            // indeterminate, so this path never sets one. A non-blocking peek that
-            // would block is a live socket. A zero-byte peek is a graceful FIN and
-            // is dead: the next write can still succeed on a half-closed socket and
-            // the frame would never be sent again.
-            try
-            {
-                socket.Blocking = true;
-                socket.Blocking = false;
-                int peeked = socket.Receive(new byte[1], SocketFlags.Peek);
-                return peeked > 0;
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.WouldBlock or SocketError.TimedOut or SocketError.IOPending or SocketError.TryAgain)
-            {
-                return true;
-            }
-            finally
-            {
-                try
-                {
-                    socket.Blocking = false;
-                    socket.Blocking = true;
-                }
-                catch (ObjectDisposedException)
-                {
-                    // The peer socket was dropped while the probe ran.
-                }
-            }
+            var error = (SocketError)code;
+            return error is SocketError.ConnectionReset
+                or SocketError.ConnectionAborted
+                or SocketError.NotConnected
+                or SocketError.Shutdown
+                or SocketError.Disconnecting
+                or SocketError.NetworkReset
+                or SocketError.NetworkDown;
         }
-        catch (Exception)
+        catch (SocketException ex) when (IsBenign(ex))
         {
             return false;
+        }
+        catch (SocketException ex) when (IsDisconnect(ex))
+        {
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// True only when a non-blocking peek returns 0 twice. A single zero-byte
+    /// read is not a FIN: Windows reports that for a peer that has not sent.
+    /// </summary>
+    private static bool ConfirmedFin(Socket socket)
+    {
+        try
+        {
+            socket.Blocking = true;
+            socket.Blocking = false;
+            var probe = new byte[1];
+            int peeked = socket.Receive(probe, SocketFlags.Peek);
+            if (peeked > 0)
+            {
+                return false;
+            }
+
+            int again = socket.Receive(probe, SocketFlags.Peek);
+            return again == 0;
+        }
+        catch (SocketException ex) when (IsBenign(ex))
+        {
+            return false;
+        }
+        catch (SocketException ex) when (IsDisconnect(ex))
+        {
+            return true;
+        }
+        finally
+        {
+            try
+            {
+                socket.Blocking = false;
+                socket.Blocking = true;
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+            {
+                // The peer socket was dropped while the probe ran.
+            }
         }
     }
 
@@ -1052,6 +1277,11 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// <summary>One peer's outbound queue. AppendEntries collapse to the latest unsent frame.</summary>
     private sealed class PeerLink : IDisposable
     {
+        public readonly Channel<byte[]> Critical = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+        });
+
         public readonly Channel<byte[]> Others = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
         {
             SingleReader = true,
