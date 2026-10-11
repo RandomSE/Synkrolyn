@@ -388,11 +388,25 @@ public class SocketDeliveryTests
         using TcpClient accepted = listener.AcceptTcpClient();
         accepted.ReceiveBufferSize = 1024;
         Assert.True(WaitFor(() => Outbound(client) is not null));
-        Outbound(client)!.Client.SendBufferSize = 1024;
-        byte[] command = new byte[256 * 1024];
-        command[0] = 4;
-        client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
-        Assert.True(WaitFor(() => SocketTransport.SendWaits > SocketTransport.SendDones), "send never blocked on the silent reader");
+        accepted.Client.ReceiveBufferSize = 1;
+        Outbound(client)!.Client.SendBufferSize = 1;
+        // Windows keeps a send buffer large enough for 256 KB, so grow until
+        // SendAsync actually parks. Stay under the 1 MiB frame cap.
+        bool blocked = false;
+        foreach (int commandLength in new[] { 256 * 1024, 512 * 1024, 900_000 })
+        {
+            int waits = SocketTransport.SendWaits;
+            byte[] command = new byte[commandLength];
+            command[0] = 4;
+            client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0));
+            if (WaitFor(() => SocketTransport.SendWaits > waits, TimeSpan.FromMilliseconds(500)))
+            {
+                blocked = true;
+                break;
+            }
+        }
+
+        Assert.True(blocked, "send never blocked on the silent reader");
         int dones = SocketTransport.SendDones;
         SocketTransport.AbortTicks = 0;
         SetPeerDead(client, TimeSpan.FromMilliseconds(1));

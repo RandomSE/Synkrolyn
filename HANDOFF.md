@@ -19,11 +19,16 @@ Confidence: 64% | Evidence: Windows push run 37839924014 timed out at "put commi
 
 Hypothesis: after `DropInbound`, a reset outbound send does not fail before `CheckQuorum`. `PeerDeadTimeout` is the election timeout, so the leader can step down while the put is still uncommitted, and a shorter log can win and truncate it. Not confirmed. If CI times out, the new exception text is the evidence. The Put is not retried.
 
+## CI cycle 1 (`5ccadae`)
+
+- push 38134006514: Ubuntu pass, Windows fail `BlockedSend_completesWithin250msOfAbort` ("send never blocked on the silent reader").
+- pull_request 38134008733: Ubuntu pass, Windows same failure.
+- `ConnectFailuresAndReset_originalPutStillCommits` passed on that Windows run, so the timeout snapshot was not printed. Root cause still unconfirmed. Confidence: 64%.
+
 ## Open items
 
-- Windows root cause is unconfirmed until a failing run prints the snapshot and notes.
-- `BlockedSend_completesWithin250msOfAbort` did not fail on this host before `Shutdown(Both)`. It locks the 250 ms bound.
-- Repair cap is 3 pushes. This commit is cycle 1 if CI is red.
+- Windows did not park `SendAsync` for a 256 KB frame (send buffer absorbed it). The test now grows the frame until a wait starts, still under the 1 MiB cap.
+- Repair cap is 3. Cycle 1 is spent. Cycle 2 is the buffer-fill test fix.
 
 ## Files
 
@@ -35,5 +40,5 @@ Hypothesis: after `DropInbound`, a reset outbound send does not fail before `Che
 - `src/Synkrolyn/Net/SocketTransport.cs:1023-1163` `IsLive` and `ConfirmedFin`
 - `src/Synkrolyn/Net/SocketTransport.cs:1280-1284` unbounded critical channel
 - `tests/Synkrolyn.Tests/Net/SocketDeliveryTests.cs:338-374` `VoteAndSnapshotAck_areNotDroppedFromAFullQueue` (failed first)
-- `tests/Synkrolyn.Tests/Net/SocketDeliveryTests.cs:376-406` `BlockedSend_completesWithin250msOfAbort`
+- `tests/Synkrolyn.Tests/Net/SocketDeliveryTests.cs:376-424` `BlockedSend_completesWithin250msOfAbort`
 - `tests/Synkrolyn.Tests/Net/SocketClusterTests.cs:43-62` one-Put timeout snapshot
