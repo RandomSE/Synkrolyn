@@ -669,6 +669,20 @@ public sealed class RaftNode
         }
     }
 
+    /// <summary>Leader clock for a log entry. Null when this node is not the leader.</summary>
+    public long? LeaderMillis()
+    {
+        lock (_eventLock)
+        {
+            if (_role != Role.Leader || _fatal)
+            {
+                return null;
+            }
+
+            return _clock.Millis;
+        }
+    }
+
     /// <summary>True when this node is leader and <see cref="LastApplied"/> has reached <paramref name="index"/>.</summary>
     public bool AwaitCommitted(long index)
     {
@@ -679,12 +693,17 @@ public sealed class RaftNode
     }
 
     /// <summary>Registers a waiter completed only when that index is applied in the proposal's term.</summary>
-    public ApplyWaiter RegisterApplyWaiter(long index)
+    /// <param name="index">Log index to wait for.</param>
+    /// <param name="onSettled">
+    /// Called on the Raft thread when the waiter is applied, failed, or indeterminate.
+    /// It must not call back into this node.
+    /// </param>
+    public ApplyWaiter RegisterApplyWaiter(long index, Action<ApplyWaiter>? onSettled = null)
     {
         lock (_eventLock)
         {
             long term = _proposedTerms.TryGetValue(index, out long proposed) ? proposed : ProposalTerm(index);
-            var waiter = new ApplyWaiter(index, term);
+            var waiter = new ApplyWaiter(index, term) { OnSettled = onSettled };
             if (_role != Role.Leader)
             {
                 waiter.Failed = true;
@@ -1014,18 +1033,45 @@ public sealed class RaftNode
         private volatile bool _failed;
         private volatile bool _indeterminate;
 
+        /// <summary>Invoked when a flag becomes true. Must not re-enter the node.</summary>
+        internal Action<ApplyWaiter>? OnSettled { get; set; }
+
         /// <summary>True after the index is applied.</summary>
         public bool Applied
         {
             get => _applied;
-            internal set => _applied = value;
+            internal set
+            {
+                if (_applied == value)
+                {
+                    return;
+                }
+
+                _applied = value;
+                if (value)
+                {
+                    OnSettled?.Invoke(this);
+                }
+            }
         }
 
         /// <summary>True when the index was truncated or the node fail-stopped before apply.</summary>
         public bool Failed
         {
             get => _failed;
-            internal set => _failed = value;
+            internal set
+            {
+                if (_failed == value)
+                {
+                    return;
+                }
+
+                _failed = value;
+                if (value)
+                {
+                    OnSettled?.Invoke(this);
+                }
+            }
         }
 
         /// <summary>
@@ -1035,7 +1081,19 @@ public sealed class RaftNode
         public bool Indeterminate
         {
             get => _indeterminate;
-            internal set => _indeterminate = value;
+            internal set
+            {
+                if (_indeterminate == value)
+                {
+                    return;
+                }
+
+                _indeterminate = value;
+                if (value)
+                {
+                    OnSettled?.Invoke(this);
+                }
+            }
         }
     }
 

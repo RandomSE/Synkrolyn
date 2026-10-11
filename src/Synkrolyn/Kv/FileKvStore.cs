@@ -93,6 +93,13 @@ public sealed class FileKvStore : IKvStore, IDisposable
     }
 
     /// <inheritdoc />
+    public string? GetForSession(long clientId, string key)
+    {
+        EnsureOpen();
+        return _inner.GetForSession(clientId, key);
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         if (!_closed)

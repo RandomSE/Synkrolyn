@@ -7,7 +7,8 @@ namespace Synkrolyn.Kv;
 
 /// <summary>
 /// Applied-local map. <see cref="Get"/> reads this replica and is not linearizable.
-/// Client serials survive PTCS snapshots.
+/// Client serials and sessions survive PTCS snapshots. Session expiry uses the
+/// leader timestamp stored in the log, never a local clock.
 /// </summary>
 public sealed class InMemoryKvStore : IKvStore
 {
@@ -16,6 +17,8 @@ public sealed class InMemoryKvStore : IKvStore
     private readonly object _gate = new();
     private ImmutableDictionary<string, string> _map = ImmutableDictionary<string, string>.Empty;
     private ImmutableDictionary<string, long> _clientSerials = ImmutableDictionary<string, long>.Empty;
+    private ImmutableDictionary<long, Session> _sessions = ImmutableDictionary<long, Session>.Empty;
+    private long _logTime;
     private ImmutableDictionary<string, string>? _lastSnapMap;
     private int _epoch;
     private long _appliedThrough = -1;
@@ -70,6 +73,11 @@ public sealed class InMemoryKvStore : IKvStore
                     return;
                 }
 
+                if (ApplySession(index, decoded))
+                {
+                    return;
+                }
+
                 if (decoded.Serial > 0 && decoded.ClientId.Length > 0)
                 {
                     if (_clientSerials.TryGetValue(decoded.ClientId, out long last) && decoded.Serial <= last)
@@ -102,7 +110,7 @@ public sealed class InMemoryKvStore : IKvStore
         lock (_gate)
         {
             WhileEncoding?.Invoke();
-            byte[] bytes = Encode(_map, _clientSerials);
+            byte[] bytes = Encode(_map, _clientSerials, _sessions, _logTime);
             _lastSnapMap = _map;
             return bytes;
         }
@@ -115,14 +123,16 @@ public sealed class InMemoryKvStore : IKvStore
         {
             ImmutableDictionary<string, string> map = _map;
             ImmutableDictionary<string, long> serials = _clientSerials;
+            ImmutableDictionary<long, Session> sessions = _sessions;
+            long logTime = _logTime;
             ImmutableDictionary<string, string>? baseline = _lastSnapMap;
             return StateCapture.Frozen(
                 () =>
                 {
                     WhileEncoding?.Invoke();
-                    return Encode(map, serials);
+                    return Encode(map, serials, sessions, logTime);
                 },
-                baseIndex => EncodeDelta(map, serials, baseline, baseIndex),
+                baseIndex => EncodeDelta(map, serials, sessions, logTime, baseline, baseIndex),
                 () =>
                 {
                     lock (_gate)
@@ -138,7 +148,7 @@ public sealed class InMemoryKvStore : IKvStore
     {
         lock (_gate)
         {
-            return Encode(_map, _clientSerials);
+            return Encode(_map, _clientSerials, _sessions, _logTime);
         }
     }
 
@@ -147,19 +157,21 @@ public sealed class InMemoryKvStore : IKvStore
     {
         lock (_gate)
         {
-            return EncodeDelta(_map, _clientSerials, _lastSnapMap, baseIndex);
+            return EncodeDelta(_map, _clientSerials, _sessions, _logTime, _lastSnapMap, baseIndex);
         }
     }
 
     private static byte[] EncodeDelta(
         ImmutableDictionary<string, string> map,
         ImmutableDictionary<string, long> serials,
+        ImmutableDictionary<long, Session> sessions,
+        long logTime,
         ImmutableDictionary<string, string>? baseline,
         long baseIndex)
     {
         if (baseline is null)
         {
-            return Encode(map, serials);
+            return Encode(map, serials, sessions, logTime);
         }
 
         var puts = new Dictionary<string, string>();
@@ -180,7 +192,17 @@ public sealed class InMemoryKvStore : IKvStore
             }
         }
 
-        return KvSnapshotDelta.Encode(baseIndex, puts, deletes, serials);
+        byte[] delta = KvSnapshotDelta.Encode(baseIndex, puts, deletes, serials);
+        if (sessions.IsEmpty && logTime == 0)
+        {
+            return delta;
+        }
+
+        byte[] tail = EncodeSessionTail(sessions, logTime);
+        byte[] buf = new byte[delta.Length + tail.Length];
+        delta.CopyTo(buf);
+        tail.CopyTo(buf.AsSpan(delta.Length));
+        return buf;
     }
 
     /// <inheritdoc />
@@ -225,9 +247,14 @@ public sealed class InMemoryKvStore : IKvStore
 
             var map = _map.ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
             var serials = _clientSerials.ToDictionary(static pair => pair.Key, static pair => pair.Value, StringComparer.Ordinal);
-            KvSnapshotDelta.ApplyTo(map, serials, snapshot);
+            int pos = KvSnapshotDelta.ApplyTo(map, serials, snapshot);
             _map = map.ToImmutableDictionary();
             _clientSerials = serials.ToImmutableDictionary();
+            if (pos < snapshot.Length)
+            {
+                RestoreSessionTail(snapshot, ref pos);
+            }
+
             _lastSnapMap = _map;
             return;
         }
@@ -245,7 +272,62 @@ public sealed class InMemoryKvStore : IKvStore
         }
     }
 
-    private static byte[] Encode(ImmutableDictionary<string, string> map, ImmutableDictionary<string, long> serials)
+    /// <inheritdoc />
+    public string? GetForSession(long clientId, string key)
+    {
+        KvCommandCodec.RequireKey(key);
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(clientId, out Session? session))
+            {
+                throw new KvSessionException("unknown session " + clientId);
+            }
+
+            if (IsExpired(session))
+            {
+                throw new KvSessionException("session expired");
+            }
+
+            return _map.GetValueOrDefault(key);
+        }
+    }
+
+    /// <summary>Session fields replicated through the log. Expired is derived from log time.</summary>
+    internal readonly record struct SessionView(
+        long ClientId,
+        long LastSeq,
+        long AckFloor,
+        long LastActiveMillis,
+        long TimeoutMillis,
+        bool Expired,
+        long LogTimeMillis);
+
+    /// <summary>Reads one session. Throws when the id was never registered in this store.</summary>
+    internal SessionView ReadSession(long clientId)
+    {
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(clientId, out Session? session))
+            {
+                throw new KvSessionException("unknown session " + clientId);
+            }
+
+            return new SessionView(
+                session.Id,
+                session.LastSeq,
+                session.AckFloor,
+                session.LastActive,
+                session.TimeoutMillis,
+                IsExpired(session),
+                _logTime);
+        }
+    }
+
+    private static byte[] Encode(
+        ImmutableDictionary<string, string> map,
+        ImmutableDictionary<string, long> serials,
+        ImmutableDictionary<long, Session> sessions,
+        long logTime)
     {
         byte[] mapBytes = EncodeMapOnly(map);
         var clients = serials.Keys.OrderBy(static id => id, StringComparer.Ordinal).ToList();
@@ -274,7 +356,17 @@ public sealed class InMemoryKvStore : IKvStore
             pos += 8;
         }
 
-        return buf;
+        if (sessions.IsEmpty && logTime == 0)
+        {
+            return buf;
+        }
+
+        byte[] tail = EncodeSessionTail(sessions, logTime);
+        byte[] withSessions = new byte[buf.Length + tail.Length];
+        buf.CopyTo(withSessions);
+        BinaryPrimitives.WriteInt32BigEndian(withSessions.AsSpan(SerialMagic.Length), 2);
+        tail.CopyTo(withSessions.AsSpan(buf.Length));
+        return withSessions;
     }
 
     private static byte[] EncodeMapOnly(ImmutableDictionary<string, string> map)
@@ -310,18 +402,34 @@ public sealed class InMemoryKvStore : IKvStore
             pos = SerialMagic.Length;
             int version = BinaryPrimitives.ReadInt32BigEndian(snapshot.AsSpan(pos));
             pos += 4;
-            if (version != SerialSnapshotVersion)
+            if (version is not SerialSnapshotVersion and not 2)
             {
                 throw new ArgumentException("unsupported kv snapshot version " + version);
             }
 
             RestoreMap(snapshot, ref pos);
             RestoreSerials(snapshot, ref pos);
+            if (version == SerialSnapshotVersion)
+            {
+                if (pos != snapshot.Length)
+                {
+                    throw new ArgumentException("trailing bytes after kv serial table");
+                }
+
+                _sessions = ImmutableDictionary<long, Session>.Empty;
+                _logTime = 0;
+            }
+            else
+            {
+                RestoreSessionTail(snapshot, ref pos);
+            }
         }
         else
         {
             RestoreMap(snapshot, ref pos);
             _clientSerials = ImmutableDictionary<string, long>.Empty;
+            _sessions = ImmutableDictionary<long, Session>.Empty;
+            _logTime = 0;
             if (pos != snapshot.Length)
             {
                 throw new ArgumentException("trailing bytes after kv snapshot");
@@ -384,12 +492,231 @@ public sealed class InMemoryKvStore : IKvStore
         }
 
         _clientSerials = restored.ToImmutable();
+    }
 
-        if (pos != snapshot.Length)
+    /// <summary>
+    /// Session register, tick, and sequenced commands. One dictionary lookup on the
+    /// steady-state put and delete path. Returns false for an ordinary command.
+    /// </summary>
+    private bool ApplySession(long index, KvCommandCodec.Command decoded)
+    {
+        if (decoded.Operation == KvCommandCodec.Op.Tick)
         {
-            throw new ArgumentException("trailing bytes after kv serial table");
+            NoteTime(decoded.LeaderTimestamp);
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.Operation == KvCommandCodec.Op.Register)
+        {
+            NoteTime(decoded.LeaderTimestamp);
+            if (!_sessions.ContainsKey(index))
+            {
+                _sessions = _sessions.SetItem(
+                    index,
+                    new Session(index, 0, 0, decoded.LeaderTimestamp, decoded.TimeoutMillis, false, "", ""));
+            }
+
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.SessionId <= 0)
+        {
+            return false;
+        }
+
+        NoteTime(decoded.LeaderTimestamp);
+        if (!_sessions.TryGetValue(decoded.SessionId, out Session? session))
+        {
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (IsExpired(session))
+        {
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.AckFloor > session.AckFloor)
+        {
+            bool keepCache = session.HasCache && session.LastSeq > decoded.AckFloor;
+            session = session with { AckFloor = decoded.AckFloor, HasCache = keepCache };
+        }
+
+        if (decoded.Serial <= session.AckFloor)
+        {
+            _sessions = _sessions.SetItem(session.Id, session);
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.Serial == session.LastSeq && session.LastSeq > 0)
+        {
+            long active = Math.Max(session.LastActive, decoded.LeaderTimestamp);
+            _sessions = _sessions.SetItem(session.Id, session with { LastActive = active });
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.Serial != session.LastSeq + 1)
+        {
+            _sessions = _sessions.SetItem(session.Id, session);
+            _appliedThrough = Math.Max(_appliedThrough, index);
+            return true;
+        }
+
+        if (decoded.Operation == KvCommandCodec.Op.Put)
+        {
+            _map = _map.SetItem(decoded.Key, decoded.Value);
+        }
+        else if (decoded.Operation == KvCommandCodec.Op.Delete)
+        {
+            _map = _map.Remove(decoded.Key);
+        }
+
+        session = session with
+        {
+            LastSeq = decoded.Serial,
+            LastActive = Math.Max(session.LastActive, decoded.LeaderTimestamp),
+            HasCache = true,
+            CachedKey = decoded.Key,
+            CachedValue = decoded.Operation == KvCommandCodec.Op.Put ? decoded.Value : "",
+        };
+        _sessions = _sessions.SetItem(session.Id, session);
+        _appliedThrough = Math.Max(_appliedThrough, index);
+        return true;
+    }
+
+    private void NoteTime(long timestamp)
+    {
+        if (timestamp > _logTime)
+        {
+            _logTime = timestamp;
         }
     }
+
+    private bool IsExpired(Session session) =>
+        session.TimeoutMillis > 0 && _logTime - session.LastActive > session.TimeoutMillis;
+
+    private static byte[] EncodeSessionTail(ImmutableDictionary<long, Session> sessions, long logTime)
+    {
+        var ids = sessions.Keys.OrderBy(static id => id).ToList();
+        var cachedKeys = new List<byte[]>(ids.Count);
+        var cachedValues = new List<byte[]>(ids.Count);
+        int size = 8 + 4;
+        foreach (long id in ids)
+        {
+            Session session = sessions[id];
+            size += (8 * 5) + 1;
+            if (session.HasCache)
+            {
+                byte[] key = Encoding.UTF8.GetBytes(session.CachedKey);
+                byte[] value = Encoding.UTF8.GetBytes(session.CachedValue);
+                cachedKeys.Add(key);
+                cachedValues.Add(value);
+                size += 8 + key.Length + value.Length;
+            }
+            else
+            {
+                cachedKeys.Add([]);
+                cachedValues.Add([]);
+            }
+        }
+
+        byte[] buf = new byte[size];
+        int pos = 0;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), logTime);
+        pos += 8;
+        BinaryPrimitives.WriteInt32BigEndian(buf.AsSpan(pos), ids.Count);
+        pos += 4;
+        for (int i = 0; i < ids.Count; i++)
+        {
+            Session session = sessions[ids[i]];
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), session.Id);
+            pos += 8;
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), session.LastSeq);
+            pos += 8;
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), session.AckFloor);
+            pos += 8;
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), session.LastActive);
+            pos += 8;
+            BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), session.TimeoutMillis);
+            pos += 8;
+            buf[pos++] = session.HasCache ? (byte)1 : (byte)0;
+            if (session.HasCache)
+            {
+                WriteBytes(buf, ref pos, cachedKeys[i]);
+                WriteBytes(buf, ref pos, cachedValues[i]);
+            }
+        }
+
+        return buf;
+    }
+
+    private void RestoreSessionTail(byte[] snapshot, ref int pos)
+    {
+        if (snapshot.Length - pos < 12)
+        {
+            throw new ArgumentException("truncated kv session table");
+        }
+
+        _logTime = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+        pos += 8;
+        int count = BinaryPrimitives.ReadInt32BigEndian(snapshot.AsSpan(pos));
+        pos += 4;
+        if (count < 0)
+        {
+            throw new ArgumentException("negative kv session count");
+        }
+
+        var restored = ImmutableDictionary.CreateBuilder<long, Session>();
+        for (int i = 0; i < count; i++)
+        {
+            if (snapshot.Length - pos < (8 * 5) + 1)
+            {
+                throw new ArgumentException("truncated kv session");
+            }
+
+            long id = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            pos += 8;
+            long lastSeq = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            pos += 8;
+            long ackFloor = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            pos += 8;
+            long lastActive = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            pos += 8;
+            long timeout = BinaryPrimitives.ReadInt64BigEndian(snapshot.AsSpan(pos));
+            pos += 8;
+            bool hasCache = snapshot[pos++] != 0;
+            string key = "";
+            string value = "";
+            if (hasCache)
+            {
+                key = ReadUtf8(snapshot, ref pos);
+                value = ReadUtf8(snapshot, ref pos);
+            }
+
+            restored[id] = new Session(id, lastSeq, ackFloor, lastActive, timeout, hasCache, key, value);
+        }
+
+        _sessions = restored.ToImmutable();
+        if (pos != snapshot.Length)
+        {
+            throw new ArgumentException("trailing bytes after kv session table");
+        }
+    }
+
+    private sealed record Session(
+        long Id,
+        long LastSeq,
+        long AckFloor,
+        long LastActive,
+        long TimeoutMillis,
+        bool HasCache,
+        string CachedKey,
+        string CachedValue);
 
     private static bool IsPtcs(byte[] snapshot)
     {
