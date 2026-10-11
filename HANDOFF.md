@@ -2,7 +2,7 @@
 
 ## State
 
-Branch `commit-2`, rebased on `dcae567` (phase 3 send cancel). Phases 1-3 are accepted. Phase 4 sessions are in. This push fixes the three phase-4 review gaps: leader timestamps across failover, session command errors, and deleting an expired session. Local results are in the chat reply. The PR stays a draft.
+Branch `commit-2`, rebased on `dcae567` (phase 3 send cancel). Phases 1-4 are accepted. This push is phase 5: a seeded simulator in the test project. It does not change production code. Local results are in the chat reply. The PR stays a draft.
 
 Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a graceful FIN. `Send` only enqueues. AppendEntries stay coalesced. No send-progress drop and no `TCP_USER_TIMEOUT`.
 
@@ -21,6 +21,11 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 - The state-machine clock is the max leader timestamp applied. It is already stored in the PTCS version 2 snapshot tail. A new leader anchors to that clock when it is non-zero, then adds elapsed process time. A later lower tick does not move the clock backwards. The first leader in a term with no applied timestamp uses its process clock, so a shifted clock is visible in the log.
 - A session command on a missing or expired session returns `SessionExpired`. A sequence above last+1 and above the ack floor returns `OutOfOrder`. Neither writes the map. `KvClient` returns null and does not ack the sequence. `SessionExpired` drops the session and registers again on the caller thread, not from the apply hook. A duplicate still returns `None` plus the cached response.
 - Expiry removes the session and its cached response inside apply, after the log clock moves, and before the command is processed. A snapshot taken after that has an empty session table and the same clock. A seq at or below the ack floor is still discarded and is not one of these errors.
+- The simulator runs four nodes on one thread. One splitmix seed drives delay, drop, duplicate, reorder, partition, crash/restart, and per-node clock rate. Durable log and term/vote stay. The `RaftNode` is discarded on crash. `SameSeed_reproducesTraceHash` compares trace hashes.
+- After every step the simulator checks Election Safety, Leader Append-Only, Log Matching, Leader Completeness, State Machine Safety, and that a live node's commit index does not move backwards. Client histories store invoke and complete with the simulator timestamp. There is no linearizability checker in this phase.
+- Faults stop at two thirds of the steps. Later steps advance a healed network. A leader and a committed session put are required by the end. `PushSeeds_holdInvariants` runs `SIM_COUNT` seeds, or 200 when unset. A failure prints `SIM_SEED=<n> dotnet test ... --filter FullyQualifiedName~SimSeed_replaysEnvironmentSeed`.
+- Local 200 seeds took 354 ms. `.github/workflows/sim-nightly.yml` is manual and nightly and sets `SIM_COUNT=10000`.
+- Skipping `CandidateLogUpToDate` made seed 332 fail State Machine Safety (`state machine diverged at 4`). That edit was reverted. Seed 332 passes with the real check. The 200 push seeds did not schedule that election. The nightly run includes seed 332. No production bug was found.
 
 ## CI
 
@@ -30,12 +35,12 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 
 `91b7aeb` push 37839924014: Ubuntu `SilentPeer` not released; Windows `ConnectFailuresAndReset` timed out "put committed". Pull request 37839929476: Ubuntu also failed `SlowReader` and `SlowButLiveReader`; Windows passed.
 
-Phase 4 CI for `3dcb8f0` was green on Ubuntu and Windows for both push and pull_request. The review push's CI is recorded in the chat reply.
+Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and Windows for both push and pull_request. Phase 5 CI is recorded in the chat reply.
 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for this review is 3. This is the first push of the three fixes. No phase after 4 is started. The PR stays a draft.
+- Repair cap for phase 5 is 3. This is the first push. No phase after 5 is started. The PR stays a draft.
 
 ## Files
 
@@ -57,3 +62,9 @@ Phase 4 CI for `3dcb8f0` was green on Ubuntu and Windows for both push and pull_
 - `tests/Synkrolyn.Tests/Raft/ClusterHarness.cs:25-40` optional per-node clock
 - `tests/Synkrolyn.Tests/Kv/KvSessionTests.cs:113-192` skew, dropped writes, and removal
 - `tests/Synkrolyn.Tests/Kv/KvSessionTests.cs:216-300` skewed-leader helper and `ShiftedClock`
+- `tests/Synkrolyn.Tests/Sim/DeterministicSimulator.cs:11-36` client history and `SimResult`
+- `tests/Synkrolyn.Tests/Sim/DeterministicSimulator.cs:42-123` seeded run and healed liveness steps
+- `tests/Synkrolyn.Tests/Sim/DeterministicSimulator.cs:492-760` invariant checks after every step
+- `tests/Synkrolyn.Tests/Sim/DeterministicSimulator.cs:830-938` simulated network
+- `tests/Synkrolyn.Tests/Sim/DeterministicSimulatorTests.cs:7-70` trace hash, history, liveness, 200 seeds
+- `.github/workflows/sim-nightly.yml` 10k seeds, manual or nightly
