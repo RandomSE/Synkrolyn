@@ -890,13 +890,13 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// <summary>How many liveness probes have started. Tests use this to see the probe is inside.</summary>
     internal static int ProbeEntered;
 
-    /// <summary>Pending send waits that have started. Tests use this to see a writer blocked in send.</summary>
+    /// <summary>Pending send waits that have started on this transport. Tests use this to see a writer blocked in send.</summary>
     internal int SendWaits;
 
-    /// <summary>Pending send waits that have returned. Tests compare this with <see cref="SendWaits"/>.</summary>
+    /// <summary>Pending send waits that have returned on this transport. Tests compare this with <see cref="SendWaits"/>.</summary>
     internal int SendDones;
 
-    /// <summary>Timestamp of the latest socket abort, or 0. Tests measure send completion against it.</summary>
+    /// <summary>Timestamp of this transport's latest socket abort, or 0. Tests measure send completion against it.</summary>
     internal long AbortTicks;
 
     private static readonly Queue<string> Notes = new();

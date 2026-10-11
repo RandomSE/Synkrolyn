@@ -373,6 +373,64 @@ public class SocketDeliveryTests
     }
 
     [Fact]
+    public void BlockedSend_counterIsPerTransport()
+    {
+        using var idle = new SocketTransport("idle", new RpcWireCodec());
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        listener.Start();
+        using var busy = new SocketTransport("busy", new RpcWireCodec());
+        SetPeerDead(busy, TimeSpan.FromSeconds(30));
+        busy.Bind();
+        busy.Start();
+        busy.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        busy.Send("busy", "b", new RequestVote(1, "busy", 0, 0));
+        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        accepted.ReceiveBufferSize = 1024;
+        Assert.True(WaitFor(() => Outbound(busy) is not null));
+        accepted.Client.ReceiveBufferSize = 1;
+        Outbound(busy)!.Client.SendBufferSize = 1;
+        int idleBefore = SendWaitsOf(idle);
+        int busyBefore = SendWaitsOf(busy);
+        bool blocked = false;
+        foreach (int commandLength in new[] { 256 * 1024, 512 * 1024, 900_000 })
+        {
+            int waits = SendWaitsOf(busy);
+            byte[] command = new byte[commandLength];
+            command[0] = 4;
+            Assert.True(busy.Send("busy", "b", new AppendEntries(1, "busy", 0, 0, [new LogEntry(1, 1, command)], 0)));
+            if (WaitFor(() => SendWaitsOf(busy) > waits, TimeSpan.FromMilliseconds(500)))
+            {
+                blocked = true;
+                break;
+            }
+        }
+
+        Assert.True(blocked, "send never blocked on the silent reader");
+        Assert.True(SendWaitsOf(busy) > busyBefore);
+        Assert.Equal(idleBefore, SendWaitsOf(idle));
+    }
+
+    /// <summary>
+    /// Reads the send-wait counter for one transport. A static field is the bug:
+    /// every transport then reports the process-wide total.
+    /// </summary>
+    private static int SendWaitsOf(SocketTransport transport)
+    {
+        FieldInfo? field = typeof(SocketTransport).GetField(
+            "SendWaits",
+            BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+        Assert.NotNull(field);
+        if (field!.IsStatic)
+        {
+            return (int)field.GetValue(null)!;
+        }
+
+        return (int)field.GetValue(transport)!;
+    }
+
+    [Fact]
     public void BlockedSend_completesWithin250msOfAbort()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
