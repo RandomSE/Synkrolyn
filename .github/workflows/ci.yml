@@ -28,3 +28,42 @@ jobs:
           else
             echo "tlc not on PATH; skipping TLA+ model check"
           fi
+
+  tlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Cache tla2tools.jar
+        id: tla-jar
+        uses: actions/cache@v4
+        with:
+          path: spec/tla2tools.jar
+          key: tla2tools-1.8.0
+      - name: Download tla2tools.jar
+        if: steps.tla-jar.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p spec
+          curl -fsSL -o spec/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: Verify tla2tools checksum
+        run: echo "7beec0f04818732a62fa193731711a99aa4f11279499b2360a7d156c519ea78d  spec/tla2tools.jar" | sha256sum -c -
+      - name: TLC real config
+        run: java -jar spec/tla2tools.jar -cleanup -workers auto -config tla/MC.cfg tla/Synkrolyn.tla
+      - name: TLC bug config must fail
+        run: |
+          set +e
+          java -jar spec/tla2tools.jar -cleanup -workers auto -config tla/MCBug.cfg tla/Synkrolyn.tla > /tmp/tlc-bug.txt
+          code=$?
+          cat /tmp/tlc-bug.txt
+          if ! grep -q "is violated" /tmp/tlc-bug.txt; then
+            echo "buggy config must produce a counterexample"
+            exit 1
+          fi
+          if [ "$code" -eq 0 ]; then
+            echo "buggy config must exit non-zero"
+            exit 1
+          fi

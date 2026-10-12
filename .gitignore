@@ -8,3 +8,6 @@ obj/
 TestResults/
 artifacts/
 .dotnet/
+spec/tla2tools.jar
+states/
+*_TTrace_*
