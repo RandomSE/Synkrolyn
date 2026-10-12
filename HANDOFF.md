@@ -32,7 +32,7 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 - Skipping `CandidateLogUpToDate` made seed 332 fail State Machine Safety (`state machine diverged at 4`). That edit was reverted. Seed 332 passes with the real check.
 - Acking AppendEntries before `Force` failed seed 1 with `append ack before flush n2 index 1`. Granting a vote before `RecordVote` failed seed 1 with `vote grant before flush n3 term 1`. Both edits were reverted and are not in this commit.
 - Seed 63 elected no leader. Every voter stayed a pre-candidate. A pre-candidate refused a higher node id even when that node had the longer log, so the best log could not win. `OnPreVote` still refuses a higher id when the logs are tied. It grants when the candidate log is strictly newer. Seed 63 passes.
-- `tla/Synkrolyn.tla` models PreVote, check-quorum, election, replication, current-term commit, the restart vote gate, and a lease read. Entries are terms. A mismatch drops the follower's last entry. `tla/MC.cfg` is 3 servers, term at most 2, log length at most 2. Local TLC found no error: 3,016,397 distinct states, depth 35, 1 min 38 s. `tla/MCBug.cfg` commits a prior-term entry from a five-server figure-8 state and violates LeaderCompleteness (9 distinct states). Ack expiry after a quorum is not a separate action.
+- `tla/Synkrolyn.tla` models PreVote, check-quorum, election, replication, current-term commit, the restart vote gate, and a lease read. Entries are terms. A mismatch drops the follower's last entry. `tla/MC.cfg` is 3 servers, term at most 2, log length at most 2. Local TLC found no error: 3,016,397 distinct states, depth 35, about 1 min 35 s. `tla/MCBug.cfg` commits a prior-term entry from a five-server figure-8 state and violates LeaderCompleteness (20 distinct states). Ack expiry after a quorum is not a separate action. Action names stay `BecomeLeader(s)`, `ClientAppend(s)`, and `Force(s)` because `TlaSpecTests` anchors on those strings.
 
 ## CI
 
@@ -47,7 +47,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 7 is 3. This is the first push. No phase after 7 is started. The PR stays a draft.
+- Repair cap for phase 7 is 3. The first push failed one spec-text test. This push is repair cycle 1. No phase after 7 is started. The PR stays a draft.
 
 ## Files
 

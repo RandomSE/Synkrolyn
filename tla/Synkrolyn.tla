@@ -27,12 +27,12 @@ Roles == {Follower, Candidate, Leader}
 VARIABLES currentTerm, votedFor, log, commitIndex, role,
           votesGranted, forcedIndex,
           preCand, preVotes, restartGate, contact, acked,
-          readPrefix, bugStep
+          readPrefix
 
 vars == <<currentTerm, votedFor, log, commitIndex, role,
           votesGranted, forcedIndex,
           preCand, preVotes, restartGate, contact, acked,
-          readPrefix, bugStep>>
+          readPrefix>>
 
 MinNat(a, b) == IF a <= b THEN a ELSE b
 MaxNat(a, b) == IF a >= b THEN a ELSE b
@@ -94,7 +94,6 @@ TypeOK ==
   /\ acked \in [Server -> SUBSET Server]
   /\ readPrefix \in Seq(1..MaxTerm)
   /\ Len(readPrefix) <= MaxLogLen
-  /\ bugStep \in 0..8
 
 ElectionSafety ==
   \A t \in 0..MaxTerm :
@@ -150,7 +149,6 @@ Init ==
   /\ contact = [s \in Server |-> FALSE]
   /\ acked = [s \in Server |-> {}]
   /\ readPrefix = << >>
-  /\ bugStep = 0
 
 \* Figure 8, just before the bad commit. n1..n3 hold term 2; n4..n5 hold term 3.
 InitBug ==
@@ -171,10 +169,9 @@ InitBug ==
         /\ contact = [s \in Server |-> FALSE]
         /\ acked = [s \in Server |-> IF s = a THEN {a, b, c} ELSE {}]
         /\ readPrefix = << >>
-        /\ bugStep = 0
 
 \* Election deadline. Does not increment the term; BeginPreVote does not either.
-Timeout(s, step) ==
+Timeout(s) ==
   /\ role[s] \in {Follower, Candidate}
   /\ ~restartGate[s]
   /\ currentTerm[s] < MaxTerm
@@ -184,11 +181,10 @@ Timeout(s, step) ==
   /\ preCand' = [preCand EXCEPT ![s] = TRUE]
   /\ preVotes' = [preVotes EXCEPT ![s] = {s}]
   /\ contact' = [contact EXCEPT ![s] = FALSE]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
                  forcedIndex, restartGate, acked, readPrefix>>
 
-PreVote(from, to, step) ==
+PreVote(from, to) ==
   /\ from # to
   /\ preCand[from]
   /\ role[from] # Leader
@@ -204,11 +200,10 @@ PreVote(from, to, step) ==
                     ELSE IF p = to THEN {}
                     ELSE preVotes[p]]
   /\ preCand' = [preCand EXCEPT ![to] = FALSE]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
                  forcedIndex, restartGate, contact, acked, readPrefix>>
 
-BeginElection(s, step) ==
+BeginElection(s) ==
   /\ preCand[s]
   /\ Cardinality(preVotes[s]) >= Majority
   /\ currentTerm[s] < MaxTerm
@@ -218,11 +213,10 @@ BeginElection(s, step) ==
   /\ votesGranted' = [votesGranted EXCEPT ![s] = {s}]
   /\ preCand' = [preCand EXCEPT ![s] = FALSE]
   /\ preVotes' = [preVotes EXCEPT ![s] = {}]
-  /\ bugStep' = step
   /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate,
                  contact, acked, readPrefix>>
 
-RequestVote(from, to, step) ==
+RequestVote(from, to) ==
   /\ from # to
   /\ role[from] = Candidate
   /\ ~preCand[from]
@@ -235,7 +229,6 @@ RequestVote(from, to, step) ==
         /\ preVotes' = [preVotes EXCEPT ![from] = {}]
         /\ contact' = [contact EXCEPT ![from] = FALSE]
         /\ acked' = [acked EXCEPT ![from] = {}]
-        /\ bugStep' = step
         /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
      \/ /\ currentTerm[from] >= currentTerm[to]
         /\ ~VoteBlocked(to)
@@ -260,10 +253,9 @@ RequestVote(from, to, step) ==
                                               ELSE votesGranted[from]]
               /\ acked' = [acked EXCEPT ![to] =
                              IF higher /\ role[to] = Leader THEN {} ELSE acked[to]]
-              /\ bugStep' = step
               /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
 
-BecomeLeader(s, step) ==
+BecomeLeader(s) ==
   /\ role[s] = Candidate
   /\ ~preCand[s]
   /\ Cardinality(votesGranted[s]) >= Majority
@@ -275,34 +267,30 @@ BecomeLeader(s, step) ==
         /\ acked' = [acked EXCEPT ![s] = {s}]
         /\ preCand' = [preCand EXCEPT ![s] = FALSE]
         /\ preVotes' = [preVotes EXCEPT ![s] = {}]
-        /\ bugStep' = step
         /\ UNCHANGED <<currentTerm, votedFor, commitIndex, forcedIndex,
                        restartGate, contact, readPrefix>>
 
-ClientAppend(s, step) ==
+ClientAppend(s) ==
   /\ role[s] = Leader
   /\ currentTerm[s] \in 1..MaxTerm
   /\ Len(log[s]) < MaxLogLen
   /\ log' = [log EXCEPT ![s] = Append(@, currentTerm[s])]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, commitIndex, role, votesGranted,
                  forcedIndex, preCand, preVotes, restartGate,
                  contact, acked, readPrefix>>
 
-Force(s, step) ==
+Force(s) ==
   /\ forcedIndex[s] < Len(log[s])
   /\ forcedIndex' = [forcedIndex EXCEPT ![s] = Len(log[s])]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
                  preCand, preVotes, restartGate, contact, acked, readPrefix>>
 
-AdvanceCommit(s, step) ==
+AdvanceCommit(s) ==
   /\ role[s] = Leader
   /\ LET ns == {n \in (commitIndex[s] + 1)..Len(log[s]) : CanCommit(s, n)}
      IN /\ ns # {}
         /\ commitIndex' = [commitIndex EXCEPT ![s] =
                              CHOOSE n \in ns : \A m \in ns : m <= n]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, role, votesGranted,
                  forcedIndex, preCand, preVotes, restartGate, contact, acked, readPrefix>>
 
@@ -311,7 +299,7 @@ IsPrefix(a, b) ==
   /\ Len(a) <= Len(b)
   /\ \A i \in 1..Len(a) : a[i] = b[i]
 
-AppendEntries(s, t, step) ==
+AppendEntries(s, t) ==
   /\ s # t
   /\ role[s] = Leader
   /\ \/ /\ currentTerm[s] < currentTerm[t]
@@ -323,7 +311,6 @@ AppendEntries(s, t, step) ==
         /\ preVotes' = [preVotes EXCEPT ![s] = {}]
         /\ contact' = [contact EXCEPT ![s] = FALSE]
         /\ acked' = [acked EXCEPT ![s] = {}]
-        /\ bugStep' = step
         /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
      \/ /\ currentTerm[s] >= currentTerm[t]
         /\ \/ role[t] # Leader
@@ -365,10 +352,9 @@ AppendEntries(s, t, step) ==
               /\ preVotes' = [preVotes EXCEPT ![t] = {}]
               /\ contact' = [contact EXCEPT ![t] = TRUE]
               /\ acked' = [acked EXCEPT ![s] = acked[s] \union {t}]
-              /\ bugStep' = step
               /\ UNCHANGED <<restartGate, readPrefix>>
 
-CheckQuorum(s, step) ==
+CheckQuorum(s) ==
   /\ role[s] = Leader
   /\ Cardinality(acked[s]) < Majority
   /\ role' = [role EXCEPT ![s] = Follower]
@@ -377,13 +363,12 @@ CheckQuorum(s, step) ==
   /\ preVotes' = [preVotes EXCEPT ![s] = {}]
   /\ contact' = [contact EXCEPT ![s] = FALSE]
   /\ acked' = [acked EXCEPT ![s] = {}]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, forcedIndex,
                  restartGate, readPrefix>>
 
 \* Crash. Durable term, vote, and forced prefix stay. The unforced suffix is dropped.
 \* Start then sets leader contact and the restart vote window.
-Restart(s, step) ==
+Restart(s) ==
   /\ currentTerm[s] > 0
   /\ LET kept == IF forcedIndex[s] = 0 THEN << >>
                  ELSE SubSeq(log[s], 1, forcedIndex[s])
@@ -405,19 +390,17 @@ Restart(s, step) ==
         /\ preVotes' = [preVotes EXCEPT ![s] = {}]
         /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
         /\ acked' = [acked EXCEPT ![s] = {}]
-        /\ bugStep' = step
         /\ UNCHANGED <<currentTerm, votedFor, forcedIndex, readPrefix>>
 
-ExpireRestartGate(s, step) ==
+ExpireRestartGate(s) ==
   /\ restartGate[s]
   /\ restartGate' = [restartGate EXCEPT ![s] = FALSE]
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
                  forcedIndex, preCand, preVotes, contact, acked, readPrefix>>
 
 \* Lease read. Observes the committed prefix once a current-term entry is
 \* committed and a quorum of append acks is fresh. Apply lag is not separate.
-Read(s, step) ==
+Read(s) ==
   /\ role[s] = Leader
   /\ Cardinality(acked[s]) >= Majority
   /\ IF commitIndex[s] < 1 THEN FALSE
@@ -426,48 +409,39 @@ Read(s, step) ==
      IN /\ Len(prefix) >= Len(readPrefix)
         /\ prefix # readPrefix
         /\ readPrefix' = prefix
-  /\ bugStep' = step
   /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
                  forcedIndex, preCand, preVotes, restartGate, contact, acked>>
 
 FullNext ==
-  \/ \E s \in Server : Timeout(s, bugStep)
-  \/ \E from, to \in Server : PreVote(from, to, bugStep)
-  \/ \E s \in Server : BeginElection(s, bugStep)
-  \/ \E from, to \in Server : RequestVote(from, to, bugStep)
-  \/ \E s \in Server : BecomeLeader(s, bugStep)
-  \/ \E s \in Server : ClientAppend(s, bugStep)
-  \/ \E s \in Server : Force(s, bugStep)
-  \/ \E s \in Server : AdvanceCommit(s, bugStep)
-  \/ \E s, t \in Server : AppendEntries(s, t, bugStep)
-  \/ \E s \in Server : CheckQuorum(s, bugStep)
-  \/ \E s \in Server : Restart(s, bugStep)
-  \/ \E s \in Server : ExpireRestartGate(s, bugStep)
-  \/ \E s \in Server : Read(s, bugStep)
+  \/ \E s \in Server : Timeout(s)
+  \/ \E from, to \in Server : PreVote(from, to)
+  \/ \E s \in Server : BeginElection(s)
+  \/ \E from, to \in Server : RequestVote(from, to)
+  \/ \E s \in Server : BecomeLeader(s)
+  \/ \E s \in Server : ClientAppend(s)
+  \/ \E s \in Server : Force(s)
+  \/ \E s \in Server : AdvanceCommit(s)
+  \/ \E s, t \in Server : AppendEntries(s, t)
+  \/ \E s \in Server : CheckQuorum(s)
+  \/ \E s \in Server : Restart(s)
+  \/ \E s \in Server : ExpireRestartGate(s)
+  \/ \E s \in Server : Read(s)
 
-\* One path: bad commit, then the term-3 log wins the election and appends.
+\* Bad commit, then the term-3 log wins the election and appends.
 BugNext ==
   IF Cardinality(Server) < 5 THEN FALSE
   ELSE LET a == Named("n1")
            b == Named("n2")
            d == Named("n4")
            e == Named("n5")
-       IN \/ /\ bugStep = 0
-             /\ AdvanceCommit(a, 1)
-          \/ /\ bugStep = 1
-             /\ Timeout(d, 2)
-          \/ /\ bugStep = 2
-             /\ PreVote(d, e, 3)
-          \/ /\ bugStep = 3
-             /\ PreVote(d, b, 4)
-          \/ /\ bugStep = 4
-             /\ BeginElection(d, 5)
-          \/ /\ bugStep = 5
-             /\ RequestVote(d, e, 6)
-          \/ /\ bugStep = 6
-             /\ RequestVote(d, b, 7)
-          \/ /\ bugStep = 7
-             /\ BecomeLeader(d, 8)
+       IN \/ AdvanceCommit(a)
+          \/ Timeout(d)
+          \/ PreVote(d, e)
+          \/ PreVote(d, b)
+          \/ BeginElection(d)
+          \/ RequestVote(d, e)
+          \/ RequestVote(d, b)
+          \/ BecomeLeader(d)
 
 \* A follower's vote set and ack set do not affect the next state.
 \* BeginElection and BecomeLeader overwrite them.
@@ -477,7 +451,7 @@ View == <<currentTerm, votedFor, log, commitIndex, role,
           [s \in Server |-> IF preCand[s] THEN preVotes[s] ELSE {}],
           restartGate, contact,
           [s \in Server |-> IF role[s] = Leader THEN acked[s] ELSE {}],
-          readPrefix, bugStep>>
+          readPrefix>>
 
 Next == IF CommitPriorTerms THEN BugNext ELSE FullNext
 
