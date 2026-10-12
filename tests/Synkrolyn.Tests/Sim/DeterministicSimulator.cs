@@ -71,11 +71,17 @@ public static class DeterministicSimulator
             : fallback;
     }
 
-    public static SimResult Run(int seed, int steps)
+    public static SimResult Run(int seed, int steps) => Run(seed, steps, staleReads: false);
+
+    /// <summary>
+    /// <paramref name="staleReads"/> serves gets from a live node's local map.
+    /// That skips ReadIndex and the lease. The linearizability checker should reject it.
+    /// </summary>
+    public static SimResult Run(int seed, int steps, bool staleReads)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(steps);
 
-        var world = new World(seed, steps);
+        var world = new World(seed, steps, staleReads);
         world.Execute();
         return world.Result();
     }
@@ -88,6 +94,7 @@ public static class DeterministicSimulator
 
         private readonly int _steps;
         private readonly int _healAt;
+        private readonly bool _staleReads;
         private readonly SimNet _net;
         private readonly List<SimNode> _nodes;
         private readonly List<SimClient> _clients = [];
@@ -100,16 +107,18 @@ public static class DeterministicSimulator
         private readonly Dictionary<string, (long Term, List<EntryMark> Prefix)> _leaderPrefix = [];
         private readonly List<string?> _healedLeaders = [];
         private readonly Dictionary<int, Pending> _pending = [];
+        private readonly Dictionary<int, (string Key, string Value)> _openPut = [];
         private readonly Dictionary<(string Voter, long Term), string> _grants = [];
         private bool _writeCommitted;
         private bool _healed;
         private bool _pendingSettled = true;
         private string? _safetyFailure;
 
-        public World(int seed, int steps)
+        public World(int seed, int steps, bool staleReads)
         {
             _rng = new SimRng((ulong)(uint)seed + 1UL);
             _steps = steps;
+            _staleReads = staleReads;
             _healAt = steps * 4 / 5;
             _net = new SimNet(_rng);
             _net.CrashSends = true;
@@ -371,6 +380,12 @@ public static class DeterministicSimulator
 
             string key = "k" + _rng.Next(3);
             string value = "v" + client.Id + "-" + step;
+            if (_openPut.TryGetValue(client.Id, out (string Key, string Value) open))
+            {
+                key = open.Key;
+                value = open.Value;
+            }
+
             if (!_healed)
             {
                 PutOnce(client, step, key, value);
@@ -379,6 +394,7 @@ public static class DeterministicSimulator
 
             Record(client.Id, "put", "invoke", key, value);
             string? outcome = Outcome(client, key, value);
+            TrackOpen(client.Id, key, value, outcome);
             if (outcome is null)
             {
                 _pending[client.Id] = new Pending(key, value, step);
@@ -394,20 +410,33 @@ public static class DeterministicSimulator
         {
             if (!Bind(client))
             {
+                string missed = _openPut.ContainsKey(client.Id) ? "null" : "no-leader";
                 Record(client.Id, "put", "invoke", key, value);
-                Record(client.Id, "put", "complete", key, "no-leader");
-                Note(step + " put no-leader");
+                Record(client.Id, "put", "complete", key, missed);
+                TrackOpen(client.Id, key, value, missed);
+                Note(step + " put " + missed);
                 return;
             }
 
             EnsureSession(client);
             Record(client.Id, "put", "invoke", key, value);
-            client.Kv.Put(key, value);
-            Drain();
-            long? done = client.Kv.AwaitCommitted();
-            string text = done is null ? "null" : done.Value.ToString(CultureInfo.InvariantCulture);
-            Record(client.Id, "put", "complete", key, text);
-            Note(step + " put " + client.Id + " " + key + " " + text);
+            try
+            {
+                client.Kv.Put(key, value);
+                Drain();
+                long? done = client.Kv.AwaitCommitted();
+                string text = done is null ? "null" : done.Value.ToString(CultureInfo.InvariantCulture);
+                TrackOpen(client.Id, key, value, text);
+                Record(client.Id, "put", "complete", key, text);
+                Note(step + " put " + client.Id + " " + key + " " + text);
+            }
+            catch (SimCrash)
+            {
+                TrackOpen(client.Id, key, value, "null");
+                Record(client.Id, "put", "complete", key, "null");
+                Note(step + " put crash " + client.Id + " " + key);
+                throw;
+            }
         }
 
         private void SettlePending(int step)
@@ -421,6 +450,7 @@ public static class DeterministicSimulator
                     if (step - op.Since >= PendingBound)
                     {
                         _pendingSettled = false;
+                        TrackOpen(id, op.Key, op.Value, "unsettled");
                         Record(id, "put", "complete", op.Key, "unsettled");
                         finished.Add(id);
                         Note(step + " unsettled " + id);
@@ -429,6 +459,7 @@ public static class DeterministicSimulator
                     continue;
                 }
 
+                TrackOpen(id, op.Key, op.Value, outcome);
                 CompletePut(id, op.Key, outcome);
                 finished.Add(id);
                 Note(step + " settle " + id + " " + outcome);
@@ -438,6 +469,17 @@ public static class DeterministicSimulator
             {
                 _pending.Remove(id);
             }
+        }
+
+        private void TrackOpen(int client, string key, string value, string? outcome)
+        {
+            if (outcome is null or "null" or "unsettled")
+            {
+                _openPut[client] = (key, value);
+                return;
+            }
+
+            _openPut.Remove(client);
         }
 
         private void CompletePut(int client, string key, string outcome)
@@ -698,15 +740,53 @@ public static class DeterministicSimulator
             string result;
             try
             {
-                result = client.Kv.Get(key) ?? "null";
+                result = _staleReads ? StaleRead(key) : LinearizableRead(client, key);
             }
             catch (KvSessionException)
             {
                 result = "expired";
             }
+            catch (SimCrash)
+            {
+                Record(client.Id, "get", "complete", key, "unknown");
+                Note(step + " get crash " + client.Id + " " + key);
+                throw;
+            }
 
             Record(client.Id, "get", "complete", key, result);
-            Note(step + " get " + client.Id + " " + key);
+            Note(step + " get " + client.Id + " " + key + " " + result);
+        }
+
+        private string LinearizableRead(SimClient client, string key)
+        {
+            string? value = client.Kv.LinearizableGet(key);
+            if (value is not null)
+            {
+                return value;
+            }
+
+            SimNode? leader = LiveLeader();
+            if (leader?.Raft is RaftNode raft && raft.Role == Role.Leader && raft.ReadIndexSatisfied())
+            {
+                return "absent";
+            }
+
+            return "unknown";
+        }
+
+        private string StaleRead(string key)
+        {
+            int start = _rng.Next(_nodes.Count);
+            for (int i = 0; i < _nodes.Count; i++)
+            {
+                SimNode node = _nodes[(start + i) % _nodes.Count];
+                if (node.Live)
+                {
+                    return node.Store.Get(key) ?? "absent";
+                }
+            }
+
+            return "unknown";
         }
 
         private void EnsureSession(SimClient client)
@@ -1126,17 +1206,23 @@ public static class DeterministicSimulator
 
         private static bool Covers(SimNode node, long index, long term, int hash)
         {
+            // Marks inside a snapshot are the pre-compact entry and can disagree with the installed snapshot.
+            if (index < node.Log.LastIncludedIndex)
+            {
+                return true;
+            }
+
+            if (index == node.Log.LastIncludedIndex)
+            {
+                return node.Log.LastIncludedTerm == term;
+            }
+
             if (node.Log.TryMark(index, out EntryMark mark))
             {
                 return mark.Term == term && mark.Hash == hash;
             }
 
-            if (node.Log.LastIncludedIndex == index)
-            {
-                return node.Log.LastIncludedTerm == term;
-            }
-
-            return node.Log.LastIncludedIndex > index;
+            return false;
         }
 
         private void Remember(string name, Dictionary<long, (long Term, int Hash)> table, EntryMark mark)

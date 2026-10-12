@@ -2,7 +2,7 @@ using Synkrolyn.Raft;
 
 namespace Synkrolyn.Tests.Sim;
 
-/// <summary>Seeded cluster simulation. Phase 6 reads <see cref="SimResult.History"/> and does not live here.</summary>
+/// <summary>Seeded cluster simulation. Every seed's history is checked for linearizability.</summary>
 public sealed class DeterministicSimulatorTests
 {
     [Fact]
@@ -87,6 +87,7 @@ public sealed class DeterministicSimulatorTests
         Assert.True(result.CommitsAligned);
         Assert.True(result.PendingSettled);
         Assert.True(result.ReplicasEqual);
+        Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.CheckHistory(result.History));
     }
 
     [Fact]
@@ -105,12 +106,29 @@ public sealed class DeterministicSimulatorTests
                 Assert.True(result.CommitsAligned, "commit");
                 Assert.True(result.PendingSettled, "pending");
                 Assert.True(result.ReplicasEqual, "replicas");
+                LinVerdict verdict = LinearizabilityChecker.CheckHistory(result.History);
+                Assert.True(verdict == LinVerdict.Linearizable, verdict + " " + LinearizabilityChecker.Conflict(result.History));
             }
             catch (Exception ex)
             {
                 throw new Xunit.Sdk.XunitException(DeterministicSimulator.ReproLine(seed) + " " + ex.Message, ex);
             }
         }
+    }
+
+    [Fact]
+    public void StaleLocalRead_isViolationOnSomeSeed()
+    {
+        for (int seed = 1; seed <= 40; seed++)
+        {
+            SimResult result = DeterministicSimulator.Run(seed, steps: 400, staleReads: true);
+            if (LinearizabilityChecker.CheckHistory(result.History) == LinVerdict.Violation)
+            {
+                return;
+            }
+        }
+
+        Assert.Fail("stale local reads were linearizable on seeds 1..40");
     }
 
     [Fact]
@@ -129,5 +147,7 @@ public sealed class DeterministicSimulatorTests
         Assert.True(result.CommitsAligned, "commit");
         Assert.True(result.PendingSettled, "pending");
         Assert.True(result.ReplicasEqual, "replicas");
+        LinVerdict verdict = LinearizabilityChecker.CheckHistory(result.History);
+        Assert.True(verdict == LinVerdict.Linearizable, verdict + " " + LinearizabilityChecker.Conflict(result.History));
     }
 }
