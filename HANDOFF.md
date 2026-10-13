@@ -2,7 +2,7 @@
 
 ## State
 
-Branch `commit-2`, rebased on `dcae567` (phase 3 send cancel). Phases 1-6 are accepted. This push is phase 7: a bounded TLA+ model of Raft, checked by TLC in a new Ubuntu CI job. No production change. Local TLC numbers are in the chat reply. The PR stays a draft.
+Branch `commit-2`, rebased on `dcae567` (phase 3 send cancel). Phases 1-7 are accepted. This push is phase 8: Prytolyn test parity and a scoped Stryker.NET run. No production change. Local mutation numbers are in the chat reply. The PR stays a draft.
 
 Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a graceful FIN. `Send` only enqueues. AppendEntries stay coalesced. No send-progress drop and no `TCP_USER_TIMEOUT`.
 
@@ -33,6 +33,7 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 - Acking AppendEntries before `Force` failed seed 1 with `append ack before flush n2 index 1`. Granting a vote before `RecordVote` failed seed 1 with `vote grant before flush n3 term 1`. Both edits were reverted and are not in this commit.
 - Seed 63 elected no leader. Every voter stayed a pre-candidate. A pre-candidate refused a higher node id even when that node had the longer log, so the best log could not win. `OnPreVote` still refuses a higher id when the logs are tied. It grants when the candidate log is strictly newer. Seed 63 passes.
 - `tla/Synkrolyn.tla` models PreVote, check-quorum, election, replication, current-term commit, the restart vote gate, and a lease read. Entries are terms. A mismatch drops the follower's last entry. `tla/MC.cfg` is 3 servers, term at most 2, log length at most 2. Local TLC found no error: 3,016,397 distinct states, depth 35, about 1 min 35 s. `tla/MCBug.cfg` commits a prior-term entry from a five-server figure-8 state and violates LeaderCompleteness (20 distinct states). Ack expiry after a quorum is not a separate action. Action names stay `BecomeLeader(s)`, `ClientAppend(s)`, and `Force(s)` because `TlaSpecTests` anchors on those strings.
+- `docs/test-parity.md` maps each of the 297 Prytolyn tests to a Synkrolyn test, or N/A. New tests cover clock bounds, vote rules, log edges, codec and frame rejection, delta snapshots, transport guards, a five-node election, joint quorum, and a strictly newer pre-vote. Stryker.NET 5.0.0 is pinned. Basic mutations cover Kv, RaftNode, the in-memory log and vote, membership codecs, FrameCodec, InMemoryTransport, and RpcWireCodec. PushSeeds, the stale-read seed, and socket tests are filtered out. Local score moved from 61.92% to 63.07% in 7 min 44 s. Break threshold is 60. Equivalent mutants are listed in that doc.
 
 ## CI
 
@@ -47,7 +48,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 7 is 3. The first push failed one spec-text test. This push is repair cycle 1. No phase after 7 is started. The PR stays a draft.
+- Repair cap for phase 8 is 3. This push is the first. No phase after 8 is started. The PR stays a draft.
 
 ## Files
 
@@ -86,3 +87,8 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `tla/MCBug.cfg` prior-term commit, five-server figure 8
 - `spec/README.md` action to C# method map
 - `.github/workflows/ci.yml:32-69` Ubuntu TLC job, pinned tla2tools 1.8.0
+- `docs/test-parity.md` one Prytolyn test per line, plus equivalent mutants
+- `tests/Synkrolyn.Tests/Raft/PrytolynParityTests.cs:1-563` parity and mutant-killing tests
+- `dotnet-tools.json` Stryker.NET 5.0.0
+- `stryker-config.json` Basic mutations, break 60
+- `.github/workflows/ci.yml:72-83` Ubuntu Stryker job on pull_request

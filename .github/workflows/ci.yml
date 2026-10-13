@@ -67,3 +67,17 @@ jobs:
             echo "buggy config must exit non-zero"
             exit 1
           fi
+
+  stryker:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore local tools
+        run: dotnet tool restore
+      - name: Stryker
+        run: dotnet stryker --config-file stryker-config.json
