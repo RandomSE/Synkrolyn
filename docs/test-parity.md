@@ -302,7 +302,7 @@ WaveERuntimeAndGroupCommitTest.java::membershipCodec_roundtripAddPromoteRemove -
 
 ## Equivalent mutants
 
-Stryker 5.0.0, mutation level Basic, on Kv, RaftNode, the in-memory log and vote, membership codecs, FrameCodec, InMemoryTransport, and RpcWireCodec. PushSeeds, the stale-read seed, and socket tests are excluded so the run stays under 10 minutes. These survivors are equivalent:
+Stryker 5.0.0, mutation level Basic. The timed CI scope is Kv, the in-memory log and vote, MembershipCodec, InMemoryTransport, and `RaftNode.cs` lines 1-1899 (election, propose, pre-vote, and the start of append). Snapshot install and the later helpers are outside that span. PushSeeds, the stale-read seed, and socket tests are excluded. The wide run scored 61.92% then 63.07% after the gap tests (7 min 44 s locally) and took 14 min 11 s in CI, so the span above is what CI breaks on. These survivors are equivalent:
 
 - `RaftNode.ResetElectionDeadline`: `span > 2T` replaced with `span >= 2T`, and `span < T` with `span <= T`. Both ends assign that same bound.
 - `RaftNode.Majority`: `voters <= 0` replaced with `voters < 0`. The count is never negative.

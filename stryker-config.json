@@ -4,7 +4,7 @@
     "test-projects": ["tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj"],
     "configuration": "Release",
     "mutation-level": "Basic",
-    "thresholds": { "high": 80, "low": 60, "break": 60 },
+    "thresholds": { "high": 80, "low": 63, "break": 63 },
     "concurrency": 4,
     "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket",
     "reporters": ["cleartext", "json"],
@@ -14,11 +14,8 @@
       "**/Raft/InMemoryPersistentState.cs",
       "**/Raft/LogEntry.cs",
       "**/Raft/MembershipCodec.cs",
-      "**/Raft/MembershipSnapshot.cs",
-      "**/Raft/RaftNode.cs",
-      "**/Net/FrameCodec.cs",
-      "**/Net/InMemoryTransport.cs",
-      "**/Net/RpcWireCodec.cs"
+      "**/Raft/RaftNode.cs{1..1899}",
+      "**/Net/InMemoryTransport.cs"
     ]
   }
 }

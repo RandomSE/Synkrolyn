@@ -33,7 +33,7 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 - Acking AppendEntries before `Force` failed seed 1 with `append ack before flush n2 index 1`. Granting a vote before `RecordVote` failed seed 1 with `vote grant before flush n3 term 1`. Both edits were reverted and are not in this commit.
 - Seed 63 elected no leader. Every voter stayed a pre-candidate. A pre-candidate refused a higher node id even when that node had the longer log, so the best log could not win. `OnPreVote` still refuses a higher id when the logs are tied. It grants when the candidate log is strictly newer. Seed 63 passes.
 - `tla/Synkrolyn.tla` models PreVote, check-quorum, election, replication, current-term commit, the restart vote gate, and a lease read. Entries are terms. A mismatch drops the follower's last entry. `tla/MC.cfg` is 3 servers, term at most 2, log length at most 2. Local TLC found no error: 3,016,397 distinct states, depth 35, about 1 min 35 s. `tla/MCBug.cfg` commits a prior-term entry from a five-server figure-8 state and violates LeaderCompleteness (20 distinct states). Ack expiry after a quorum is not a separate action. Action names stay `BecomeLeader(s)`, `ClientAppend(s)`, and `Force(s)` because `TlaSpecTests` anchors on those strings.
-- `docs/test-parity.md` maps each of the 297 Prytolyn tests to a Synkrolyn test, or N/A. New tests cover clock bounds, vote rules, log edges, codec and frame rejection, delta snapshots, transport guards, a five-node election, joint quorum, and a strictly newer pre-vote. Stryker.NET 5.0.0 is pinned. Basic mutations cover Kv, RaftNode, the in-memory log and vote, membership codecs, FrameCodec, InMemoryTransport, and RpcWireCodec. PushSeeds, the stale-read seed, and socket tests are filtered out. Local score moved from 61.92% to 63.07% in 7 min 44 s. Break threshold is 60. Equivalent mutants are listed in that doc.
+- `docs/test-parity.md` maps each of the 297 Prytolyn tests to a Synkrolyn test, or N/A. New tests cover clock bounds, vote rules, log edges, codec and frame rejection, delta snapshots, transport guards, a five-node election, joint quorum, and a strictly newer pre-vote. Stryker.NET 5.0.0 is pinned. A wide Basic run scored 61.92% then 63.07% after those tests (7 min 44 s locally) and took 14 min 11 s on the pull-request runner. CI now mutates Kv, the in-memory log and vote, MembershipCodec, InMemoryTransport, and `RaftNode.cs` lines 1-1899. That scope scored 67.32% in 2 min 52 s locally. Break threshold is 63. Equivalent mutants are listed in that doc.
 
 ## CI
 
@@ -48,7 +48,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 8 is 3. This push is the first. No phase after 8 is started. The PR stays a draft.
+- Repair cap for phase 8 is 3. The first push was green, and its Stryker job took 14 min 11 s. This push narrows the mutation span. No phase after 8 is started. The PR stays a draft.
 
 ## Files
 
@@ -90,5 +90,5 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `docs/test-parity.md` one Prytolyn test per line, plus equivalent mutants
 - `tests/Synkrolyn.Tests/Raft/PrytolynParityTests.cs:1-563` parity and mutant-killing tests
 - `dotnet-tools.json` Stryker.NET 5.0.0
-- `stryker-config.json` Basic mutations, break 60
+- `stryker-config.json` Basic mutations, RaftNode lines 1-1899, break 63
 - `.github/workflows/ci.yml:72-83` Ubuntu Stryker job on pull_request
