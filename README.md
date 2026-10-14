@@ -45,3 +45,4 @@ The host binds three loopback nodes, waits for one leader, puts `hello` to `worl
 - `docs/testing.md`: clock, chaos, and socket tests
 - `docs/membership.md`: learners, single-server changes, joint consensus
 - `docs/tla.md`: what the model covers and how to run TLC
+- `docs/benchmarks.md`: loopback latency, throughput, election, and allocation versus commit `9ae58dd`

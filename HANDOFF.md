@@ -2,7 +2,11 @@
 
 ## State
 
-Branch `commit-2`, rebased on `dcae567` (phase 3 send cancel). Phases 1-7 are accepted. This push is phase 8: Prytolyn test parity and a scoped Stryker.NET run. No production change. Local mutation numbers are in the chat reply. The PR stays a draft.
+Branch `commit-2`. Phases 1-8 are on this branch. This push is phase 9: a loopback benchmark harness against commit-1 `9ae58dd`. No production change. The PR stays a draft.
+
+`bench/Synkrolyn.Bench` is an executable, not a test project. `dotnet test` does not run it. `.github/workflows/bench.yml` is `workflow_dispatch` only. Numbers, machine info, and findings are in `docs/benchmarks.md`.
+
+Findings, not fixed here: commit p99 about 30 ms versus about 3 to 6 ms; lease-read p50 about 0.37 us versus 0.17 us; election p99 about 280 ms versus about 153 ms. Write throughput is higher (about 9100 ops/s versus about 1400). Commit p50, ReadIndex p50, and election p50 stay inside noise. Proposed fixes are in that doc. None was small enough to land without a new test.
 
 Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a graceful FIN. `Send` only enqueues. AppendEntries stay coalesced. No send-progress drop and no `TCP_USER_TIMEOUT`.
 
@@ -48,7 +52,8 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 8 is 3. The first push was green, and its Stryker job took 14 min 11 s. This push narrows the mutation span. No phase after 8 is started. The PR stays a draft.
+- Repair cap for phase 9 is 3. No phase after 9 is started. The PR stays a draft.
+- Benchmark findings to fix later, with tests: commit p99 tail, lease-read lock on the hit path, pre-vote retry after a grant-less round. See `docs/benchmarks.md`.
 
 ## Files
 
@@ -92,3 +97,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `dotnet-tools.json` Stryker.NET 5.0.0
 - `stryker-config.json` Basic mutations, RaftNode lines 1-1899, break 63
 - `.github/workflows/ci.yml:72-83` Ubuntu Stryker job on pull_request
+- `bench/Synkrolyn.Bench/BenchMain.cs` loopback throughput, latency, election, allocation
+- `bench/Synkrolyn.Bench/ReadProbe.cs` ticket probe, or the baseline ack set
+- `docs/benchmarks.md` side-by-side table and findings
+- `.github/workflows/bench.yml` manual benchmark workflow
