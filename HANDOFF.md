@@ -2,7 +2,7 @@
 
 ## State
 
-Branch `commit-2`. Phases 1-8 are on this branch. Phase 9 added the loopback harness. This push is phase 9b: the three benchmark findings, each test-first. The PR stays a draft.
+Branch `commit-2`. Phases 1-9b are on this branch. This push is phase 10: `docs/thesis-matrix.md` only. No production change. The PR stays a draft.
 
 `bench/Synkrolyn.Bench` is an executable, not a test project. `dotnet test` does not run it. `.github/workflows/bench.yml` is `workflow_dispatch` only. Numbers are in `docs/benchmarks.md`.
 
@@ -52,7 +52,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 9b is 3. No phase after 9b is started. The PR stays a draft.
+- Repair cap for phase 10 is 2. Docs only. The PR stays a draft.
 - This phase's CI is recorded in the chat reply.
 
 ## Files
@@ -100,6 +100,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `bench/Synkrolyn.Bench/BenchMain.cs` loopback throughput, latency, election, allocation
 - `bench/Synkrolyn.Bench/ReadProbe.cs` ticket probe, or the baseline ack set
 - `docs/benchmarks.md` side-by-side table after the phase 9b fixes
+- `docs/thesis-matrix.md` Ongaro sections to code, tests, and TLA+
 - `.github/workflows/bench.yml` manual benchmark workflow
 - `src/Synkrolyn/Net/SocketTransport.cs:1045-1068` `ChainNext` flushes the next append from the send callback
 - `tests/Synkrolyn.Tests/Net/SocketDeliveryTests.cs:481` `NextAppend_isFlushedByTheSendCompletionCallback`
