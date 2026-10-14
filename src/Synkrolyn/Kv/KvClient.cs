@@ -224,14 +224,14 @@ public sealed class KvClient
     public string? LinearizableGet(string key)
     {
         KvCommandCodec.RequireKey(key);
-        if (_raft.Role != Role.Leader)
-        {
-            return null;
-        }
-
         if (_raft.ReadIndexSatisfied())
         {
             return Get(key);
+        }
+
+        if (_raft.Role != Role.Leader)
+        {
+            return null;
         }
 
         if (_readTicketOpen)

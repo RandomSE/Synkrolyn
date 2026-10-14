@@ -67,6 +67,7 @@ public sealed class RaftNode
     private readonly List<Action> _afterForce = [];
     private readonly HashSet<string> _votesGranted = [];
     private readonly HashSet<string> _preVotesGranted = [];
+    private readonly HashSet<string> _preVoteDenials = [];
     private readonly List<byte> _incomingSnapshot = [];
     private readonly HashSet<string> _snapshotForceFull = [];
     private readonly HashSet<string> _coldVoters = [];
@@ -90,6 +91,12 @@ public sealed class RaftNode
     private LeadershipTransferStatus _transferStatus = LeadershipTransferStatus.None;
     private long _leaseIgnoreFromMillis = long.MinValue;
     private long _leaseIgnoreUntilMillis = long.MinValue;
+
+    /// <summary>
+    /// Exclusive clock time through which a leader lease read is valid. Zero means no lease.
+    /// Written on the raft thread and read without <see cref="_eventLock"/>.
+    /// </summary>
+    private long _publishedLeaseUntil;
     private bool _transferCampaign;
     private Action<Action> _applyExecutor = static action => action();
     private Action<Action> _snapshotExecutor = static action => action();
@@ -358,6 +365,7 @@ public sealed class RaftNode
         lock (_eventLock)
         {
             _clockDriftBound = rho;
+            PublishLinearizableLease();
         }
     }
 
@@ -630,6 +638,7 @@ public sealed class RaftNode
             }
             finally
             {
+                PublishLinearizableLease();
                 _draining = false;
             }
 
@@ -836,13 +845,14 @@ public sealed class RaftNode
         }
     }
 
-    /// <summary>True when the send-time read lease is valid and the commit index is applied.</summary>
+    /// <summary>
+    /// True when the send-time read lease is valid and the commit index is applied.
+    /// Does not take the raft lock. The raft thread publishes the expiry.
+    /// </summary>
     public bool ReadIndexSatisfied()
     {
-        lock (_eventLock)
-        {
-            return LinearizableLeaseValidLocked() && _lastApplied >= _commitIndex;
-        }
+        long until = Volatile.Read(ref _publishedLeaseUntil);
+        return until != 0 && _clock.Millis < until;
     }
 
     /// <summary>True when <paramref name="ticket"/>'s heartbeat round has a quorum and its index is applied.</summary>
@@ -1043,6 +1053,7 @@ public sealed class RaftNode
             }
 
             _commitIndex = index;
+            PublishLinearizableLease();
         }
     }
 
@@ -1052,6 +1063,18 @@ public sealed class RaftNode
         lock (_eventLock)
         {
             StepDown(CurrentTermLocked());
+        }
+    }
+
+    /// <summary>Holds the raft lock until <paramref name="release"/> is set. Tests use this to see a lock-free read.</summary>
+    internal void HoldEventLockForTest(ManualResetEventSlim entered, ManualResetEventSlim release)
+    {
+        ArgumentNullException.ThrowIfNull(entered);
+        ArgumentNullException.ThrowIfNull(release);
+        lock (_eventLock)
+        {
+            entered.Set();
+            release.Wait();
         }
     }
 
@@ -1215,6 +1238,7 @@ public sealed class RaftNode
         _preVoteRound++;
         _preCandidate = true;
         _preVotesGranted.Clear();
+        _preVoteDenials.Clear();
         _preVotesGranted.Add(_nodeId);
         ResetElectionDeadline();
         bool transfer = _transferCampaign;
@@ -1317,6 +1341,7 @@ public sealed class RaftNode
         _pendingTransferTo = peer;
         _transferStatus = LeadershipTransferStatus.AwaitingWinner;
         _pendingTransferDeadline = _clock.Millis + _electionTimeoutMillis;
+        PublishLinearizableLease();
     }
 
     private void MaybeFinishTransfer()
@@ -1358,6 +1383,7 @@ public sealed class RaftNode
         _proposedTerms[index] = term;
         ReplicateToAll();
         MaybeAdvanceCommit();
+        PublishLinearizableLease();
         return index;
     }
 
@@ -1598,6 +1624,10 @@ public sealed class RaftNode
                 {
                     BeginElection();
                 }
+            }
+            else if (_preVoteDenials.Add(from) && PreVoteQuorumImpossible())
+            {
+                RetryPreVoteWhenVoteGateEnds();
             }
 
             return;
@@ -2410,6 +2440,7 @@ public sealed class RaftNode
 
         _leaderId = null;
         FailApplyWaiters();
+        Volatile.Write(ref _publishedLeaseUntil, 0);
     }
 
     private void FinishApply(long index)
@@ -2670,6 +2701,7 @@ public sealed class RaftNode
         _lastLeaderContactMillis = long.MinValue;
         AbortReadIndex();
         ResetElectionDeadline();
+        Volatile.Write(ref _publishedLeaseUntil, 0);
     }
 
     private bool HasCommittedEntryInCurrentTerm()
@@ -2764,7 +2796,68 @@ public sealed class RaftNode
     {
         _preCandidate = false;
         _preVotesGranted.Clear();
+        _preVoteDenials.Clear();
         _preVoteRound++;
+    }
+
+    private bool PreVoteQuorumImpossible()
+    {
+        int possible = _preVotesGranted.Count;
+        foreach (string peer in _voterPeers)
+        {
+            if (_preVotesGranted.Contains(peer) || _preVoteDenials.Contains(peer))
+            {
+                continue;
+            }
+
+            // The leader we lost contact with is why this round started. A missing
+            // grant from them must not keep a denied round open for a full timeout.
+            if (peer == _leaderId)
+            {
+                continue;
+            }
+
+            possible++;
+        }
+
+        return possible < Majority();
+    }
+
+    /// <summary>
+    /// A round that can no longer reach quorum retries when the vote gate opens,
+    /// or on the next millisecond when this node's gate is already open.
+    /// </summary>
+    private void RetryPreVoteWhenVoteGateEnds()
+    {
+        long now = _clock.Millis;
+        long remaining = RemainingVoteGateMillis(now);
+        DisarmPreVote();
+        _electionDeadline = now + (remaining > 0 ? remaining : 1);
+    }
+
+    private long RemainingVoteGateMillis(long now)
+    {
+        long remaining = 0;
+        if (_lastLeaderContactMillis != long.MinValue)
+        {
+            long gate = _leaderAdvertisedLeaseMillis > 0 ? _leaderAdvertisedLeaseMillis : _electionTimeoutMillis;
+            long elapsed = now - _lastLeaderContactMillis;
+            if (elapsed < gate)
+            {
+                remaining = gate - elapsed;
+            }
+        }
+
+        if (_restartLeaseUntilMillis != long.MinValue && _restartLeaseUntilMillis > now)
+        {
+            long restart = _restartLeaseUntilMillis - now;
+            if (restart > remaining)
+            {
+                remaining = restart;
+            }
+        }
+
+        return remaining;
     }
 
     private bool IsCurrentVoter(string peer) => _voterPeers.Contains(peer);
@@ -2826,6 +2919,103 @@ public sealed class RaftNode
         }
 
         return HeardCount(_leaseAckMillis, bound) >= Majority();
+    }
+
+    /// <summary>Caller holds <see cref="_eventLock"/>.</summary>
+    private void PublishLinearizableLease()
+    {
+        Volatile.Write(ref _publishedLeaseUntil, LinearizableLeaseUntilLocked());
+    }
+
+    /// <summary>Caller holds <see cref="_eventLock"/>. Zero when the lease must not be served.</summary>
+    private long LinearizableLeaseUntilLocked()
+    {
+        if (!LinearizableLeaseValidLocked() || _lastApplied < _commitIndex)
+        {
+            return 0;
+        }
+
+        if (_voterPeers.Count == 0)
+        {
+            return long.MaxValue;
+        }
+
+        long bound = LeaderLeaseMillis();
+        if (InJointLocked())
+        {
+            long cold = AckQuorumExpiry(_coldVoters, _coldVoters.Count, _coldVoters.Contains(_nodeId), bound);
+            long cnew = AckQuorumExpiry(_cnewVoters, _cnewVoters.Count, _cnewVoters.Contains(_nodeId), bound);
+            if (cold == 0 || cnew == 0)
+            {
+                return 0;
+            }
+
+            return Math.Min(cold, cnew);
+        }
+
+        int voters = _voterPeers.Count + (_selfVoter ? 1 : 0);
+        return AckQuorumExpiry(_voterPeers, voters, _selfVoter, bound);
+    }
+
+    /// <summary>Exclusive expiry of the peer ack that keeps a quorum fresh.</summary>
+    private long AckQuorumExpiry(IEnumerable<string> peers, int voterCount, bool selfCounts, long bound)
+    {
+        if (voterCount <= 0)
+        {
+            return 0;
+        }
+
+        int need = (voterCount / 2 + 1) - (selfCounts ? 1 : 0);
+        if (need <= 0)
+        {
+            return long.MaxValue;
+        }
+
+        Span<long> stamps = voterCount <= 64 ? stackalloc long[64] : new long[voterCount];
+        int count = 0;
+        foreach (string peer in peers)
+        {
+            if (peer == _nodeId)
+            {
+                continue;
+            }
+
+            long last = _linearizableAckSendMillis.GetValueOrDefault(peer, long.MinValue);
+            if (last == long.MinValue)
+            {
+                continue;
+            }
+
+            if (count >= stamps.Length)
+            {
+                return 0;
+            }
+
+            stamps[count++] = last;
+        }
+
+        if (count < need)
+        {
+            return 0;
+        }
+
+        stamps[..count].Sort();
+        return ExclusiveExpiry(stamps[count - need], bound);
+    }
+
+    private static long ExclusiveExpiry(long stamp, long bound)
+    {
+        if (bound <= 0 || stamp == long.MinValue)
+        {
+            return 0;
+        }
+
+        if (stamp > long.MaxValue - bound)
+        {
+            return long.MaxValue;
+        }
+
+        return stamp + bound;
     }
 
     private bool LinearizableLeaseValidLocked()

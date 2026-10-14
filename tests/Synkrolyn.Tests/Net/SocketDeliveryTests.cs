@@ -477,6 +477,56 @@ public class SocketDeliveryTests
             "blocked send still pending 250 ms after the abort at " + abort);
     }
 
+    [Fact]
+    public void NextAppend_isFlushedByTheSendCompletionCallback()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024);
+        listener.Start();
+        using var client = new SocketTransport("a", new RpcWireCodec());
+        SetPeerDead(client, TimeSpan.FromSeconds(30));
+        client.Bind();
+        client.Start();
+        client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
+        client.Send("a", "b", new RequestVote(1, "a", 0, 0));
+        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
+        using TcpClient accepted = listener.AcceptTcpClient();
+        accepted.ReceiveBufferSize = 1024;
+        Assert.True(WaitFor(() => Outbound(client) is not null));
+        accepted.Client.ReceiveBufferSize = 1;
+        Outbound(client)!.Client.SendBufferSize = 1;
+        bool blocked = false;
+        foreach (int commandLength in new[] { 256 * 1024, 512 * 1024, 900_000 })
+        {
+            int waits = client.SendWaits;
+            byte[] command = new byte[commandLength];
+            command[0] = 4;
+            Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0)));
+            if (WaitFor(() => client.SendWaits > waits, TimeSpan.FromMilliseconds(500)))
+            {
+                blocked = true;
+                break;
+            }
+        }
+
+        Assert.True(blocked, "send never blocked on the silent reader");
+        byte[] next = new byte[32];
+        next[0] = 7;
+        Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(2, 1, next)], 0)));
+        using var hold = new ManualResetEventSlim(false);
+        client.HoldWriterAfterPending = hold;
+        try
+        {
+            byte[]? frame = ReadAppend(accepted, TimeSpan.FromMilliseconds(800), next);
+            Assert.NotNull(frame);
+        }
+        finally
+        {
+            hold.Set();
+            client.HoldWriterAfterPending = null;
+        }
+    }
+
     /// <summary>
     /// Sets the peer-dead timeout when this build has one. Older builds keep the
     /// 1 s progress rule, which is what these tests reject.

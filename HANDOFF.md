@@ -2,11 +2,11 @@
 
 ## State
 
-Branch `commit-2`. Phases 1-8 are on this branch. This push is phase 9: a loopback benchmark harness against commit-1 `9ae58dd`. No production change. The PR stays a draft.
+Branch `commit-2`. Phases 1-8 are on this branch. Phase 9 added the loopback harness. This push is phase 9b: the three benchmark findings, each test-first. The PR stays a draft.
 
-`bench/Synkrolyn.Bench` is an executable, not a test project. `dotnet test` does not run it. `.github/workflows/bench.yml` is `workflow_dispatch` only. Numbers, machine info, and findings are in `docs/benchmarks.md`.
+`bench/Synkrolyn.Bench` is an executable, not a test project. `dotnet test` does not run it. `.github/workflows/bench.yml` is `workflow_dispatch` only. Numbers are in `docs/benchmarks.md`.
 
-Findings, not fixed here: commit p99 about 30 ms versus about 3 to 6 ms; lease-read p50 about 0.37 us versus 0.17 us; election p99 about 280 ms versus about 153 ms. Write throughput is higher (about 9100 ops/s versus about 1400). Commit p50, ReadIndex p50, and election p50 stay inside noise. Proposed fixes are in that doc. None was small enough to land without a new test.
+Phase 9 tails were commit p99 about 28 to 34 ms, lease-read p50 about 0.37 us, and election p99 about 245 to 279 ms. After the fixes, the second paired Release run against `9ae58dd` is commit p99 5213 us versus 13491 us, lease p50 0.121 us versus 0.165 us, and election p99 152.1 ms versus 153.6 ms. The repeat agrees. Local `dotnet test` Release: 266 passed, including `PushSeeds` at 200 seeds and the linearizability checker. TLC and Stryker are the CI jobs. The TLA spec did not change.
 
 Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a graceful FIN. `Send` only enqueues. AppendEntries stay coalesced. No send-progress drop and no `TCP_USER_TIMEOUT`.
 
@@ -52,8 +52,8 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 9 is 3. No phase after 9 is started. The PR stays a draft.
-- Benchmark findings to fix later, with tests: commit p99 tail, lease-read lock on the hit path, pre-vote retry after a grant-less round. See `docs/benchmarks.md`.
+- Repair cap for phase 9b is 3. No phase after 9b is started. The PR stays a draft.
+- This phase's CI is recorded in the chat reply.
 
 ## Files
 
@@ -99,5 +99,13 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `.github/workflows/ci.yml:72-83` Ubuntu Stryker job on pull_request
 - `bench/Synkrolyn.Bench/BenchMain.cs` loopback throughput, latency, election, allocation
 - `bench/Synkrolyn.Bench/ReadProbe.cs` ticket probe, or the baseline ack set
-- `docs/benchmarks.md` side-by-side table and findings
+- `docs/benchmarks.md` side-by-side table after the phase 9b fixes
 - `.github/workflows/bench.yml` manual benchmark workflow
+- `src/Synkrolyn/Net/SocketTransport.cs:1045-1068` `ChainNext` flushes the next append from the send callback
+- `tests/Synkrolyn.Tests/Net/SocketDeliveryTests.cs:481` `NextAppend_isFlushedByTheSendCompletionCallback`
+- `src/Synkrolyn/Raft/RaftNode.cs:852` lock-free `ReadIndexSatisfied`
+- `src/Synkrolyn/Raft/RaftNode.cs:2925` `PublishLinearizableLease`
+- `src/Synkrolyn/Kv/KvClient.cs:227` lease check before `Role`
+- `tests/Synkrolyn.Tests/Kv/LeaseReadTests.cs:14-59` hot lease, expiry, and step-down
+- `src/Synkrolyn/Raft/RaftNode.cs:2830` `RetryPreVoteWhenVoteGateEnds`
+- `tests/Synkrolyn.Tests/Raft/RaftNodeElectionTests.cs:61` grant-less pre-vote retries at the lease end

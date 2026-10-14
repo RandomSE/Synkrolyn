@@ -584,7 +584,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             EnsureWindow(link);
             TcpClient client = EnsureOutbound(peer);
-            SendAll(client.Client, frame, () => PeerSilent(link) || !_running);
+            SendAll(client.Client, frame, () => PeerSilent(link) || !_running, link);
             if (!OutboundLive(peer))
             {
                 // The peer reset while the bytes were only in the socket buffer.
@@ -899,6 +899,13 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// <summary>Timestamp of this transport's latest socket abort, or 0. Tests measure send completion against it.</summary>
     internal long AbortTicks;
 
+    /// <summary>
+    /// When set, the writer blocks after a pending send has completed and before it
+    /// can start another frame itself. Tests use this to see whether the completion
+    /// callback already flushed the next append.
+    /// </summary>
+    internal ManualResetEventSlim? HoldWriterAfterPending;
+
     private static readonly Queue<string> Notes = new();
 
     /// <summary>Failure-path notes for the connect-reset test. Not on the success path.</summary>
@@ -940,7 +947,7 @@ public sealed class SocketTransport : ITransport, IDisposable
     /// on the OS finishing the callback. A partial copy into the kernel is not
     /// a reason to reconnect: the peer is still reading.
     /// </summary>
-    private void SendAll(Socket socket, byte[] frame, Func<bool> abort)
+    private void SendAll(Socket socket, byte[] frame, Func<bool> abort, PeerLink link)
     {
         int offset = 0;
         while (offset < frame.Length)
@@ -952,18 +959,31 @@ public sealed class SocketTransport : ITransport, IDisposable
 
             var args = new SocketAsyncEventArgs();
             var done = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            int chunk = offset;
             args.Completed += (_, e) =>
             {
-                if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
+                try
                 {
-                    done.TrySetException(new IOException("send failed: " + e.SocketError));
-                }
-                else
-                {
-                    done.TrySetResult(e.BytesTransferred);
-                }
+                    if (e.SocketError != SocketError.Success || e.BytesTransferred <= 0)
+                    {
+                        done.TrySetException(new IOException("send failed: " + e.SocketError));
+                    }
+                    else
+                    {
+                        if (chunk + e.BytesTransferred >= frame.Length)
+                        {
+                            // The next append must leave before the writer notices
+                            // this completion. The 20 ms wait below is only the abort poll.
+                            ChainNext(socket, link, abort);
+                        }
 
-                e.Dispose();
+                        done.TrySetResult(e.BytesTransferred);
+                    }
+                }
+                finally
+                {
+                    e.Dispose();
+                }
             };
 
             bool pending;
@@ -1000,6 +1020,10 @@ public sealed class SocketTransport : ITransport, IDisposable
                     }
 
                     offset += args.BytesTransferred;
+                    if (offset >= frame.Length)
+                    {
+                        ChainNext(socket, link, abort);
+                    }
                 }
                 finally
                 {
@@ -1010,6 +1034,152 @@ public sealed class SocketTransport : ITransport, IDisposable
             }
 
             offset += WaitPending(done, socket, abort);
+        }
+
+        if (Volatile.Read(ref link.ChainRunning) != 0)
+        {
+            WaitChain(socket, link, abort);
+        }
+    }
+
+    /// <summary>
+    /// Starts <see cref="PeerLink.PendingAppend"/> from the send that just finished.
+    /// The writer is still inside <see cref="WaitPending"/>, so this is the only
+    /// path that does not wait for that thread to loop.
+    /// </summary>
+    private void ChainNext(Socket socket, PeerLink link, Func<bool> abort)
+    {
+        byte[]? next = TakeAppend(link, out _);
+        if (next is null)
+        {
+            TaskCompletionSource<int>? done = link.ChainDone;
+            Volatile.Write(ref link.ChainRunning, 0);
+            done?.TrySetResult(0);
+            return;
+        }
+
+        if (Volatile.Read(ref link.ChainRunning) == 0)
+        {
+            link.ChainDone = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(ref link.ChainRunning, 1);
+        }
+
+        PostFrame(socket, next, 0, link.ChainDone!, link, abort);
+    }
+
+    private void PostFrame(
+        Socket socket,
+        byte[] frame,
+        int offset,
+        TaskCompletionSource<int> done,
+        PeerLink link,
+        Func<bool> abort)
+    {
+        if (abort())
+        {
+            done.TrySetException(new OperationCanceledException());
+            return;
+        }
+
+        var args = new SocketAsyncEventArgs();
+        args.Completed += (_, e) =>
+        {
+            try
+            {
+                FinishChunk(socket, frame, offset, e, done, link, abort);
+            }
+            finally
+            {
+                e.Dispose();
+            }
+        };
+
+        bool pending;
+        try
+        {
+            args.SetBuffer(frame, offset, frame.Length - offset);
+            pending = socket.SendAsync(args);
+        }
+        catch (Exception ex)
+        {
+            args.Dispose();
+            done.TrySetException(ex);
+            return;
+        }
+
+        if (!pending)
+        {
+            try
+            {
+                FinishChunk(socket, frame, offset, args, done, link, abort);
+            }
+            finally
+            {
+                args.Dispose();
+            }
+        }
+    }
+
+    private void FinishChunk(
+        Socket socket,
+        byte[] frame,
+        int offset,
+        SocketAsyncEventArgs args,
+        TaskCompletionSource<int> done,
+        PeerLink link,
+        Func<bool> abort)
+    {
+        if (args.SocketError is SocketError.WouldBlock or SocketError.IOPending or SocketError.TryAgain)
+        {
+            link.RetryFrame = frame;
+            link.RetryOffset = offset;
+            done.TrySetResult(int.MinValue);
+            return;
+        }
+
+        if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
+        {
+            done.TrySetException(new IOException("send failed: " + args.SocketError));
+            return;
+        }
+
+        int next = offset + args.BytesTransferred;
+        if (next < frame.Length)
+        {
+            PostFrame(socket, frame, next, done, link, abort);
+            return;
+        }
+
+        ChainNext(socket, link, abort);
+    }
+
+    private void WaitChain(Socket socket, PeerLink link, Func<bool> abort)
+    {
+        TaskCompletionSource<int> done = link.ChainDone ?? throw new InvalidOperationException("missing chain");
+        while (Volatile.Read(ref link.ChainRunning) != 0)
+        {
+            int result = WaitPending(done, socket, abort);
+            if (result != int.MinValue)
+            {
+                return;
+            }
+
+            if (!WaitWritable(socket, abort))
+            {
+                throw new OperationCanceledException();
+            }
+
+            byte[]? frame = link.RetryFrame;
+            int offset = link.RetryOffset;
+            link.RetryFrame = null;
+            if (frame is null)
+            {
+                throw new IOException("send failed: " + SocketError.WouldBlock);
+            }
+
+            done = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            link.ChainDone = done;
+            PostFrame(socket, frame, offset, done, link, abort);
         }
     }
 
@@ -1040,10 +1210,12 @@ public sealed class SocketTransport : ITransport, IDisposable
                 break;
             }
 
+            HoldWriterAfterPending?.Wait();
             return done.Task.GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {
+            HoldWriterAfterPending?.Wait();
             throw;
         }
         finally
@@ -1366,6 +1538,18 @@ public sealed class SocketTransport : ITransport, IDisposable
         public byte[]? PendingAppend;
 
         public long AppendGeneration;
+
+        /// <summary>1 while a completion callback is still sending a newer append.</summary>
+        public int ChainRunning;
+
+        /// <summary>Completed when <see cref="ChainRunning"/> drops to 0.</summary>
+        public TaskCompletionSource<int>? ChainDone;
+
+        /// <summary>Frame a chained send could not accept because the window was full.</summary>
+        public byte[]? RetryFrame;
+
+        /// <summary>Offset into <see cref="RetryFrame"/>.</summary>
+        public int RetryOffset;
 
         public long LastInboundTicks;
 
