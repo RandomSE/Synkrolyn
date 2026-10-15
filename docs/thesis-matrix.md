@@ -2,7 +2,7 @@
 
 Diego Ongaro, *Consensus: Bridging Theory and Practice* (Stanford, 2014). Section titles below are that dissertation's. The extended Raft paper numbers some of the same rules differently: paper 5.4.1 is thesis 3.6.1, and paper 5.4.2 is thesis 3.6.2.
 
-Status is `implemented`, `extended` (the rule is present, and this tree adds a stricter or extra behavior), `not applicable`, or `gap`. A unit test is a scenario, not a proof of `RaftNode`. The simulator (`DeterministicSimulatorTests.PushSeeds_holdInvariants`, 200 seeds) checks Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety, and `LinearizabilityChecker` checks client histories. TLC checks `tla/Synkrolyn.tla`. Stryker mutates Kv, sessions, and all of `RaftNode` in two CI jobs (breaks 58 and 67); see `docs/test-parity.md`. Loopback measurements are in `docs/benchmarks.md`.
+Status is `implemented`, `extended` (the rule is present, and this tree adds a stricter or extra behavior), `not applicable`, or `gap`. A unit test is a scenario, not a proof of `RaftNode`. The simulator (`DeterministicSimulatorTests.PushSeeds_holdInvariants`, 200 seeds) checks Election Safety, Leader Append-Only, Log Matching, Leader Completeness, and State Machine Safety, and `LinearizabilityChecker` checks client histories. TLC checks `tla/Synkrolyn.tla`. Stryker mutates Kv, sessions, and all of `RaftNode` in two CI jobs (breaks 59 and 68); see `docs/test-parity.md`. Loopback measurements are in `docs/benchmarks.md`.
 
 ## Chapter 3: Basic Raft
 

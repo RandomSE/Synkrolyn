@@ -107,6 +107,8 @@ public sealed class MutationGapTests
 
         client.PrepareSeqForTest(4);
         Assert.Null(client.Put("k", "skip"));
+        KvCommandCodec.Command skipped = KvCommandCodec.Decode(cluster.Harness.Log("solo").Read(cluster.Harness.Log("solo").LastIndex).Command);
+        Assert.Equal(4, skipped.Serial);
         cluster.Harness.DrainAll();
         Assert.Null(client.AwaitCommitted());
         Assert.Equal(KvCommandError.OutOfOrder, client.LastError);
@@ -130,5 +132,25 @@ public sealed class MutationGapTests
         Assert.NotNull(client.AwaitCommitted());
         Assert.Equal("fresh", cluster.Stores["solo"].Get("k"));
         Assert.Equal(1, cluster.Stores["solo"].ReadSession(recovered).LastSeq);
+    }
+
+    [Fact]
+    public void SessionDelete_removesTheKey_andADuplicateReturnsTheCachedEmpty()
+    {
+        var store = new InMemoryKvStore();
+        store.Apply(1, KvCommandCodec.EncodeRegister(1_000, 5_000));
+        store.Apply(2, KvCommandCodec.EncodeSessionPut("k", "v", 1, 1, 0, 1_000));
+        Assert.Equal("v", store.Get("k"));
+        store.Apply(3, KvCommandCodec.EncodeSessionDelete("k", 1, 2, 0, 1_100));
+        Assert.Equal(KvCommandError.None, store.CommandResult.Error);
+        Assert.Equal("", store.CommandResult.CachedResponse);
+        Assert.Null(store.Get("k"));
+        Assert.Equal(2, store.ReadSession(1).LastSeq);
+
+        store.Apply(4, KvCommandCodec.EncodeSessionDelete("k", 1, 2, 1, 1_200));
+        Assert.Equal(KvCommandError.None, store.CommandResult.Error);
+        Assert.Equal("", store.CommandResult.CachedResponse);
+        Assert.Null(store.Get("k"));
+        Assert.Equal(2, store.ReadSession(1).LastSeq);
     }
 }

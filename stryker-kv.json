@@ -4,7 +4,7 @@
     "test-projects": ["tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj"],
     "configuration": "Release",
     "mutation-level": "Basic",
-    "thresholds": { "high": 80, "low": 67, "break": 67 },
+    "thresholds": { "high": 80, "low": 68, "break": 68 },
     "concurrency": 4,
     "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket",
     "reporters": ["cleartext", "json"],
