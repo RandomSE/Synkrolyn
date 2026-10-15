@@ -57,8 +57,11 @@ public static class KvSnapshotDelta
         return buf;
     }
 
-    /// <summary>Applies puts, deletes, and an optional serial trailer onto the base maps.</summary>
-    public static void ApplyTo(Dictionary<string, string> map, Dictionary<string, long> serials, byte[] snapshot)
+    /// <summary>
+    /// Applies puts, deletes, and an optional serial trailer onto the base maps.
+    /// Returns the offset after that trailer. A session tail may follow.
+    /// </summary>
+    public static int ApplyTo(Dictionary<string, string> map, Dictionary<string, long> serials, byte[] snapshot)
     {
         ArgumentNullException.ThrowIfNull(serials);
         int pos = Magic.Length + 1 + 8;
@@ -90,7 +93,7 @@ public static class KvSnapshotDelta
 
         if (pos == snapshot.Length)
         {
-            return;
+            return pos;
         }
 
         if (snapshot.Length - pos < 4)
@@ -118,10 +121,7 @@ public static class KvSnapshotDelta
             pos += 8;
         }
 
-        if (pos != snapshot.Length)
-        {
-            throw new ArgumentException("trailing bytes after delta serial table");
-        }
+        return pos;
     }
 
     private static byte[] EncodeMapOnly(long baseIndex, IReadOnlyDictionary<string, string> puts, IReadOnlyList<string> deletes)

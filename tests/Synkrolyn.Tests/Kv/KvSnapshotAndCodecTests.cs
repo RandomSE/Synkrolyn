@@ -54,7 +54,11 @@ public sealed class KvSnapshotTests
         store.Apply(4, KvCommandCodec.EncodeDelete("a"));
         byte[] delta = store.SnapshotDelta(0);
         Assert.True(KvSnapshotDelta.IsDelta(delta));
-        Assert.True(delta.Length < store.Snapshot().Length || delta.Length > 0);
+        int deleteCountAt = DeleteCountOffset(delta);
+        Assert.True(deleteCountAt + 4 < delta.Length);
+        Assert.Equal(1, BinaryPrimitives.ReadInt32BigEndian(delta.AsSpan(deleteCountAt)));
+        int deletedKeyLength = BinaryPrimitives.ReadInt32BigEndian(delta.AsSpan(deleteCountAt + 4));
+        Assert.Equal("a", Encoding.UTF8.GetString(delta, deleteCountAt + 8, deletedKeyLength));
         var restored = new InMemoryKvStore();
         restored.Restore(full);
         restored.RestoreChecked(0, 0, delta);
@@ -106,6 +110,22 @@ public sealed class KvSnapshotTests
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    private static int DeleteCountOffset(byte[] delta)
+    {
+        int pos = 4 + 1 + 8;
+        int puts = BinaryPrimitives.ReadInt32BigEndian(delta.AsSpan(pos));
+        pos += 4;
+        for (int i = 0; i < puts; i++)
+        {
+            int keyLength = BinaryPrimitives.ReadInt32BigEndian(delta.AsSpan(pos));
+            pos += 4 + keyLength;
+            int valueLength = BinaryPrimitives.ReadInt32BigEndian(delta.AsSpan(pos));
+            pos += 4 + valueLength;
+        }
+
+        return pos;
+    }
 }
 
 public sealed class CodecTests
@@ -136,6 +156,11 @@ public sealed class CodecTests
         Assert.Equal("cmd"u8.ToArray(), back.Entries[0].Command);
         var timeout = new TimeoutNow(4, "n2");
         Assert.Equal(timeout, Assert.IsType<TimeoutNow>(codec.Decode(codec.Encode("n2", timeout)).Payload));
+        var vote = new RequestVote(6, "n3", 4, 2, true, 9);
+        var voteBack = Assert.IsType<RequestVote>(codec.Decode(codec.Encode("n3", vote)).Payload);
+        Assert.Equal(vote, voteBack);
+        var grant = new RequestVoteResponse(6, true, true, 9);
+        Assert.Equal(grant, Assert.IsType<RequestVoteResponse>(codec.Decode(codec.Encode("n2", grant)).Payload));
     }
 
     [Fact]

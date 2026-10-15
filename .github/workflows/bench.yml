@@ -1,0 +1,16 @@
+name: bench
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Loopback cluster benchmark
+        run: dotnet run --project bench/Synkrolyn.Bench/Synkrolyn.Bench.csproj --configuration Release -- --label ci

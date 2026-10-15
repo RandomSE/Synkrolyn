@@ -6,4 +6,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj" />
   </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/Synkrolyn.Bench/Synkrolyn.Bench.csproj" />
+  </Folder>
 </Solution>

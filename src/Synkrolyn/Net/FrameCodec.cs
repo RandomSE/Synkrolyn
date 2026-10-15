@@ -28,7 +28,8 @@ public static class FrameCodec
     public sealed class Decoder
     {
         private readonly int _maxPayloadBytes;
-        private readonly List<byte> _pending = [];
+        private byte[] _pending = [];
+        private int _length;
 
         /// <summary>Uses <see cref="DefaultMaxPayloadBytes"/>.</summary>
         public Decoder()
@@ -51,34 +52,56 @@ public static class FrameCodec
         public List<byte[]> Push(byte[] chunk)
         {
             ArgumentNullException.ThrowIfNull(chunk);
-            _pending.AddRange(chunk);
-            byte[] all = [.. _pending];
+            Append(chunk);
             int pos = 0;
             var frames = new List<byte[]>();
-            while (all.Length - pos >= 4)
+            while (_length - pos >= 4)
             {
-                int length = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(all.AsSpan(pos));
+                int length = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(_pending.AsSpan(pos));
                 if (length < 0 || length > _maxPayloadBytes)
                 {
                     throw new ArgumentException("invalid frame length: " + length);
                 }
 
-                if (all.Length - pos - 4 < length)
+                if (_length - pos - 4 < length)
                 {
                     break;
                 }
 
-                frames.Add(all.AsSpan(pos + 4, length).ToArray());
+                frames.Add(_pending.AsSpan(pos + 4, length).ToArray());
                 pos += 4 + length;
             }
 
-            _pending.Clear();
-            if (pos < all.Length)
+            if (pos > 0)
             {
-                _pending.AddRange(all.AsSpan(pos));
+                int keep = _length - pos;
+                if (keep > 0)
+                {
+                    Buffer.BlockCopy(_pending, pos, _pending, 0, keep);
+                }
+
+                _length = keep;
             }
 
             return frames;
+        }
+
+        private void Append(byte[] chunk)
+        {
+            if (chunk.Length == 0)
+            {
+                return;
+            }
+
+            int needed = _length + chunk.Length;
+            if (_pending.Length < needed)
+            {
+                int size = Math.Max(needed, Math.Max(256, _pending.Length * 2));
+                Array.Resize(ref _pending, size);
+            }
+
+            chunk.CopyTo(_pending.AsSpan(_length));
+            _length += chunk.Length;
         }
     }
 }
