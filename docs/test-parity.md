@@ -302,11 +302,25 @@ WaveERuntimeAndGroupCommitTest.java::membershipCodec_roundtripAddPromoteRemove -
 
 ## Equivalent mutants
 
-Stryker 5.0.0, mutation level Basic. The timed CI scope is Kv, the in-memory log and vote, MembershipCodec, InMemoryTransport, and `RaftNode.cs` lines 1-1899 (election, propose, pre-vote, and the start of append). Snapshot install and the later helpers are outside that span. PushSeeds, the stale-read seed, and socket tests are excluded. The wide run scored 61.92% then 63.07% after the gap tests (7 min 44 s locally) and took 14 min 11 s in CI, so the span above is what CI breaks on. These survivors are equivalent:
+Stryker.NET 5.0.0, mutation level Basic. The CI scope is file globs, not line ranges: `Kv/**/*.cs` (including sessions), `InMemoryRaftLog`, `InMemoryPersistentState`, `LogEntry`, `MembershipCodec`, all of `RaftNode.cs`, and `InMemoryTransport`. PushSeeds, the stale-read seed, and socket tests are excluded. Concurrency is 4. `since` is off: a diff against `main` still mutates this whole branch, and a full run fits the job. On that scope the score was 62.40% before the phase 11 tests and 65.26% after (1,073 killed, 22 timeout, 380 survived, 203 no coverage; 7 min 10 s locally). Break threshold is 62, a few points under that score. An 80% score would need about 250 more detections. The rest are the equivalents below, snapshot-install and append-reply bookkeeping, and codec length checks. Pinning those would assert implementation details, so they stay.
+
+The earlier line-range scope (`RaftNode.cs` lines 1-1899) scored 67.32% in 2 min 52 s. The wide run scored 61.92% then 63.07% and took 14 min 11 s in CI. That span drifted as the file grew, so CI no longer uses it.
+
+These survivors are equivalent:
 
 - `RaftNode.ResetElectionDeadline`: `span > 2T` replaced with `span >= 2T`, and `span < T` with `span <= T`. Both ends assign that same bound.
 - `RaftNode.Majority`: `voters <= 0` replaced with `voters < 0`. The count is never negative.
+- `RaftNode.LeaderLeaseMillis`: the `rho == 0` return is the same value as falling through (`T * 1`). `shrunk <= 1` replaced with `shrunk < 1` also returns 1.
+- `RaftNode.CandidateLogUpToDate` and `CandidateLogStrictlyNewer`: `LastLogTerm > local` replaced with `>=` inside the unequal-term branch. Equal terms never enter that branch.
+- `RaftNode.MaybeAdvanceCommit`: `n > commit` replaced with `n >= commit` writes the same index. `n <= lastIncluded` replaced with `n < lastIncluded` is not reached, because commit is never below the snapshot index. The non-leader return does not move commit: a follower's match set is not a quorum.
+- `RaftNode.NoteLinearizableAck`: `stamp <= 0` replaced with `stamp < 0`. Stamps start at 1, so 0 still misses the send map. `at > previous` replaced with `at >= previous` stores the same timestamp.
+- `RaftNode.AckQuorumExpiry`: `voterCount <= 0` and `need <= 0` replaced with `<`. Those counts are never negative.
 - `InMemoryPersistentState.NoteAdvertisedLease`: `millis <= current` replaced with `millis < current`. An equal value assigns the same millis.
 - `InJointLocked`: `cold > 0 && cnew > 0` replaced with `||`. Cold and Cnew are written as a pair, so one-sided joint state does not occur.
-- `FrameCodec` buffer growth `length * 2` replaced with `length / 2`. `Math.Max(needed, ...)` already covers the bytes the decoder must keep.
+- `InMemoryKvStore.Apply` empty command: `index > applied` replaced with `index >= applied`. An equal index assigns the same applied index.
+- `InMemoryKvStore.Apply` client serial: `TryGet && serial <= last` replaced with `||`. A missing id yields last 0, and this block only sees serials above 0, so the first write still applies.
+- `InMemoryKvStore.ApplySession`: `AckFloor >` replaced with `>=` writes the same floor. `LastSeq > AckFloor` replaced with `>=` on the keep-cache check, and `HasCache &&` replaced with `||`, only diverge when the serial is already at or below the floor, and that serial is discarded before the cache is read. `LastSeq > 0` replaced with `>= 0` on the duplicate path: serial 0 is discarded by the ack floor, which starts at 0.
+- `InMemoryKvStore.ExpireSessions`: removing the empty-table return still loops zero times. `IsExpired`'s `TimeoutMillis > 0` replaced with `< 0` is not observable: the same clock advance removes the session first.
+- `InMemoryRaftLog.ReadBatchUnlocked`: `lastIncluded > 0` replaced with `>= 0`. Replication indexes start at 1, so `nextIndex <= 0` does not happen.
+- `KvClient.TakeEffect`: removing the already-consumed return re-reads the same command result.
 - Block-removal mutants on empty braces and on assignments whose value is never read.
