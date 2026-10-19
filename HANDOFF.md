@@ -2,7 +2,7 @@
 
 ## State
 
-Branch `commit-2`. Phases 1-11 are on this branch. This push is phase 11b: mutation triage. No production change. The PR stays a draft.
+Branch `commit-2`. Phases 1-11b are on this branch. This push is phase 11c: the socket callback test waits on the flush, and lease/vote mutation gaps. No production change. The PR stays a draft.
 
 `bench/Synkrolyn.Bench` is an executable, not a test project. `dotnet test` does not run it. `.github/workflows/bench.yml` is `workflow_dispatch` only. Numbers are in `docs/benchmarks.md`.
 
@@ -37,7 +37,8 @@ Peer liveness is inbound silence past `PeerDeadTimeout`, a socket reset, or a gr
 - Acking AppendEntries before `Force` failed seed 1 with `append ack before flush n2 index 1`. Granting a vote before `RecordVote` failed seed 1 with `vote grant before flush n3 term 1`. Both edits were reverted and are not in this commit.
 - Seed 63 elected no leader. Every voter stayed a pre-candidate. A pre-candidate refused a higher node id even when that node had the longer log, so the best log could not win. `OnPreVote` still refuses a higher id when the logs are tied. It grants when the candidate log is strictly newer. Seed 63 passes.
 - `tla/Synkrolyn.tla` models PreVote, check-quorum, election, replication, current-term commit, the restart vote gate, and a lease read. Entries are terms. A mismatch drops the follower's last entry. `tla/MC.cfg` is 3 servers, term at most 2, log length at most 2. Local TLC found no error: 3,016,397 distinct states, depth 35, about 1 min 35 s. `tla/MCBug.cfg` commits a prior-term entry from a five-server figure-8 state and violates LeaderCompleteness (20 distinct states). Ack expiry after a quorum is not a separate action. Action names stay `BecomeLeader(s)`, `ClientAppend(s)`, and `Force(s)` because `TlaSpecTests` anchors on those strings.
-- `docs/test-parity.md` maps each of the 297 Prytolyn tests to a Synkrolyn test, or N/A. Stryker.NET 5.0.0 is pinned. CI mutates Kv (including sessions), the in-memory log and vote, MembershipCodec, InMemoryTransport, and all of `RaftNode.cs`. Phase 11b reclassified survivors: 29 are equivalent, 535 are gaps. The score moved from 65.26% to 66.39% (1,078 killed, 36 timeout, 365 survived, 199 no coverage). Breaks are 59 on `RaftNode` (62.92%) and 68 on the Kv slice (71.69%). The combined local break is 63. An 80% score needs about 230 more detections. No production bug turned up.
+- `docs/test-parity.md` maps each of the 297 Prytolyn tests to a Synkrolyn test, or N/A. Stryker.NET 5.0.0 is pinned. CI mutates Kv (including sessions), the in-memory log and vote, MembershipCodec, InMemoryTransport, and all of `RaftNode.cs`. Phase 11c killed 23 lease, ReadIndex, and vote mutants. The score moved from 66.39% to 67.76% (1,102 killed, 35 timeout, 350 survived, 191 no coverage). `RaftNode` is 65.19%, break 62. The Kv slice stays 71.69%, break 68. The combined break is 64. Thirty-five survivors are equivalent. `RaftNode` still has 43 lease/ReadIndex gaps and 56 vote/term gaps. No production bug turned up.
+- `NextAppend_isFlushedByTheSendCompletionCallback` waits until the next append is decoded, and checks `SendDones` is unchanged so the writer is still inside the pending send. The 15 s bound only stops a missing callback from hanging the process. Fifty local runs passed.
 
 ## CI
 
@@ -52,7 +53,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 ## Open items
 
 - Windows put-timeout root cause was not printed. The exception text is the evidence if it fails again. Do not retry the Put.
-- Repair cap for phase 11b is 3. Tests, Stryker thresholds, and docs. The PR stays a draft.
+- Repair cap for phase 11c is 3. Tests, Stryker thresholds, and docs. The PR stays a draft.
 - This phase's CI is recorded in the chat reply.
 
 ## Files
@@ -95,7 +96,7 @@ Phase 4 CI for `3dcb8f0` and the review push `e90f4a1` were green on Ubuntu and 
 - `docs/test-parity.md` one Prytolyn test per line, plus equivalent mutants
 - `tests/Synkrolyn.Tests/Raft/PrytolynParityTests.cs:1-563` parity and mutant-killing tests
 - `dotnet-tools.json` Stryker.NET 5.0.0
-- `stryker-config.json` combined scope, break 63. `stryker-raft.json` break 59. `stryker-kv.json` break 68
+- `stryker-config.json` combined scope, break 64. `stryker-raft.json` break 62. `stryker-kv.json` break 68
 - `tests/Synkrolyn.Tests/Raft/MutationGapTests.cs` vote, lease, joint quorum, and batch edges
 - `tests/Synkrolyn.Tests/Kv/MutationGapTests.cs` session dedup, ack floor, expiry, and client serials
 - `.github/workflows/ci.yml` Ubuntu Stryker matrix (`raft`, `kv`) on pull_request

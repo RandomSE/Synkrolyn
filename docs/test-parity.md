@@ -302,13 +302,13 @@ WaveERuntimeAndGroupCommitTest.java::membershipCodec_roundtripAddPromoteRemove -
 
 ## Equivalent mutants
 
-Stryker.NET 5.0.0, mutation level Basic. The scope is file globs, not line ranges: `Kv/**/*.cs` (including sessions), `InMemoryRaftLog`, `InMemoryPersistentState`, `LogEntry`, `MembershipCodec`, all of `RaftNode.cs`, and `InMemoryTransport`. PushSeeds, the stale-read seed, and socket tests are excluded. Concurrency is 4. Phase 11 scored 65.26% (1,073 killed, 22 timeout, 380 survived, 203 no coverage). Phase 11b behavioral tests raised that to 66.39% (1,078 killed, 36 timeout, 365 survived, 199 no coverage) on the same 1,678 mutants. An 80% score would need about 230 more detections. Most of the undetected mutants are gaps, not equivalents.
+Stryker.NET 5.0.0, mutation level Basic. The scope is file globs, not line ranges: `Kv/**/*.cs` (including sessions), `InMemoryRaftLog`, `InMemoryPersistentState`, `LogEntry`, `MembershipCodec`, all of `RaftNode.cs`, and `InMemoryTransport`. PushSeeds, the stale-read seed, and socket tests are excluded. Concurrency is 4. Phase 11 scored 65.26% (1,073 killed, 22 timeout, 380 survived, 203 no coverage). Phase 11b raised that to 66.39% (1,078 killed, 36 timeout, 365 survived, 199 no coverage). Phase 11c killed 23 more on lease, ReadIndex, and vote timing: 67.76% (1,102 killed, 35 timeout, 350 survived, 191 no coverage) on the same 1,678 mutants. An 80% score would need about 210 more detections. Most of the undetected mutants are gaps, not equivalents.
 
-One job on the full scope took 12 min 38 s in CI. `since` with an empty diff reports no score, so CI keeps two jobs. `stryker-raft.json` is all of `RaftNode.cs`: 62.92%, 5 min 9 s locally, break 59. `stryker-kv.json` is Kv, sessions, and the in-memory log, vote, codec, and transport: 71.69%, 3 min 14 s locally, break 68. `stryker-config.json` is the combined scope, break 63, for a local full run.
+One job on the full scope took 12 min 38 s in CI. `since` with an empty diff reports no score, so CI keeps two jobs. `stryker-raft.json` is all of `RaftNode.cs`: 65.19% (630 killed, 31 timeout, 250 survived, 103 no coverage), 4 min 42 s locally, break 62. `stryker-kv.json` is Kv, sessions, and the in-memory log, vote, codec, and transport: 71.69%, break 68. `stryker-config.json` is the combined scope, break 64, for a local full run.
 
 The earlier line-range scope (`RaftNode.cs` lines 1-1899) scored 67.32% in 2 min 52 s. The wide run scored 61.92% then 63.07% and took 14 min 11 s in CI. That span drifted as the file grew, so CI no longer uses it.
 
-Twenty-nine survivors are equivalent. Each one leaves every observable result unchanged:
+Thirty-five survivors are equivalent. Each one leaves every observable result unchanged:
 
 - `ResetElectionDeadline`: `span < T` replaced with `<=`, and `span > 2T` with `>=`. Both ends assign that same bound.
 - `Majority`: `voters <= 0` replaced with `<`. The count is never negative.
@@ -328,15 +328,10 @@ Twenty-nine survivors are equivalent. Each one leaves every observable result un
 - `ApplySession`: `AckFloor >` replaced with `>=` writes the same floor. The keep-cache `&&`/`>` mutants only diverge for a serial the ack floor already discarded. `LastSeq > 0` replaced with `>=` on the duplicate path: serial 0 is discarded because the floor starts at 0.
 - `ExpireSessions`: removing the empty-table return still loops zero times.
 - `ReadBatchUnlocked`: `lastIncluded > 0` replaced with `>=`. Replication indexes start at 1, so `nextIndex <= 0` does not happen.
+- `Start`: the restart-lease `&&` replaced with `||` still waits only when a restart lease is set, because an election deadline is never below `long.MinValue`. `deadline < restart` replaced with `<=` writes that same instant when the two are equal.
+- `LeaderMillis`: `elapsed < 0` replaced with `<=` stores 0 at elapsed 0, and the clock is monotonic so elapsed is never negative. `applied > stamp` replaced with `>=` stores that same stamp.
+- `RemainingVoteGateMillis`: the restart `&&` replaced with `||` still applies only to a real restart lease, because an unset lease is `long.MinValue` and is not after now. `restart > now` replaced with `>=` adds a zero remainder, which does not replace a longer gate.
 
-The other 535 undetected mutants are gaps (365 survived and 199 with no coverage, minus those 29). Counts by area:
-
-- Log append, truncation, fast backup, and snapshot install: 121.
-- Kv store, session dedup, expiry, and client retry: 109.
-- Lease and ReadIndex: 89.
-- Vote, term, and election deadline: 70.
-- Commit index and apply: 44.
-- Membership change and the mailbox: 80.
-- Codec, in-memory transport, and the log store: 22.
+The other 506 undetected mutants are gaps. This round killed 23, all on lease, ReadIndex, and vote timing. `RaftNode` still has 43 lease/ReadIndex gaps and 56 vote/term gaps. The other areas were not remeasured: log/snapshot 121, kv/session 109, commit/apply 44, membership and mailbox 80, codec/transport/log store 22.
 
 `IsExpired` treating a negative timeout as already expired, `TakeEffect` dropping the consumed-index return, and the non-leader return in `MaybeAdvanceCommit` are gaps. A negative timeout, a second take of an error, and a follower force can each change the result.

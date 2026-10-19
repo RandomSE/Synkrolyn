@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Synkrolyn.Net;
 using Synkrolyn.Raft;
 
@@ -439,6 +440,146 @@ public sealed class MutationGapTests
     }
 
     [Fact]
+    public void RestartLease_longerThanTheElectionTimeout_holdsTheDeadline()
+    {
+        const long timeout = 150;
+        const long advertised = 500;
+        var state = new InMemoryPersistentState();
+        state.SetCurrentTerm(3);
+        state.NoteAdvertisedLease(advertised);
+        var cluster = new ClusterHarness();
+        cluster.Transport.Register("n2", _ => { });
+        cluster.Transport.Register("n3", _ => { });
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(timeout), Heartbeat, state: state);
+        RaftNode node = cluster.Node("n1");
+        Assert.Equal(advertised, node.NextDeadlineMillis());
+        Assert.Equal(Role.Follower, node.Role);
+
+        cluster.Clock.Advance(advertised - 1);
+        var denied = CaptureRealVotes(cluster);
+        cluster.Transport.Send("n3", "n1", new RequestVote(3, "n3", 0, 0));
+        cluster.DrainAll();
+        Assert.Equal([false], denied);
+        Assert.Null(cluster.State("n1").VotedFor);
+        Assert.Equal(3, node.CurrentTerm);
+
+        cluster.Clock.Advance(1);
+        var granted = CaptureRealVotes(cluster);
+        cluster.Transport.Send("n3", "n1", new RequestVote(3, "n3", 0, 0));
+        cluster.DrainAll();
+        Assert.Equal([true], granted);
+        Assert.Equal("n3", cluster.State("n1").VotedFor);
+    }
+
+    [Fact]
+    public void PreVoteDenial_waitsOutTheLongerOfRestartAndAdvertisedLease()
+    {
+        const long timeout = 150;
+        const long advertised = 400;
+        var state = new InMemoryPersistentState();
+        state.SetCurrentTerm(3);
+        state.NoteAdvertisedLease(500);
+        var cluster = new ClusterHarness();
+        cluster.Transport.Register("n2", _ => { });
+        cluster.Transport.Register("n3", _ => { });
+        cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(timeout), Heartbeat, state: state);
+        cluster.Transport.Send("n2", "n1", new AppendEntries(4, "n2", 0, 0, [], 0, 1, advertised));
+        cluster.DrainAll();
+        Assert.Equal("n2", cluster.Node("n1").LeaderId);
+        long round = 0;
+        cluster.Transport.Reregister("n2", envelope =>
+        {
+            if (envelope.Payload is RequestVote vote && vote.PreVote)
+            {
+                round = vote.Round;
+            }
+        });
+        cluster.Transport.Reregister("n3", envelope =>
+        {
+            if (envelope.Payload is RequestVote vote && vote.PreVote)
+            {
+                round = vote.Round;
+            }
+        });
+        cluster.Advance(timeout);
+        Assert.Equal(Role.Follower, cluster.Node("n1").Role);
+        Assert.True(round > 0);
+        cluster.Transport.Send("n3", "n1", new RequestVoteResponse(cluster.Node("n1").CurrentTerm, false, true, round));
+        cluster.DrainAll();
+        RaftNode node = cluster.Node("n1");
+        Assert.Equal(500, node.NextDeadlineMillis());
+        Assert.Equal(4, node.CurrentTerm);
+        cluster.Clock.Advance(500 - timeout - 1);
+        cluster.DrainAll();
+        Assert.Equal(500, node.NextDeadlineMillis());
+        Assert.Equal(Role.Follower, node.Role);
+        Assert.Equal(4, node.CurrentTerm);
+    }
+
+    [Fact]
+    public void FollowerReadLease_includesPauseSlack_andAPromotedLeaderClearsIt()
+    {
+        ClusterHarness cluster = Elect(150);
+        cluster.Advance(Heartbeat.Milliseconds);
+        RaftNode follower = cluster.Node("n2");
+        follower.SetFollowerLeasePauseSlackMillis(40);
+        cluster.Isolate("n2");
+        long bound = 100_000;
+        cluster.Clock.Advance(bound - 40);
+        follower.Drain();
+        Assert.True(follower.FollowerReadLeaseValid);
+        Assert.Equal(Role.Follower, follower.Role);
+        cluster.Clock.Advance(80);
+        follower.Drain();
+        Assert.False(follower.FollowerReadLeaseValid);
+
+        var promoted = new ClusterHarness();
+        var slow = TimeSpan.FromMilliseconds(100_000);
+        promoted.AddNode("n1", ["n2", "n3"], slow, Heartbeat);
+        promoted.AddNode("n2", ["n1", "n3"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        promoted.AddNode("n3", ["n1", "n2"], slow, Heartbeat);
+        promoted.Transport.Send("n1", "n2", new AppendEntries(1, "n1", 0, 0, [], 0, 1, 80));
+        promoted.DrainAll();
+        promoted.Node("n2").SetFollowerLeasePauseSlackMillis(500);
+        Assert.True(promoted.Node("n2").FollowerReadLeaseValid);
+        promoted.Advance(80);
+        Assert.Equal(Role.Leader, promoted.Node("n2").Role);
+        Assert.False(promoted.Node("n2").FollowerReadLeaseValid);
+        Assert.Null(promoted.Node("n1").LeaderMillis());
+    }
+
+    [Fact]
+    public void LeaderMillis_followsAnAppliedTimestamp_andReadLeaseRequiresApply()
+    {
+        var machine = new StampMachine();
+        var cluster = new ClusterHarness();
+        var election = TimeSpan.FromMilliseconds(150);
+        var slow = TimeSpan.FromMilliseconds(100_000);
+        cluster.AddNode("n1", ["n2", "n3"], election, Heartbeat, machine);
+        cluster.AddNode("n2", ["n1", "n3"], slow, Heartbeat);
+        cluster.AddNode("n3", ["n1", "n2"], slow, Heartbeat);
+        cluster.Advance(150);
+        RaftNode leader = cluster.Node("n1");
+        Assert.Equal(Role.Leader, leader.Role);
+        Assert.Equal(cluster.Clock.Millis, leader.LeaderMillis());
+        Assert.True(leader.ReadIndexSatisfied());
+        Action? parked = null;
+        leader.SetApplyExecutor(action => parked = action);
+        byte[] stamp = new byte[8];
+        BinaryPrimitives.WriteInt64BigEndian(stamp, 5_000);
+        Assert.NotNull(cluster.Propose("n1", stamp));
+        Assert.True(leader.CommitIndex > leader.LastApplied);
+        Assert.False(leader.ReadIndexSatisfied());
+        Assert.Equal(Role.Leader, leader.Role);
+        Assert.NotNull(parked);
+        parked();
+        leader.Drain();
+        Assert.Equal(5_000, machine.Stamp);
+        Assert.Equal(5_000, leader.LeaderMillis());
+        Assert.Null(cluster.Node("n2").LeaderMillis());
+    }
+
+    [Fact]
     public void ReadBatch_keepsAnExactFit_andASingleOversizedEntry()
     {
         var log = new InMemoryRaftLog();
@@ -547,6 +688,21 @@ public sealed class MutationGapTests
         cluster.Transport.Register("n3", _ => { });
         cluster.AddNode("n1", ["n2", "n3"], TimeSpan.FromMilliseconds(electionMillis), Heartbeat);
         return cluster;
+    }
+
+    private sealed class StampMachine : IStateMachine
+    {
+        public long Stamp { get; private set; }
+
+        public void Apply(long index, byte[] command)
+        {
+            if (command.Length == 8)
+            {
+                Stamp = BinaryPrimitives.ReadInt64BigEndian(command);
+            }
+        }
+
+        public long AppliedTimestamp() => Stamp;
     }
 
     private static void HearLeaderWithoutAdvertisedLease(ClusterHarness cluster)

@@ -9,6 +9,10 @@ namespace Synkrolyn.Tests.Net;
 
 public class SocketDeliveryTests
 {
+    /// <summary>
+    /// Hangs the process only if a callback never arrives. Not a timing assertion.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(15);
     [Fact]
     public void FailedConnect_retriesTheSameFrame()
     {
@@ -489,10 +493,9 @@ public class SocketDeliveryTests
         client.Start();
         client.SetPeer("b", new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port));
         client.Send("a", "b", new RequestVote(1, "a", 0, 0));
-        Assert.True(listener.Server.Poll(2_000_000, SelectMode.SelectRead));
-        using TcpClient accepted = listener.AcceptTcpClient();
+        using TcpClient accepted = AcceptConnected(listener);
         accepted.ReceiveBufferSize = 1024;
-        Assert.True(WaitFor(() => Outbound(client) is not null));
+        Assert.True(WaitFor(() => Outbound(client) is not null, HangGuard), "outbound socket was not opened");
         accepted.Client.ReceiveBufferSize = 1;
         Outbound(client)!.Client.SendBufferSize = 1;
         bool blocked = false;
@@ -502,7 +505,7 @@ public class SocketDeliveryTests
             byte[] command = new byte[commandLength];
             command[0] = 4;
             Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0)));
-            if (WaitFor(() => client.SendWaits > waits, TimeSpan.FromMilliseconds(500)))
+            if (WaitFor(() => client.SendWaits > waits, HangGuard))
             {
                 blocked = true;
                 break;
@@ -510,21 +513,47 @@ public class SocketDeliveryTests
         }
 
         Assert.True(blocked, "send never blocked on the silent reader");
+        int donesWhileHeld = client.SendDones;
+        using var hold = new ManualResetEventSlim(false);
+        client.HoldWriterAfterPending = hold;
         byte[] next = new byte[32];
         next[0] = 7;
         Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(2, 1, next)], 0)));
-        using var hold = new ManualResetEventSlim(false);
-        client.HoldWriterAfterPending = hold;
+        using var flushedByCallback = new ManualResetEventSlim(false);
+        Exception? readError = null;
+        var reader = new Thread(() =>
+        {
+            try
+            {
+                accepted.Client.ReceiveBufferSize = 256 * 1024;
+                ReadUntilCommand(accepted, next, flushedByCallback);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+            {
+                readError = ex;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "next-append-reader",
+        };
+        reader.Start();
         try
         {
-            byte[]? frame = ReadAppend(accepted, TimeSpan.FromMilliseconds(800), next);
-            Assert.NotNull(frame);
+            Assert.True(
+                flushedByCallback.Wait(HangGuard),
+                "the next append was not readable while the writer was still inside the pending send");
+            Assert.Equal(donesWhileHeld, client.SendDones);
         }
         finally
         {
             hold.Set();
             client.HoldWriterAfterPending = null;
+            accepted.Close();
+            reader.Join(HangGuard);
         }
+
+        Assert.Null(readError);
     }
 
     /// <summary>
@@ -535,6 +564,47 @@ public class SocketDeliveryTests
     {
         PropertyInfo? property = typeof(SocketTransport).GetProperty("PeerDeadTimeout");
         property?.SetValue(transport, timeout);
+    }
+
+    /// <summary>Blocks until the listener accepts. A missing connect trips <see cref="HangGuard"/>.</summary>
+    private static TcpClient AcceptConnected(TcpListener listener)
+    {
+        Task<TcpClient> accepting = listener.AcceptTcpClientAsync();
+        Assert.True(accepting.Wait(HangGuard), "peer did not connect");
+        return accepting.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Blocks until <paramref name="command"/> is decoded, then signals.
+    /// One decoder stays for the whole socket: a vote and an append can share a read.
+    /// </summary>
+    private static void ReadUntilCommand(TcpClient client, byte[] command, ManualResetEventSlim found)
+    {
+        client.Client.ReceiveTimeout = 0;
+        var decoder = new FrameCodec.Decoder();
+        var codec = new RpcWireCodec();
+        byte[] buf = new byte[8192];
+        NetworkStream stream = client.GetStream();
+        while (true)
+        {
+            int n = stream.Read(buf, 0, buf.Length);
+            if (n <= 0)
+            {
+                return;
+            }
+
+            foreach (byte[] frame in decoder.Push(buf.AsSpan(0, n).ToArray()))
+            {
+                if (codec.Decode(frame).Payload is AppendEntries append
+                    && append.Entries.Count == 1
+                    && append.Entries[0].Command.Length == command.Length
+                    && append.Entries[0].Command[0] == command[0])
+                {
+                    found.Set();
+                    return;
+                }
+            }
+        }
     }
 
     /// <summary>
