@@ -499,13 +499,16 @@ public class SocketDeliveryTests
         accepted.Client.ReceiveBufferSize = 1;
         Outbound(client)!.Client.SendBufferSize = 1;
         bool blocked = false;
-        foreach (int commandLength in new[] { 256 * 1024, 512 * 1024, 900_000 })
+        var filling = System.Diagnostics.Stopwatch.StartNew();
+        while (filling.Elapsed < HangGuard)
         {
             int waits = client.SendWaits;
-            byte[] command = new byte[commandLength];
+            byte[] command = new byte[900_000];
             command[0] = 4;
             Assert.True(client.Send("a", "b", new AppendEntries(1, "a", 0, 0, [new LogEntry(1, 1, command)], 0)));
-            if (WaitFor(() => client.SendWaits > waits, HangGuard))
+            // A full window parks inside SendAsync and increments SendWaits at once.
+            // A frame the kernel still accepts does not, so the next frame keeps filling.
+            if (WaitFor(() => client.SendWaits > waits, TimeSpan.FromMilliseconds(250)))
             {
                 blocked = true;
                 break;

@@ -306,10 +306,12 @@ public sealed class SocketTransport : ITransport, IDisposable
                 IsBackground = true,
                 Name = "synkrolyn-write-" + _nodeId + "-" + recipient,
             };
+            // Start before publishing. Dispose joins whatever is in _writers, and
+            // Join throws if it observes the thread before Start.
+            spawned.Start();
             _writers[recipient] = spawned;
         }
 
-        spawned.Start();
         return link;
     }
 
@@ -326,7 +328,7 @@ public sealed class SocketTransport : ITransport, IDisposable
             // Stopping the listener unblocks Accept.
         }
 
-        _acceptor?.Join(1000);
+        JoinStarted(_acceptor);
 
         PeerLink[] links;
         Thread[] writers;
@@ -362,7 +364,7 @@ public sealed class SocketTransport : ITransport, IDisposable
 
         foreach (Thread writer in writers)
         {
-            writer.Join(1000);
+            JoinStarted(writer);
         }
 
         foreach (PeerLink link in links)
@@ -371,6 +373,17 @@ public sealed class SocketTransport : ITransport, IDisposable
         }
 
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>Join a thread Dispose might observe before that thread is started.</summary>
+    private static void JoinStarted(Thread? thread)
+    {
+        if (thread is null || (thread.ThreadState & System.Threading.ThreadState.Unstarted) != 0)
+        {
+            return;
+        }
+
+        thread.Join(1000);
     }
 
     private void AcceptLoop()
