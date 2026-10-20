@@ -21,7 +21,21 @@ export type LogEntry = {
   command: string;
 };
 
-export type MessageKind = "requestVote" | "voteReply" | "appendEntries" | "appendReply";
+export type MessageKind = "requestVote" | "voteReply" | "preVote" | "preVoteReply" | "appendEntries" | "appendReply";
+
+export type ReadStatus = "pending" | "ok" | "refused";
+
+export type ReadResult = {
+  id: number;
+  leaderId: number;
+  status: ReadStatus;
+  value: string | null;
+  roundTrip: boolean;
+  stale: boolean;
+  issuedAt: number;
+  term: number;
+  acks: number[];
+};
 
 export type Message = {
   id: number;
@@ -40,6 +54,7 @@ export type Message = {
   leaderCommit: number;
   success: boolean;
   matchIndex: number;
+  sentAt: number;
 };
 
 export type NodeState = {
@@ -56,6 +71,11 @@ export type NodeState = {
   votes: number[];
   nextIndex: number[];
   matchIndex: number[];
+  preVoting: boolean;
+  preVotes: number[];
+  peerContact: number[];
+  quorumUntil: number;
+  leaseUntil: number;
 };
 
 export type PendingWrite = {
@@ -74,6 +94,10 @@ export type Sim = {
   flags: FeatureFlags;
   queue: PendingWrite[];
   travelTicks: number;
+  elections: number;
+  reads: ReadResult[];
+  nextReadId: number;
+  banner: string;
 };
 
 export type CreateOptions = {
@@ -83,6 +107,10 @@ export type CreateOptions = {
 };
 
 const HEARTBEAT_TICKS = 3;
+const LEADER_FRESH_TICKS = 6;
+const QUORUM_WINDOW = 10;
+const LEASE_TICKS = 8;
+const READ_TIMEOUT = 16;
 
 export function cloneSim(sim: Sim): Sim {
   return {
@@ -95,6 +123,8 @@ export function cloneSim(sim: Sim): Sim {
       votes: node.votes.slice(),
       nextIndex: node.nextIndex.slice(),
       matchIndex: node.matchIndex.slice(),
+      preVotes: node.preVotes.slice(),
+      peerContact: node.peerContact.slice(),
     })),
     messages: sim.messages.map((message) => ({
       ...message,
@@ -105,6 +135,10 @@ export function cloneSim(sim: Sim): Sim {
     flags: { ...sim.flags },
     queue: sim.queue.map((item) => ({ ...item })),
     travelTicks: sim.travelTicks,
+    elections: sim.elections,
+    reads: sim.reads.map((read) => ({ ...read, acks: read.acks.slice() })),
+    nextReadId: sim.nextReadId,
+    banner: sim.banner,
   };
 }
 
@@ -122,6 +156,10 @@ export function createSim(options: CreateOptions = {}): Sim {
     flags: { ...defaultFlags, ...options.flags },
     queue: [],
     travelTicks: 2,
+    elections: 0,
+    reads: [],
+    nextReadId: 1,
+    banner: "",
   };
   for (let id = 0; id < nodeCount; id += 1) {
     sim.nodes.push({
@@ -138,6 +176,11 @@ export function createSim(options: CreateOptions = {}): Sim {
       votes: [],
       nextIndex: [],
       matchIndex: [],
+      preVoting: false,
+      preVotes: [],
+      peerContact: [],
+      quorumUntil: 0,
+      leaseUntil: 0,
     });
   }
   return sim;
@@ -147,8 +190,12 @@ export function tick(sim: Sim): Sim {
   noteFeatureFlags(sim);
   sim.tickCount += 1;
   deliver(sim);
+  settleReads(sim);
   for (const node of sim.nodes) {
     if (node.crashed) continue;
+    if (node.role === "leader" && sim.flags.checkQuorum && sim.tickCount > node.quorumUntil) {
+      stepDown(node, node.term, sim);
+    }
     if (node.role === "leader") {
       flushQueue(sim, node);
       node.heartbeatElapsed += 1;
@@ -157,7 +204,10 @@ export function tick(sim: Sim): Sim {
       replicate(sim, node, heartbeatDue);
     } else {
       node.electionElapsed += 1;
-      if (node.electionElapsed >= node.electionTimeout) beginElection(sim, node);
+      if (node.electionElapsed >= node.electionTimeout) {
+        if (sim.flags.preVote) beginPreVote(sim, node);
+        else beginElection(sim, node);
+      }
     }
   }
   return sim;
@@ -214,12 +264,100 @@ export function setPartitions(sim: Sim, groups: number[][] | null): void {
 }
 
 function noteFeatureFlags(sim: Sim): void {
-  // Later chapters turn these on. Base Raft does not read them.
-  void sim.flags.preVote;
-  void sim.flags.checkQuorum;
-  void sim.flags.leases;
-  void sim.flags.readIndex;
+  // The Synkrolyn chapter turns this on later. Extended Raft does not read it.
   void sim.flags.synkrolynImprovements;
+}
+
+export function requestRead(sim: Sim, nodeId: number): ReadResult {
+  const node = sim.nodes[nodeId];
+  const read: ReadResult = {
+    id: sim.nextReadId,
+    leaderId: nodeId,
+    status: "refused",
+    value: null,
+    roundTrip: false,
+    stale: false,
+    issuedAt: sim.tickCount,
+    term: node?.term ?? 0,
+    acks: [],
+  };
+  sim.nextReadId += 1;
+  if (!node || node.crashed || node.role !== "leader") {
+    sim.reads.push(read);
+    return read;
+  }
+  const value = committedValue(node);
+  const leaseOpen = sim.flags.leases && node.leaseUntil > 0 && sim.tickCount <= node.leaseUntil;
+  if (leaseOpen) {
+    read.status = "ok";
+    read.value = value;
+    read.stale = markStale(sim, value);
+    sim.reads.push(read);
+    return read;
+  }
+  if (sim.flags.leases && !sim.flags.readIndex) {
+    sim.reads.push(read);
+    return read;
+  }
+  if (sim.flags.readIndex) {
+    read.status = "pending";
+    read.roundTrip = true;
+    sim.reads.push(read);
+    return read;
+  }
+  read.status = "ok";
+  read.value = value;
+  read.stale = markStale(sim, value);
+  sim.reads.push(read);
+  return read;
+}
+
+function committedValue(node: NodeState): string | null {
+  if (node.commitIndex <= 0) return null;
+  return node.log[node.commitIndex - 1]?.command ?? null;
+}
+
+function newestCommitted(sim: Sim): string | null {
+  let bestIndex = 0;
+  let best: string | null = null;
+  for (const node of sim.nodes) {
+    if (node.commitIndex > bestIndex) {
+      bestIndex = node.commitIndex;
+      best = node.log[node.commitIndex - 1]?.command ?? null;
+    }
+  }
+  return best;
+}
+
+function markStale(sim: Sim, value: string | null): boolean {
+  const newest = newestCommitted(sim);
+  return newest !== null && value !== newest;
+}
+
+function settleReads(sim: Sim): void {
+  for (const read of sim.reads) {
+    if (read.status !== "pending") continue;
+    const leader = sim.nodes[read.leaderId];
+    if (!leader || leader.crashed || leader.role !== "leader" || leader.term !== read.term) {
+      read.status = "refused";
+      continue;
+    }
+    if (sim.tickCount - read.issuedAt >= READ_TIMEOUT) read.status = "refused";
+  }
+}
+
+function noteReadAck(sim: Sim, leader: NodeState, from: number, sentAt: number): void {
+  for (const read of sim.reads) {
+    if (read.status !== "pending" || read.leaderId !== leader.id || read.term !== leader.term) continue;
+    if (sentAt <= read.issuedAt) continue;
+    if (!read.acks.includes(from)) read.acks.push(from);
+    if (read.acks.length + 1 >= majority(sim)) {
+      read.status = "ok";
+      read.value = committedValue(leader);
+      read.stale = markStale(sim, read.value);
+      read.roundTrip = true;
+    }
+  }
 }
 
 function nextUnit(sim: Sim): number {
@@ -294,13 +432,31 @@ function flushQueue(sim: Sim, leader: NodeState): void {
   sim.queue = remaining;
 }
 
+function beginPreVote(sim: Sim, node: NodeState): void {
+  node.preVoting = true;
+  node.preVotes = [node.id];
+  node.role = "follower";
+  node.electionElapsed = 0;
+  node.electionTimeout = rollTimeout(sim, node.id);
+  const prospective = node.term + 1;
+  for (const peer of sim.nodes) {
+    if (peer.id === node.id) continue;
+    send(sim, emptyMessage(node.id, peer.id, "preVote", prospective, {
+      lastLogIndex: lastIndex(node),
+      lastLogTerm: lastTerm(node),
+    }));
+  }
+}
+
 function beginElection(sim: Sim, node: NodeState): void {
+  node.preVoting = false;
   node.role = "candidate";
   node.term += 1;
   node.votedFor = node.id;
   node.votes = [node.id];
   node.electionElapsed = 0;
   node.electionTimeout = rollTimeout(sim, node.id);
+  sim.elections += 1;
   for (const peer of sim.nodes) {
     if (peer.id === node.id) continue;
     send(sim, emptyMessage(node.id, peer.id, "requestVote", node.term, {
@@ -318,8 +474,24 @@ function becomeLeader(sim: Sim, node: NodeState): void {
   node.matchIndex = sim.nodes.map(() => 0);
   node.matchIndex[node.id] = lastIndex(node);
   node.heartbeatElapsed = 0;
+  node.peerContact = sim.nodes.map(() => 0);
+  node.quorumUntil = sim.tickCount + QUORUM_WINDOW;
+  node.leaseUntil = 0;
   flushQueue(sim, node);
   replicate(sim, node, true);
+}
+
+function noteQuorum(sim: Sim, leader: NodeState): void {
+  let fresh = 1;
+  for (const peer of sim.nodes) {
+    if (peer.id === leader.id) continue;
+    const seen = leader.peerContact[peer.id] ?? 0;
+    if (seen > 0 && sim.tickCount - seen <= QUORUM_WINDOW) fresh += 1;
+  }
+  if (fresh >= majority(sim)) {
+    leader.quorumUntil = sim.tickCount + QUORUM_WINDOW;
+    if (sim.flags.leases) leader.leaseUntil = sim.tickCount + LEASE_TICKS;
+  }
 }
 
 function stepDown(node: NodeState, term: number, sim: Sim): void {
@@ -327,6 +499,10 @@ function stepDown(node: NodeState, term: number, sim: Sim): void {
   node.role = "follower";
   node.votedFor = null;
   node.votes = [];
+  node.preVoting = false;
+  node.preVotes = [];
+  node.leaseUntil = 0;
+  node.quorumUntil = 0;
   node.electionElapsed = 0;
   node.electionTimeout = rollTimeout(sim, node.id);
 }
@@ -347,8 +523,33 @@ function deliver(sim: Sim): void {
     if (!reachable(sim, message.from, message.to)) continue;
     if (message.kind === "requestVote") onRequestVote(sim, to, message);
     else if (message.kind === "voteReply") onVoteReply(sim, to, message);
+    else if (message.kind === "preVote") onPreVote(sim, to, message);
+    else if (message.kind === "preVoteReply") onPreVoteReply(sim, to, message);
     else if (message.kind === "appendEntries") onAppendEntries(sim, to, message);
     else onAppendReply(sim, to, message);
+  }
+}
+
+function onPreVote(sim: Sim, voter: NodeState, message: Message): void {
+  const heardLeaderRecently = voter.role === "leader" || voter.electionElapsed < LEADER_FRESH_TICKS;
+  const granted =
+    message.term > voter.term &&
+    !heardLeaderRecently &&
+    logUpToDate(message.lastLogIndex, message.lastLogTerm, voter);
+  send(sim, emptyMessage(voter.id, message.from, "preVoteReply", voter.term, { granted }));
+}
+
+function onPreVoteReply(sim: Sim, candidate: NodeState, message: Message): void {
+  if (message.term > candidate.term) {
+    candidate.preVoting = false;
+    stepDown(candidate, message.term, sim);
+    return;
+  }
+  if (!candidate.preVoting || !message.granted) return;
+  if (!candidate.preVotes.includes(message.from)) candidate.preVotes.push(message.from);
+  if (candidate.preVotes.length >= majority(sim)) {
+    candidate.preVoting = false;
+    beginElection(sim, candidate);
   }
 }
 
@@ -386,6 +587,7 @@ function onAppendEntries(sim: Sim, follower: NodeState, message: Message): void 
   }
   follower.role = "follower";
   follower.votes = [];
+  follower.preVoting = false;
   follower.electionElapsed = 0;
   if (message.prevLogIndex > 0) {
     const previous = follower.log[message.prevLogIndex - 1];
@@ -414,6 +616,7 @@ function onAppendEntries(sim: Sim, follower: NodeState, message: Message): void 
     emptyMessage(follower.id, message.from, "appendReply", follower.term, {
       success: true,
       matchIndex: follower.log.length,
+      sentAt: message.sentAt,
     }),
   );
 }
@@ -431,6 +634,9 @@ function onAppendReply(sim: Sim, leader: NodeState, message: Message): void {
   }
   leader.matchIndex[message.from] = Math.max(leader.matchIndex[message.from] ?? 0, message.matchIndex);
   leader.nextIndex[message.from] = message.matchIndex + 1;
+  leader.peerContact[message.from] = sim.tickCount;
+  noteQuorum(sim, leader);
+  noteReadAck(sim, leader, message.from, message.sentAt);
   advanceCommit(sim, leader);
 }
 
@@ -466,6 +672,7 @@ function replicate(sim: Sim, leader: NodeState, heartbeatDue: boolean): void {
         prevLogTerm,
         entries,
         leaderCommit: leader.commitIndex,
+        sentAt: sim.tickCount,
       }),
     );
   }
@@ -492,6 +699,7 @@ function emptyMessage(
     leaderCommit: 0,
     success: false,
     matchIndex: 0,
+    sentAt: 0,
     ...extra,
   };
 }

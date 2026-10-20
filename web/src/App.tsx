@@ -1,12 +1,17 @@
 import { useEffect, useReducer } from "react";
 import { cloneSim, crash, restart, setPartitions, tick, type Sim } from "./sim/raft";
-import { baseSteps, chapterLinks, minoritySplit, type ChapterStep } from "./ui/chapters";
+import { baseSteps, chapterLinks, extendedSteps, minoritySplit, type ChapterStep } from "./ui/chapters";
 import { Stage } from "./ui/Stage";
 
 type Speed = 1 | 2 | 4;
+type ChapterId = "base" | "extended";
+type Compare = { off: number | null; on: number | null };
 
 type State = {
+  chapter: ChapterId;
   stepIndex: number;
+  extensionOn: boolean;
+  compare: Compare;
   sim: Sim;
   originTick: number;
   fired: number[];
@@ -23,14 +28,31 @@ type Action =
   | { type: "reset" }
   | { type: "speed"; speed: Speed }
   | { type: "goto"; index: number }
+  | { type: "chapter"; id: ChapterId }
+  | { type: "toggle-extension" }
   | { type: "toggle-node"; id: number }
   | { type: "toggle-partition" };
 
-function loadStep(index: number, speed: Speed = 1): State {
-  const step = baseSteps[index] ?? baseSteps[0]!;
-  const sim = step.setup();
+function stepsFor(chapter: ChapterId): ChapterStep[] {
+  return chapter === "extended" ? extendedSteps : baseSteps;
+}
+
+function loadStep(
+  chapter: ChapterId,
+  index: number,
+  speed: Speed = 1,
+  extensionOn = false,
+  compare: Compare = { off: null, on: null },
+): State {
+  const steps = stepsFor(chapter);
+  const step = steps[index] ?? steps[0]!;
+  const enabled = chapter === "extended" && extensionOn;
+  const sim = step.setup(enabled);
   return {
+    chapter,
     stepIndex: index,
+    extensionOn: enabled,
+    compare,
     sim,
     originTick: sim.tickCount,
     fired: [],
@@ -50,12 +72,22 @@ function advance(state: State, step: ChapterStep): State {
       fired.push(event.atTick);
     }
   }
-  const playing = step.pauseWhen(sim) ? false : state.playing;
-  return { ...state, sim, fired, playing, frame: state.frame + 1 };
+  step.onTick?.(sim, relative);
+  let playing = state.playing;
+  let compare = state.compare;
+  if (step.pauseWhen(sim)) {
+    playing = false;
+    if (step.extension) {
+      const value = step.extension.measure(sim);
+      compare = state.extensionOn ? { ...state.compare, on: value } : { ...state.compare, off: value };
+    }
+  }
+  return { ...state, sim, fired, playing, compare, frame: state.frame + 1 };
 }
 
 function reducer(state: State, action: Action): State {
-  const step = baseSteps[state.stepIndex] ?? baseSteps[0]!;
+  const steps = stepsFor(state.chapter);
+  const step = steps[state.stepIndex] ?? steps[0]!;
   switch (action.type) {
     case "play":
       return { ...state, playing: true };
@@ -64,9 +96,15 @@ function reducer(state: State, action: Action): State {
     case "speed":
       return { ...state, speed: action.speed };
     case "goto":
-      return loadStep(action.index, state.speed);
+      return loadStep(state.chapter, action.index, state.speed);
+    case "chapter":
+      return loadStep(action.id, 0, state.speed);
+    case "toggle-extension": {
+      const next = loadStep(state.chapter, state.stepIndex, state.speed, !state.extensionOn, state.compare);
+      return { ...next, playing: true };
+    }
     case "reset":
-      return loadStep(state.stepIndex, state.speed);
+      return loadStep(state.chapter, state.stepIndex, state.speed, state.extensionOn);
     case "tick":
       return advance(state, step);
     case "step":
@@ -91,8 +129,9 @@ function reducer(state: State, action: Action): State {
 }
 
 export function App() {
-  const [state, dispatch] = useReducer(reducer, undefined, () => loadStep(0));
-  const step = baseSteps[state.stepIndex] ?? baseSteps[0]!;
+  const [state, dispatch] = useReducer(reducer, undefined, () => loadStep("base", 0));
+  const steps = stepsFor(state.chapter);
+  const step = steps[state.stepIndex] ?? steps[0]!;
   const tickMs = Math.round(480 / state.speed);
 
   useEffect(() => {
@@ -117,8 +156,13 @@ export function App() {
             <button
               key={link.id}
               type="button"
-              className={link.available ? "chapter current" : "chapter soon"}
+              className={
+                !link.available ? "chapter soon" : link.id === state.chapter ? "chapter current" : "chapter"
+              }
               disabled={!link.available}
+              onClick={() => {
+                if (link.id === "base" || link.id === "extended") dispatch({ type: "chapter", id: link.id });
+              }}
             >
               {link.title}
               {!link.available && <span>coming soon</span>}
@@ -130,7 +174,7 @@ export function App() {
       <main className="layout">
         <section className="story" aria-live="polite">
           <p className="kicker">
-            Chapter 1, step {state.stepIndex + 1} of {baseSteps.length}
+            Chapter {state.chapter === "extended" ? 2 : 1}, step {state.stepIndex + 1} of {steps.length}
           </p>
           <h2>{step.title}</h2>
           <p className="kicker-line">{step.kicker}</p>
@@ -142,6 +186,32 @@ export function App() {
               </li>
             ))}
           </ul>
+          {step.extension && (
+            <div className="extension">
+              <button
+                type="button"
+                className={state.extensionOn ? "on" : ""}
+                aria-pressed={state.extensionOn}
+                onClick={() => dispatch({ type: "toggle-extension" })}
+              >
+                {state.extensionOn ? `${step.extension.name} on` : `${step.extension.name} off`}
+              </button>
+              <div className="compare" aria-label={step.extension.counter}>
+                <p>{step.extension.counter}</p>
+                <div>
+                  <span>Fix off</span>
+                  <strong>{state.compare.off ?? "..."}</strong>
+                </div>
+                <div>
+                  <span>Fix on</span>
+                  <strong>{state.compare.on ?? "..."}</strong>
+                </div>
+              </div>
+              <p className="live">
+                This run: {step.extension.measure(state.sim)}
+              </p>
+            </div>
+          )}
           <div className="pager">
             <button
               type="button"
@@ -153,14 +223,15 @@ export function App() {
             <button
               type="button"
               onClick={() => dispatch({ type: "goto", index: state.stepIndex + 1 })}
-              disabled={state.stepIndex >= baseSteps.length - 1}
+              disabled={state.stepIndex >= steps.length - 1}
             >
               Next
             </button>
           </div>
           <p className="later">
-            Later chapters add PreVote, CheckQuorum, leases, ReadIndex, and the Synkrolyn improvements.
-            Those switches are off for this tour.
+            {state.chapter === "extended"
+              ? "Synkrolyn, the last chapter, is still to come."
+              : "Chapter 2 turns each extension on and off. Synkrolyn is still to come."}
           </p>
         </section>
 
@@ -203,6 +274,9 @@ export function App() {
               Tick {state.sim.tickCount}
             </span>
           </div>
+          {state.sim.banner && state.sim.banner !== "cut" && state.sim.banner !== "asked" && (
+            <p className="banner">{state.sim.banner}</p>
+          )}
           <Stage sim={state.sim} tickMs={tickMs} onToggleNode={(id) => dispatch({ type: "toggle-node", id })} />
         </section>
       </main>
