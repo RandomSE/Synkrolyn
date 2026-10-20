@@ -399,6 +399,100 @@ h2 {
   min-height: 1.4em;
 }
 
+.pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.pair-label {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.pair .stage {
+  height: min(46vw, 380px);
+  min-height: 260px;
+}
+
+.numbers {
+  display: grid;
+  gap: 16px;
+}
+
+.numbers figure {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.numbers figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.numbers figcaption span {
+  color: var(--muted);
+}
+
+.bar-block {
+  display: grid;
+  gap: 6px;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.bar-track {
+  background: #f3ecdf;
+  border-radius: 999px;
+  height: 14px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--slate);
+}
+
+.bar-fill.now { background: var(--sea); }
+
+.bar-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  min-width: 7.5rem;
+  text-align: right;
+}
+
+.finale {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: grid;
+  gap: 12px;
+}
+
+.finale li {
+  background: #fbf7ef;
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+
+.finale h3 {
+  margin: 4px 0;
+  font-family: Fraunces, Georgia, serif;
+  font-weight: 560;
+}
+
+.finale p { margin: 0; line-height: 1.45; }
+
 .legend {
   display: flex;
   flex-wrap: wrap;
@@ -439,6 +533,11 @@ h2 {
   .chapters { margin-top: 16px; }
   .story { margin-bottom: 16px; }
   .stage { height: 460px; min-height: 0; }
+  .pair { grid-template-columns: 1fr; }
+  .pair .stage { height: 320px; }
+  .bar-row { grid-template-columns: 5.5rem 1fr; }
+  .bar-value { grid-column: 2; text-align: left; min-width: 0; }
+  .numbers figcaption { display: grid; }
   .tick-readout { margin-left: 0; }
   .node { width: 76px; }
   .node-id { width: 52px; height: 52px; }

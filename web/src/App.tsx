@@ -1,10 +1,20 @@
 import { useEffect, useReducer } from "react";
 import { cloneSim, crash, restart, setPartitions, tick, type Sim } from "./sim/raft";
-import { baseSteps, chapterLinks, extendedSteps, minoritySplit, type ChapterStep } from "./ui/chapters";
+import { Finale } from "./ui/Finale";
+import { Numbers } from "./ui/Numbers";
 import { Stage } from "./ui/Stage";
+import {
+  baseSteps,
+  chapterLinks,
+  extendedSteps,
+  minoritySplit,
+  synkrolynSteps,
+  type ChapterStep,
+} from "./ui/chapters";
 
 type Speed = 1 | 2 | 4;
-type ChapterId = "base" | "extended";
+type ChapterId = "base" | "extended" | "synkrolyn";
+type Side = "left" | "right";
 type Compare = { off: number | null; on: number | null };
 
 type State = {
@@ -15,6 +25,9 @@ type State = {
   sim: Sim;
   originTick: number;
   fired: number[];
+  right: Sim | null;
+  rightOrigin: number;
+  rightFired: number[];
   playing: boolean;
   speed: Speed;
   frame: number;
@@ -30,11 +43,32 @@ type Action =
   | { type: "goto"; index: number }
   | { type: "chapter"; id: ChapterId }
   | { type: "toggle-extension" }
-  | { type: "toggle-node"; id: number }
+  | { type: "toggle-node"; id: number; side: Side }
   | { type: "toggle-partition" };
 
 function stepsFor(chapter: ChapterId): ChapterStep[] {
-  return chapter === "extended" ? extendedSteps : baseSteps;
+  if (chapter === "extended") return extendedSteps;
+  if (chapter === "synkrolyn") return synkrolynSteps;
+  return baseSteps;
+}
+
+function chapterNumber(chapter: ChapterId): number {
+  if (chapter === "extended") return 2;
+  if (chapter === "synkrolyn") return 3;
+  return 1;
+}
+
+function runMoment(sim: Sim, step: ChapterStep, origin: number, fired: number[]): number[] {
+  const relative = sim.tickCount - origin;
+  const next = fired.slice();
+  for (const event of step.script) {
+    if (event.atTick === relative && !next.includes(event.atTick)) {
+      event.run(sim);
+      next.push(event.atTick);
+    }
+  }
+  step.onTick?.(sim, relative);
+  return next;
 }
 
 function loadStep(
@@ -46,8 +80,10 @@ function loadStep(
 ): State {
   const steps = stepsFor(chapter);
   const step = steps[index] ?? steps[0]!;
-  const enabled = chapter === "extended" && extensionOn;
-  const sim = step.setup(enabled);
+  const pair = Boolean(step.pair);
+  const enabled = !pair && chapter === "extended" && extensionOn;
+  const sim = step.setup(pair ? false : enabled);
+  const right = pair ? step.setup(true) : null;
   return {
     chapter,
     stepIndex: index,
@@ -56,6 +92,9 @@ function loadStep(
     sim,
     originTick: sim.tickCount,
     fired: [],
+    right,
+    rightOrigin: right?.tickCount ?? 0,
+    rightFired: [],
     playing: false,
     speed,
     frame: 0,
@@ -63,26 +102,32 @@ function loadStep(
 }
 
 function advance(state: State, step: ChapterStep): State {
-  const sim = tick(cloneSim(state.sim));
-  const relative = sim.tickCount - state.originTick;
-  const fired = state.fired.slice();
-  for (const event of step.script) {
-    if (event.atTick === relative && !fired.includes(event.atTick)) {
-      event.run(sim);
-      fired.push(event.atTick);
-    }
+  let sim = state.sim;
+  let fired = state.fired;
+  if (!step.pauseWhen(sim)) {
+    sim = tick(cloneSim(sim));
+    fired = runMoment(sim, step, state.originTick, fired);
   }
-  step.onTick?.(sim, relative);
+  let right = state.right;
+  let rightFired = state.rightFired;
+  if (right && step.pair && !step.pauseWhen(right)) {
+    right = tick(cloneSim(right));
+    rightFired = runMoment(right, step, state.rightOrigin, rightFired);
+  }
   let playing = state.playing;
   let compare = state.compare;
-  if (step.pauseWhen(sim)) {
+  const leftDone = step.pauseWhen(sim);
+  const rightDone = !step.pair || right === null || step.pauseWhen(right);
+  if (leftDone && rightDone) {
     playing = false;
-    if (step.extension) {
+    if (step.extension && step.pair && right) {
+      compare = { off: step.extension.measure(sim), on: step.extension.measure(right) };
+    } else if (step.extension) {
       const value = step.extension.measure(sim);
       compare = state.extensionOn ? { ...state.compare, on: value } : { ...state.compare, off: value };
     }
   }
-  return { ...state, sim, fired, playing, compare, frame: state.frame + 1 };
+  return { ...state, sim, right, fired, rightFired, playing, compare, frame: state.frame + 1 };
 }
 
 function reducer(state: State, action: Action): State {
@@ -110,22 +155,39 @@ function reducer(state: State, action: Action): State {
     case "step":
       return { ...advance({ ...state, playing: false }, step), playing: false };
     case "toggle-node": {
-      const current = state.sim.nodes[action.id];
+      const source = action.side === "right" ? state.right : state.sim;
+      if (!source) return state;
+      const current = source.nodes[action.id];
       if (!current) return state;
-      const sim = cloneSim(state.sim);
-      if (current.crashed) restart(sim, action.id);
-      else crash(sim, action.id);
-      return { ...state, sim, frame: state.frame + 1 };
+      const next = cloneSim(source);
+      if (current.crashed) restart(next, action.id);
+      else crash(next, action.id);
+      if (action.side === "right") return { ...state, right: next, frame: state.frame + 1 };
+      return { ...state, sim: next, frame: state.frame + 1 };
     }
     case "toggle-partition": {
       const sim = cloneSim(state.sim);
-      if (state.sim.partitions) setPartitions(sim, null);
-      else setPartitions(sim, minoritySplit(state.sim));
-      return { ...state, sim, frame: state.frame + 1 };
+      setPartitions(sim, state.sim.partitions ? null : minoritySplit(state.sim));
+      let right = state.right;
+      if (right && step.pair) {
+        right = cloneSim(right);
+        setPartitions(right, state.right?.partitions ? null : minoritySplit(right));
+      }
+      return { ...state, sim, right, frame: state.frame + 1 };
     }
     default:
       return state;
   }
+}
+
+function laterLine(chapter: ChapterId): string {
+  if (chapter === "synkrolyn") return "Base Raft and Extended Raft stay in the chapters above.";
+  if (chapter === "extended") return "Chapter 3 runs Extended Raft and Synkrolyn side by side.";
+  return "Chapter 2 turns each extension on and off. Chapter 3 runs both sides at once.";
+}
+
+function showBanner(text: string): boolean {
+  return text.length > 0 && text !== "cut" && text !== "asked";
 }
 
 export function App() {
@@ -133,6 +195,7 @@ export function App() {
   const steps = stepsFor(state.chapter);
   const step = steps[state.stepIndex] ?? steps[0]!;
   const tickMs = Math.round(480 / state.speed);
+  const pair = Boolean(step.pair && state.right);
 
   useEffect(() => {
     if (!state.playing) return;
@@ -161,7 +224,7 @@ export function App() {
               }
               disabled={!link.available}
               onClick={() => {
-                if (link.id === "base" || link.id === "extended") dispatch({ type: "chapter", id: link.id });
+                if (link.available) dispatch({ type: "chapter", id: link.id });
               }}
             >
               {link.title}
@@ -174,7 +237,7 @@ export function App() {
       <main className="layout">
         <section className="story" aria-live="polite">
           <p className="kicker">
-            Chapter {state.chapter === "extended" ? 2 : 1}, step {state.stepIndex + 1} of {steps.length}
+            Chapter {chapterNumber(state.chapter)}, step {state.stepIndex + 1} of {steps.length}
           </p>
           <h2>{step.title}</h2>
           <p className="kicker-line">{step.kicker}</p>
@@ -186,7 +249,7 @@ export function App() {
               </li>
             ))}
           </ul>
-          {step.extension && (
+          {step.extension && !step.pair && (
             <div className="extension">
               <button
                 type="button"
@@ -207,9 +270,20 @@ export function App() {
                   <strong>{state.compare.on ?? "..."}</strong>
                 </div>
               </div>
-              <p className="live">
-                This run: {step.extension.measure(state.sim)}
-              </p>
+              <p className="live">This run: {step.extension.measure(state.sim)}</p>
+            </div>
+          )}
+          {step.pair && step.extension && (
+            <div className="compare" aria-label={step.extension.counter}>
+              <p>{step.extension.counter}</p>
+              <div>
+                <span>Extended Raft</span>
+                <strong>{step.extension.measure(state.sim)}</strong>
+              </div>
+              <div>
+                <span>Synkrolyn</span>
+                <strong>{state.right ? step.extension.measure(state.right) : "..."}</strong>
+              </div>
             </div>
           )}
           <div className="pager">
@@ -228,22 +302,18 @@ export function App() {
               Next
             </button>
           </div>
-          <p className="later">
-            {state.chapter === "extended"
-              ? "Synkrolyn, the last chapter, is still to come."
-              : "Chapter 2 turns each extension on and off. Synkrolyn is still to come."}
-          </p>
+          <p className="later">{laterLine(state.chapter)}</p>
         </section>
 
         <section className="exhibit">
           <div className="controls">
-            <button type="button" onClick={() => dispatch({ type: "play" })} aria-pressed={state.playing} disabled={state.playing}>
+            <button type="button" onClick={() => dispatch({ type: "play" })} aria-pressed={state.playing} disabled={state.playing || Boolean(step.screen)}>
               Play
             </button>
             <button type="button" onClick={() => dispatch({ type: "pause" })} disabled={!state.playing}>
               Pause
             </button>
-            <button type="button" onClick={() => dispatch({ type: "step" })}>
+            <button type="button" onClick={() => dispatch({ type: "step" })} disabled={Boolean(step.screen)}>
               Step
             </button>
             <button type="button" onClick={() => dispatch({ type: "reset" })}>
@@ -262,22 +332,44 @@ export function App() {
                 </button>
               ))}
             </div>
-            <button
-              type="button"
-              onClick={() => dispatch({ type: "toggle-partition" })}
-              aria-pressed={state.sim.partitions !== null}
-              className={state.sim.partitions ? "on" : ""}
-            >
-              {state.sim.partitions ? "Heal the cut" : "Cut the network"}
-            </button>
-            <span className="tick-readout" title="One tick is one small moment in the tour.">
-              Tick {state.sim.tickCount}
-            </span>
+            {!step.screen && (
+              <button
+                type="button"
+                onClick={() => dispatch({ type: "toggle-partition" })}
+                aria-pressed={state.sim.partitions !== null}
+                className={state.sim.partitions ? "on" : ""}
+              >
+                {state.sim.partitions ? "Heal the cut" : "Cut the network"}
+              </button>
+            )}
+            {!step.screen && (
+              <span className="tick-readout" title="One tick is one small moment in the tour.">
+                Tick {state.sim.tickCount}
+              </span>
+            )}
           </div>
-          {state.sim.banner && state.sim.banner !== "cut" && state.sim.banner !== "asked" && (
-            <p className="banner">{state.sim.banner}</p>
+          {step.screen === "numbers" && <Numbers />}
+          {step.screen === "finale" && <Finale />}
+          {!step.screen && pair && state.right && (
+            <div className="pair">
+              <div>
+                <p className="pair-label">Extended Raft</p>
+                {showBanner(state.sim.banner) && <p className="banner">{state.sim.banner}</p>}
+                <Stage sim={state.sim} tickMs={tickMs} onToggleNode={(id) => dispatch({ type: "toggle-node", id, side: "left" })} />
+              </div>
+              <div>
+                <p className="pair-label">Synkrolyn</p>
+                {showBanner(state.right.banner) && <p className="banner">{state.right.banner}</p>}
+                <Stage sim={state.right} tickMs={tickMs} onToggleNode={(id) => dispatch({ type: "toggle-node", id, side: "right" })} />
+              </div>
+            </div>
           )}
-          <Stage sim={state.sim} tickMs={tickMs} onToggleNode={(id) => dispatch({ type: "toggle-node", id })} />
+          {!step.screen && !pair && (
+            <>
+              {showBanner(state.sim.banner) && <p className="banner">{state.sim.banner}</p>}
+              <Stage sim={state.sim} tickMs={tickMs} onToggleNode={(id) => dispatch({ type: "toggle-node", id, side: "left" })} />
+            </>
+          )}
         </section>
       </main>
     </div>

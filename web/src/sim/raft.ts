@@ -6,6 +6,11 @@ export type FeatureFlags = {
   leases: boolean;
   readIndex: boolean;
   synkrolynImprovements: boolean;
+  durableAck: boolean;
+  sessions: boolean;
+  snapshots: boolean;
+  voteGate: boolean;
+  leaseGrace: boolean;
 };
 
 export const defaultFlags: FeatureFlags = {
@@ -14,14 +19,29 @@ export const defaultFlags: FeatureFlags = {
   leases: false,
   readIndex: false,
   synkrolynImprovements: false,
+  durableAck: false,
+  sessions: false,
+  snapshots: false,
+  voteGate: false,
+  leaseGrace: false,
 };
 
 export type LogEntry = {
   term: number;
   command: string;
+  storedAt?: number;
+  client?: string;
+  serial?: number;
 };
 
-export type MessageKind = "requestVote" | "voteReply" | "preVote" | "preVoteReply" | "appendEntries" | "appendReply";
+export type MessageKind =
+  | "requestVote"
+  | "voteReply"
+  | "preVote"
+  | "preVoteReply"
+  | "appendEntries"
+  | "appendReply"
+  | "installSnapshot";
 
 export type ReadStatus = "pending" | "ok" | "refused";
 
@@ -76,6 +96,10 @@ export type NodeState = {
   peerContact: number[];
   quorumUntil: number;
   leaseUntil: number;
+  durableIndex: number;
+  snapshotIndex: number;
+  snapshotTerm: number;
+  voteGateUntil: number;
 };
 
 export type PendingWrite = {
@@ -98,6 +122,11 @@ export type Sim = {
   reads: ReadResult[];
   nextReadId: number;
   banner: string;
+  tally: number;
+  appliedCommit: number;
+  appliedSerials: Record<string, number>;
+  ackedCommand: string | null;
+  mark: number;
 };
 
 export type CreateOptions = {
@@ -111,6 +140,8 @@ const LEADER_FRESH_TICKS = 6;
 const QUORUM_WINDOW = 10;
 const LEASE_TICKS = 8;
 const READ_TIMEOUT = 16;
+const DISK_LAG = 6;
+const CLOCK_DRIFT = 0.01;
 
 export function cloneSim(sim: Sim): Sim {
   return {
@@ -139,6 +170,11 @@ export function cloneSim(sim: Sim): Sim {
     reads: sim.reads.map((read) => ({ ...read, acks: read.acks.slice() })),
     nextReadId: sim.nextReadId,
     banner: sim.banner,
+    tally: sim.tally,
+    appliedCommit: sim.appliedCommit,
+    appliedSerials: { ...sim.appliedSerials },
+    ackedCommand: sim.ackedCommand,
+    mark: sim.mark,
   };
 }
 
@@ -160,6 +196,11 @@ export function createSim(options: CreateOptions = {}): Sim {
     reads: [],
     nextReadId: 1,
     banner: "",
+    tally: 0,
+    appliedCommit: 0,
+    appliedSerials: {},
+    ackedCommand: null,
+    mark: 0,
   };
   for (let id = 0; id < nodeCount; id += 1) {
     sim.nodes.push({
@@ -181,6 +222,10 @@ export function createSim(options: CreateOptions = {}): Sim {
       peerContact: [],
       quorumUntil: 0,
       leaseUntil: 0,
+      durableIndex: 0,
+      snapshotIndex: 0,
+      snapshotTerm: 0,
+      voteGateUntil: 0,
     });
   }
   return sim;
@@ -189,8 +234,10 @@ export function createSim(options: CreateOptions = {}): Sim {
 export function tick(sim: Sim): Sim {
   noteFeatureFlags(sim);
   sim.tickCount += 1;
+  rememberDisk(sim);
   deliver(sim);
   settleReads(sim);
+  applyTally(sim);
   for (const node of sim.nodes) {
     if (node.crashed) continue;
     if (node.role === "leader" && sim.flags.checkQuorum && sim.tickCount > node.quorumUntil) {
@@ -228,6 +275,62 @@ export function leaderId(sim: Sim): number | null {
   return leaders[0]!.id;
 }
 
+export function acknowledged(sim: Sim): string | null {
+  return sim.ackedCommand;
+}
+
+export function powerLoss(sim: Sim, id: number): void {
+  const node = sim.nodes[id];
+  if (!node) return;
+  rememberNode(sim, node);
+  node.log = node.log.filter((entry) => sim.tickCount - (entry.storedAt ?? 0) >= DISK_LAG);
+  node.commitIndex = Math.min(node.commitIndex, node.durableIndex);
+  node.role = "follower";
+  node.votes = [];
+  node.crashed = false;
+  sim.messages = sim.messages.filter((message) => message.from !== id && message.to !== id);
+}
+
+export function submit(sim: Sim, client: string, serial: number, command: string, preferredLeader?: number): void {
+  const target = preferredLeader ?? leaderId(sim);
+  const node = target === null ? undefined : sim.nodes[target];
+  if (!node || node.crashed || node.role !== "leader") return;
+  if (sim.flags.sessions) {
+    const seen = sim.appliedSerials[client] ?? 0;
+    if (serial <= seen) return;
+    if (node.log.some((entry) => entry.client === client && entry.serial === serial)) return;
+  }
+  appendLocal(sim, node, command, { client, serial });
+}
+
+export function compactPrefix(sim: Sim, leaderId: number): void {
+  const leader = sim.nodes[leaderId];
+  if (!leader) return;
+  const index = leader.commitIndex;
+  const term = logEntry(leader, index)?.term ?? leader.term;
+  leader.log = [];
+  if (sim.flags.snapshots) {
+    leader.snapshotIndex = index;
+    leader.snapshotTerm = term;
+  }
+  leader.matchIndex = sim.nodes.map(() => 0);
+  leader.matchIndex[leader.id] = sim.flags.snapshots ? index : 0;
+  leader.nextIndex = sim.nodes.map(() => (sim.flags.snapshots ? index + 1 : 1));
+}
+
+export function campaign(sim: Sim, id: number): void {
+  const node = sim.nodes[id];
+  if (!node || node.crashed) return;
+  const term = node.term + 1;
+  for (const peer of sim.nodes) {
+    if (peer.id === id || peer.role === "leader") continue;
+    send(sim, emptyMessage(id, peer.id, "requestVote", term, {
+      lastLogIndex: lastIndex(node),
+      lastLogTerm: lastTerm(node),
+    }));
+  }
+}
+
 export function propose(sim: Sim, command: string, preferredLeader?: number): void {
   const target = preferredLeader ?? leaderId(sim);
   const node = target === null ? undefined : sim.nodes[target];
@@ -235,7 +338,7 @@ export function propose(sim: Sim, command: string, preferredLeader?: number): vo
     sim.queue.push({ command, leaderId: target });
     return;
   }
-  appendLocal(node, command);
+  appendLocal(sim, node, command);
 }
 
 export function crash(sim: Sim, id: number): void {
@@ -379,12 +482,77 @@ function majority(sim: Sim): number {
 }
 
 function lastIndex(node: NodeState): number {
-  return node.log.length;
+  return node.snapshotIndex + node.log.length;
 }
 
 function lastTerm(node: NodeState): number {
-  if (node.log.length === 0) return 0;
+  if (node.log.length === 0) return node.snapshotTerm;
   return node.log[node.log.length - 1]!.term;
+}
+
+function logEntry(node: NodeState, index: number): LogEntry | undefined {
+  if (index <= node.snapshotIndex || index <= 0) return undefined;
+  return node.log[index - node.snapshotIndex - 1];
+}
+
+function leaseSpan(sim: Sim): number {
+  if (!sim.flags.leaseGrace) return LEASE_TICKS;
+  return Math.floor(LEASE_TICKS * (1 - CLOCK_DRIFT));
+}
+
+function rememberNode(sim: Sim, node: NodeState): void {
+  let kept = 0;
+  for (const entry of node.log) {
+    if (sim.tickCount - (entry.storedAt ?? 0) >= DISK_LAG) kept += 1;
+  }
+  node.durableIndex = node.snapshotIndex + kept;
+}
+
+function rememberDisk(sim: Sim): void {
+  for (const node of sim.nodes) {
+    if (node.crashed) continue;
+    rememberNode(sim, node);
+    if (node.role === "leader" && sim.flags.durableAck) {
+      node.matchIndex[node.id] = node.durableIndex;
+    }
+  }
+}
+
+function applyTally(sim: Sim): void {
+  const leader = sim.nodes.find((node) => node.role === "leader" && !node.crashed);
+  if (!leader) return;
+  while (sim.appliedCommit < leader.commitIndex) {
+    const entry = logEntry(leader, sim.appliedCommit + 1);
+    if (!entry) break;
+    sim.appliedCommit += 1;
+    if (entry.command !== "add") continue;
+    if (sim.flags.sessions && entry.client !== undefined && entry.serial !== undefined) {
+      const seen = sim.appliedSerials[entry.client] ?? 0;
+      if (entry.serial <= seen) continue;
+      sim.appliedSerials[entry.client] = entry.serial;
+    }
+    sim.tally += 1;
+  }
+}
+
+function onInstallSnapshot(sim: Sim, follower: NodeState, message: Message): void {
+  if (message.term > follower.term) stepDown(follower, message.term, sim);
+  if (message.term < follower.term) {
+    send(sim, emptyMessage(follower.id, message.from, "appendReply", follower.term, { success: false }));
+    return;
+  }
+  follower.snapshotIndex = message.lastLogIndex;
+  follower.snapshotTerm = message.lastLogTerm;
+  follower.log = [];
+  follower.commitIndex = Math.max(follower.commitIndex, message.lastLogIndex);
+  follower.durableIndex = follower.snapshotIndex;
+  follower.role = "follower";
+  follower.electionElapsed = 0;
+  send(sim, emptyMessage(follower.id, message.from, "appendReply", follower.term, {
+    success: true,
+    matchIndex: follower.snapshotIndex,
+    sentAt: message.sentAt,
+  }));
 }
 
 function logUpToDate(lastLogIndex: number, lastLogTerm: number, voter: NodeState): boolean {
@@ -412,19 +580,19 @@ function send(sim: Sim, message: Omit<Message, "id" | "travel" | "totalTravel">)
   sim.nextMessageId += 1;
 }
 
-function appendLocal(node: NodeState, command: string): void {
-  node.log.push({ term: node.term, command });
+function appendLocal(sim: Sim, node: NodeState, command: string, extra: Partial<LogEntry> = {}): void {
+  node.log.push({ term: node.term, command, storedAt: sim.tickCount, ...extra });
   if (node.matchIndex.length === 0) {
     node.matchIndex = node.nextIndex.map(() => 0);
   }
-  node.matchIndex[node.id] = node.log.length;
+  node.matchIndex[node.id] = sim.flags.durableAck ? node.durableIndex : lastIndex(node);
 }
 
 function flushQueue(sim: Sim, leader: NodeState): void {
   const remaining: PendingWrite[] = [];
   for (const item of sim.queue) {
     if (item.leaderId === null || item.leaderId === leader.id) {
-      appendLocal(leader, item.command);
+      appendLocal(sim, leader, item.command);
     } else {
       remaining.push(item);
     }
@@ -490,7 +658,7 @@ function noteQuorum(sim: Sim, leader: NodeState): void {
   }
   if (fresh >= majority(sim)) {
     leader.quorumUntil = sim.tickCount + QUORUM_WINDOW;
-    if (sim.flags.leases) leader.leaseUntil = sim.tickCount + LEASE_TICKS;
+    if (sim.flags.leases) leader.leaseUntil = sim.tickCount + leaseSpan(sim);
   }
 }
 
@@ -526,11 +694,20 @@ function deliver(sim: Sim): void {
     else if (message.kind === "preVote") onPreVote(sim, to, message);
     else if (message.kind === "preVoteReply") onPreVoteReply(sim, to, message);
     else if (message.kind === "appendEntries") onAppendEntries(sim, to, message);
+    else if (message.kind === "installSnapshot") onInstallSnapshot(sim, to, message);
     else onAppendReply(sim, to, message);
   }
 }
 
+function voteGated(sim: Sim, voter: NodeState): boolean {
+  return sim.flags.voteGate && sim.tickCount < voter.voteGateUntil;
+}
+
 function onPreVote(sim: Sim, voter: NodeState, message: Message): void {
+  if (voteGated(sim, voter)) {
+    send(sim, emptyMessage(voter.id, message.from, "preVoteReply", voter.term, { granted: false }));
+    return;
+  }
   const heardLeaderRecently = voter.role === "leader" || voter.electionElapsed < LEADER_FRESH_TICKS;
   const granted =
     message.term > voter.term &&
@@ -554,6 +731,10 @@ function onPreVoteReply(sim: Sim, candidate: NodeState, message: Message): void 
 }
 
 function onRequestVote(sim: Sim, voter: NodeState, message: Message): void {
+  if (voteGated(sim, voter)) {
+    send(sim, emptyMessage(voter.id, message.from, "voteReply", voter.term, { granted: false }));
+    return;
+  }
   if (message.term > voter.term) stepDown(voter, message.term, sim);
   let granted = false;
   if (
@@ -589,6 +770,7 @@ function onAppendEntries(sim: Sim, follower: NodeState, message: Message): void 
   follower.votes = [];
   follower.preVoting = false;
   follower.electionElapsed = 0;
+  if (sim.flags.voteGate) follower.voteGateUntil = sim.tickCount + follower.electionTimeout;
   if (message.prevLogIndex > 0) {
     const previous = follower.log[message.prevLogIndex - 1];
     if (!previous || previous.term !== message.prevLogTerm) {
@@ -601,10 +783,10 @@ function onAppendEntries(sim: Sim, follower: NodeState, message: Message): void 
     index += 1;
     const existing = follower.log[index - 1];
     if (!existing) {
-      follower.log.push(entry);
+      follower.log.push({ ...entry, storedAt: sim.tickCount });
     } else if (existing.term !== entry.term) {
       follower.log.length = index - 1;
-      follower.log.push(entry);
+      follower.log.push({ ...entry, storedAt: sim.tickCount });
     }
   }
   if (follower.commitIndex > follower.log.length) follower.commitIndex = follower.log.length;
@@ -615,7 +797,7 @@ function onAppendEntries(sim: Sim, follower: NodeState, message: Message): void 
     sim,
     emptyMessage(follower.id, message.from, "appendReply", follower.term, {
       success: true,
-      matchIndex: follower.log.length,
+      matchIndex: sim.flags.durableAck ? follower.durableIndex : lastIndex(follower),
       sentAt: message.sentAt,
     }),
   );
@@ -642,15 +824,19 @@ function onAppendReply(sim: Sim, leader: NodeState, message: Message): void {
 
 function advanceCommit(sim: Sim, leader: NodeState): void {
   const needed = majority(sim);
-  for (let index = leader.log.length; index > leader.commitIndex; index -= 1) {
-    if (leader.log[index - 1]!.term !== leader.term) continue;
-    let copies = 1;
+  for (let index = lastIndex(leader); index > leader.commitIndex; index -= 1) {
+    const entry = logEntry(leader, index);
+    if (!entry || entry.term !== leader.term) continue;
+    const selfStored = !sim.flags.durableAck || leader.durableIndex >= index;
+    let copies = selfStored ? 1 : 0;
     for (const peer of sim.nodes) {
       if (peer.id === leader.id) continue;
       if ((leader.matchIndex[peer.id] ?? 0) >= index) copies += 1;
     }
     if (copies >= needed) {
       leader.commitIndex = index;
+      const acked = logEntry(leader, index);
+      if (acked) sim.ackedCommand = acked.command;
       return;
     }
   }
@@ -659,6 +845,15 @@ function advanceCommit(sim: Sim, leader: NodeState): void {
 function replicate(sim: Sim, leader: NodeState, heartbeatDue: boolean): void {
   for (const peer of sim.nodes) {
     if (peer.id === leader.id) continue;
+    if (leader.snapshotIndex > 0 && (leader.matchIndex[peer.id] ?? 0) < leader.snapshotIndex) {
+      send(sim, emptyMessage(leader.id, peer.id, "installSnapshot", leader.term, {
+        lastLogIndex: leader.snapshotIndex,
+        lastLogTerm: leader.snapshotTerm,
+        leaderCommit: leader.commitIndex,
+        sentAt: sim.tickCount,
+      }));
+      continue;
+    }
     const next = leader.nextIndex[peer.id] ?? lastIndex(leader) + 1;
     const behind = lastIndex(leader) >= next;
     if (!heartbeatDue && !behind) continue;

@@ -1,12 +1,19 @@
 import {
+  acknowledged,
+  campaign,
+  compactPrefix,
   crash,
   createSim,
   leaderId,
+  powerLoss,
   propose,
   requestRead,
+  restart,
   runUntil,
   setPartitions,
+  submit,
   tick,
+  type FeatureFlags,
   type Sim,
 } from "../sim/raft";
 
@@ -19,7 +26,7 @@ export type ChapterLink = {
 export const chapterLinks: ChapterLink[] = [
   { id: "base", title: "Base Raft", available: true },
   { id: "extended", title: "Extended Raft", available: true },
-  { id: "synkrolyn", title: "Synkrolyn", available: false },
+  { id: "synkrolyn", title: "Synkrolyn", available: true },
 ];
 
 export type GlossaryLine = {
@@ -38,11 +45,14 @@ export type ChapterStep = {
   onTick?: (sim: Sim, relative: number) => void;
   pauseWhen: (sim: Sim) => boolean;
   extension?: {
-    flag: "preVote" | "checkQuorum" | "readIndex" | "leases";
+    flag: string;
     name: string;
     counter: string;
     measure: (sim: Sim) => number;
+    better?: "lower" | "higher";
   };
+  pair?: boolean;
+  screen?: "numbers" | "finale";
 };
 
 const NOTE = "hello";
@@ -434,6 +444,265 @@ export const extendedSteps: ChapterStep[] = [
       }
     },
     pauseWhen: (sim) => sim.banner.includes("After the window"),
+  },
+];
+
+function electWith(flags: Partial<FeatureFlags>): Sim {
+  const sim = createSim({ nodeCount: 5, seed: 1, flags });
+  runUntil(sim, (state) => leaderId(state) !== null, 200);
+  sim.messages = [];
+  return sim;
+}
+
+function othersExcept(sim: Sim, id: number): number[] {
+  return sim.nodes.map((node) => node.id).filter((nodeId) => nodeId !== id);
+}
+
+export const synkrolynSteps: ChapterStep[] = [
+  {
+    id: "durable-ack",
+    title: "Told yes before it was saved",
+    kicker: "Waiting for the disk",
+    body: "The leader can say a note is safe as soon as most servers hold it in memory. Pull the power then, and those copies vanish, so the yes was too early. Synkrolyn waits until the note is on disk on a majority before it says yes.",
+    glossary: [
+      { word: "Durable", meaning: "Written to disk, so a power cut does not erase it." },
+      { word: "Acknowledge", meaning: "The moment the group says the write is safe." },
+    ],
+    pair: true,
+    extension: {
+      flag: "durableAck",
+      name: "Durable ack",
+      counter: "Copies still on disk",
+      better: "higher",
+      measure: (sim) => sim.nodes.filter((node) => node.log.some((entry) => entry.command === "save")).length,
+    },
+    setup: (enabled = false) => electWith({ durableAck: enabled }),
+    script: [],
+    onTick: (sim, relative) => {
+      if (sim.banner) return;
+      if (relative === 2) {
+        const leader = leaderId(sim);
+        if (leader !== null) propose(sim, "save", leader);
+        return;
+      }
+      if (acknowledged(sim) === "save") {
+        for (const node of sim.nodes) powerLoss(sim, node.id);
+        const kept = sim.nodes.filter((node) => node.log.some((entry) => entry.command === "save")).length;
+        sim.banner = kept >= 3
+          ? "The yes waited until the note was on disk."
+          : "Said yes, then a power loss erased it.";
+      }
+    },
+    pauseWhen: (sim) => sim.banner.length > 0,
+  },
+  {
+    id: "sessions",
+    title: "The same request, twice",
+    kicker: "A retry should not count twice",
+    body: "A client sends add, hears nothing, and sends that same request again. With no memory of the first one, the group counts it twice. Synkrolyn remembers the client and the request number, so the repeat does not count a second time.",
+    glossary: [
+      { word: "Session", meaning: "A memory of which requests from one client already counted." },
+      { word: "Serial", meaning: "The client's own number for one request." },
+    ],
+    pair: true,
+    extension: {
+      flag: "sessions",
+      name: "Sessions",
+      counter: "Times the add counted",
+      better: "lower",
+      measure: (sim) => sim.tally,
+    },
+    setup: (enabled = false) => electWith({ sessions: enabled }),
+    script: [],
+    onTick: (sim, relative) => {
+      if (sim.banner) return;
+      const leader = leaderId(sim);
+      if (relative === 2 && leader !== null) {
+        submit(sim, "ada", 1, "add", leader);
+        return;
+      }
+      if (relative === 30 && leader !== null) {
+        submit(sim, "ada", 1, "add", leader);
+        return;
+      }
+      if (relative >= 50) {
+        sim.banner = sim.tally > 1
+          ? "The repeat counted a second time."
+          : "The repeat did not count a second time.";
+      }
+    },
+    pauseWhen: (sim) => sim.banner.length > 0,
+  },
+  {
+    id: "snapshots",
+    title: "A blank server and a packed history",
+    kicker: "Catching up after old notes are gone",
+    body: "The leader throws away notes it has already made permanent. A server that was off the whole time comes back empty. Without a packed copy of that history, it never catches up. Synkrolyn sends the packed history, and the blank server jumps forward.",
+    glossary: [
+      { word: "Snapshot", meaning: "A packed copy of everything already made permanent." },
+      { word: "Blank server", meaning: "A server that missed the notes and starts empty." },
+    ],
+    pair: true,
+    extension: {
+      flag: "snapshots",
+      name: "Snapshots",
+      counter: "Notes the blank server holds",
+      better: "higher",
+      measure: (sim) => {
+        const node = sim.nodes[sim.mark];
+        if (!node) return 0;
+        return Math.max(node.commitIndex, node.snapshotIndex);
+      },
+    },
+    setup: (enabled = false) => {
+      const sim = electWith({ snapshots: enabled });
+      const leader = leaderId(sim);
+      if (leader === null) return sim;
+      const behind = othersExcept(sim, leader).at(-1);
+      if (behind === undefined) return sim;
+      sim.mark = behind;
+      crash(sim, behind);
+      for (const command of ["a", "b", "c"]) {
+        propose(sim, command, leader);
+        runUntil(sim, (state) => {
+          const node = state.nodes[leader]!;
+          const index = node.log.findIndex((entry) => entry.command === command);
+          return index >= 0 && node.commitIndex >= index + 1;
+        }, 200);
+      }
+      compactPrefix(sim, leader);
+      restart(sim, behind);
+      sim.messages = [];
+      return sim;
+    },
+    script: [],
+    onTick: (sim, relative) => {
+      if (sim.banner) return;
+      const node = sim.nodes[sim.mark];
+      const held = node ? Math.max(node.commitIndex, node.snapshotIndex) : 0;
+      if (held >= 3 || relative >= 40) {
+        sim.banner = held >= 3
+          ? "The blank server received the packed history."
+          : "The old notes were discarded, and the blank server never caught up.";
+      }
+    },
+    pauseWhen: (sim) => sim.banner.length > 0,
+  },
+  {
+    id: "vote-gate",
+    title: "A vote while the leader is fine",
+    kicker: "Ignoring a challenger too soon",
+    body: "A server that has just heard from the leader should not hand its vote to someone else. Extended Raft still does, which can stir up a new election for no reason. Synkrolyn keeps a short window after each heartbeat. A challenge inside that window is refused, and the leader stays.",
+    glossary: [
+      { word: "Vote gate", meaning: "A short time after hearing the leader when a server will not vote for anyone else." },
+      { word: "Challenger", meaning: "A server that asks for votes before it should." },
+    ],
+    pair: true,
+    extension: {
+      flag: "voteGate",
+      name: "Vote gate",
+      counter: "Votes given to the challenger",
+      better: "lower",
+      measure: (sim) => sim.nodes.filter((node) => node.id !== sim.mark && node.votedFor === sim.mark).length,
+    },
+    setup: (enabled = false) => {
+      const sim = electWith({ voteGate: enabled });
+      for (let i = 0; i < 10; i += 1) tick(sim);
+      const leader = leaderId(sim);
+      sim.mark = leader === null ? 0 : othersExcept(sim, leader)[0] ?? 0;
+      sim.messages = [];
+      return sim;
+    },
+    script: [],
+    onTick: (sim, relative) => {
+      if (sim.banner) return;
+      if (relative === 2) {
+        campaign(sim, sim.mark);
+        return;
+      }
+      if (relative >= 12) {
+        const grants = sim.nodes.filter((node) => node.id !== sim.mark && node.votedFor === sim.mark).length;
+        sim.banner = grants > 0
+          ? "Servers voted for a challenger while the leader was fine."
+          : "The challenge was refused, and the leader stayed.";
+      }
+    },
+    pauseWhen: (sim) => sim.banner.length > 0,
+  },
+  {
+    id: "lease-grace",
+    title: "A promise a little shorter than the clock",
+    kicker: "Leaving room for a slow clock",
+    body: "The leader may answer a read on its own while a short promise holds. Clocks do not agree perfectly, so Synkrolyn ends that promise a little early. At the same moment, the longer promise still answers and the shorter one has already stopped.",
+    glossary: [
+      { word: "Lease", meaning: "A short promise. The leader may answer reads alone until it ends." },
+      { word: "Clock bound", meaning: "The promise is shortened by a small allowance for clocks that disagree." },
+    ],
+    pair: true,
+    extension: {
+      flag: "leaseGrace",
+      name: "Lease grace",
+      counter: "Answers past the shorter window",
+      better: "lower",
+      measure: (sim) => (sim.reads.at(-1)?.status === "ok" ? 1 : 0),
+    },
+    setup: (enabled = false) => {
+      const sim = electWith({ leases: true, leaseGrace: enabled });
+      const leader = leaderId(sim);
+      if (leader !== null) propose(sim, "v1", leader);
+      runUntil(sim, (state) => state.nodes.every((node) => node.commitIndex >= 1), 200);
+      for (let i = 0; i < 20; i += 1) tick(sim);
+      sim.messages = [];
+      return sim;
+    },
+    script: [],
+    onTick: (sim, relative) => {
+      if (sim.banner) return;
+      const leader = leaderId(sim);
+      if (relative === 2 && leader !== null && !sim.partitions) {
+        setPartitions(sim, [[leader], othersExcept(sim, leader)]);
+        sim.mark = sim.nodes[leader]!.leaseUntil;
+        return;
+      }
+      const due = sim.flags.leaseGrace ? sim.mark + 1 : sim.mark;
+      if (!sim.partitions || sim.mark <= 0 || sim.tickCount < due || sim.reads.length > 0) return;
+      const cut = sim.partitions[0]?.[0];
+      if (cut === undefined) return;
+      const read = requestRead(sim, cut);
+      sim.banner = read.status === "ok"
+        ? "It still answered after the shorter window."
+        : "It stopped at the clock bound.";
+    },
+    pauseWhen: (sim) => sim.banner.length > 0,
+  },
+  {
+    id: "numbers",
+    title: "By the numbers",
+    kicker: "One loopback run",
+    body: "Three figures from the benchmark notes, drawn as bars. They come from one loopback run on one machine. They are not a promise about every run.",
+    glossary: [
+      { word: "Baseline", meaning: "The earlier commit those notes compare against." },
+      { word: "This branch", meaning: "The Synkrolyn tree those notes measured." },
+    ],
+    screen: "numbers",
+    setup: fresh,
+    script: [],
+    pauseWhen: () => true,
+  },
+  {
+    id: "finale",
+    title: "Three pictures of the same idea",
+    kicker: "What the tour covered",
+    body: "Base Raft showed a group picking one leader, copying a note, and making it permanent only with a majority. Extended Raft showed four ways that story frays, and the switch that calms each one. Synkrolyn showed five more promises: the yes waits for disk, a retry counts once, a blank server can catch up, a challenge during a healthy leader is ignored, and the fast answer stops a little early for slow clocks.",
+    glossary: [
+      { word: "Base Raft", meaning: "A leader, copies of a note, and a majority." },
+      { word: "Extended Raft", meaning: "PreVote, CheckQuorum, ReadIndex, and leases." },
+      { word: "Synkrolyn", meaning: "Disk, sessions, snapshots, the vote window, and the shorter lease." },
+    ],
+    screen: "finale",
+    setup: fresh,
+    script: [],
+    pauseWhen: () => true,
   },
 ];
 
