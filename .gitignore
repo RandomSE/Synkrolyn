@@ -1,5 +1,7 @@
 bin/
 obj/
+node_modules/
+web/dist/
 .vs/
 .idea/
 .kodaelus/
@@ -7,4 +9,8 @@ obj/
 *.suo
 TestResults/
 artifacts/
+StrykerOutput/
 .dotnet/
+spec/tla2tools.jar
+states/
+*_TTrace_*

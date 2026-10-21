@@ -29,12 +29,14 @@ public sealed class ClusterHarness
         TimeSpan heartbeat,
         IStateMachine? stateMachine = null,
         IPersistentState? state = null,
-        IRaftLog? log = null)
+        IRaftLog? log = null,
+        IRaftClock? clock = null)
     {
         stateMachine ??= IStateMachine.NoOp();
         state ??= new InMemoryPersistentState();
         log ??= new InMemoryRaftLog();
-        var node = new RaftNode(id, peers, _clock, _transport, state, log, electionTimeout, heartbeat, stateMachine);
+        clock ??= _clock;
+        var node = new RaftNode(id, peers, clock, _transport, state, log, electionTimeout, heartbeat, stateMachine);
         node.SetElectionJitter(static timeout => timeout);
         node.SnapshotThreshold = 0;
         _transport.Register(id, node.Receive);
@@ -164,6 +166,17 @@ public sealed class ClusterHarness
     }
 
     public IReadOnlyList<RaftNode> Leaders() => _nodes.Values.Where(n => n.Role == Role.Leader).ToList();
+
+    /// <summary>
+    /// Runs <paramref name="action"/> on a fresh background thread.
+    /// A test that then blocks must not use the thread pool for that work:
+    /// the runner already occupies the pool, and a new worker can miss a two-second wait.
+    /// </summary>
+    public static void RunOffThread(Action action)
+    {
+        var thread = new Thread(() => action()) { IsBackground = true };
+        thread.Start();
+    }
 
     public void AssertAtMostOneLeaderPerTerm()
     {

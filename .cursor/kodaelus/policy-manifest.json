@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "modes": {
+    "main": {
+      "file": "modes/main.md",
+      "always": [
+        "tasks/tdd.md",
+        "tasks/test-discovery.md",
+        "tasks/follow-up-queue.md"
+      ],
+      "tiers": {
+        "full": {
+          "always": [
+            "tasks/tdd.md",
+            "tasks/test-discovery.md",
+            "tasks/follow-up-queue.md"
+          ]
+        },
+        "standard": {
+          "always": [
+            "tasks/tdd.md",
+            "tasks/test-discovery.md",
+            "tasks/follow-up-queue.md"
+          ]
+        },
+        "lite": {
+          "always": []
+        }
+      },
+      "fragments": [
+        {
+          "file": "fragments/delivery-self-check.md",
+          "section": "main"
+        }
+      ]
+    },
+    "bug": {
+      "file": "modes/bug.md",
+      "always": ["tasks/follow-up-queue.md"],
+      "fragments": [
+        {
+          "file": "fragments/delivery-self-check.md",
+          "section": "bug"
+        }
+      ]
+    },
+    "prepare": {
+      "file": "modes/prepare.md",
+      "always": ["tasks/test-discovery.md"],
+      "fragments": [
+        {
+          "file": "fragments/delivery-self-check.md",
+          "section": "prepare"
+        }
+      ]
+    },
+    "ship": {
+      "file": "modes/ship.md",
+      "always": ["tasks/test-discovery.md"],
+      "fragments": [
+        {
+          "file": "fragments/delivery-self-check.md",
+          "section": "ship"
+        }
+      ]
+    },
+    "lite": {
+      "file": "modes/lite.md",
+      "always": [],
+      "fragments": [
+        {
+          "file": "fragments/delivery-self-check.md",
+          "section": "lite"
+        }
+      ]
+    },
+    "prompt": {
+      "file": "modes/prompt.md",
+      "always": [],
+      "fragments": []
+    },
+    "suggest": {
+      "file": "modes/suggest.md",
+      "always": [],
+      "fragments": []
+    },
+    "question": {
+      "file": "modes/question.md",
+      "always": [],
+      "fragments": []
+    }
+  },
+  "conditional": [
+    {
+      "id": "file-deletion",
+      "file": "tasks/file-deletion.md",
+      "pattern": "\\b(?:delete|remove)\\b[\\s\\S]{0,40}\\bfiles?\\b",
+      "flags": "i",
+      "note": "Before any whole-file delete."
+    },
+    {
+      "id": "refactor",
+      "file": "tasks/refactor.md",
+      "pattern": "\\brefactor",
+      "flags": "i",
+      "note": "When the task is a refactor."
+    },
+    {
+      "id": "architecture-review",
+      "file": "tasks/architecture-review.md",
+      "pattern": "\\barchitecture review\\b|\\btradeoffs?\\b|\\bredesign\\b",
+      "flags": "i",
+      "note": "When the user wants a review without implementation."
+    },
+    {
+      "id": "engineering-bar",
+      "file": "tasks/engineering-bar.md",
+      "pattern": "\\brefactor|\\bquality pass\\b|\\bnew module\\b|\\badds a module\\b",
+      "flags": "i",
+      "note": "When the task adds a module, refactors, or asks for a quality pass."
+    },
+    {
+      "id": "cursor-playbooks",
+      "file": "tasks/cursor-playbooks.md",
+      "pattern": "\\bbrowser smoke\\b|\\bbrowser verification\\b|\\bpr review\\b|\\bpull request review\\b|\\bmulti-?root\\b",
+      "flags": "i",
+      "note": "Cursor tool playbooks. Not new agents."
+    }
+  ]
+}

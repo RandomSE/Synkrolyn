@@ -12,6 +12,7 @@ public sealed class FileKvStore : IKvStore, IDisposable
 
     private readonly string _dir;
     private readonly string _file;
+    private readonly DataDirectoryLock _directoryLock;
     private readonly InMemoryKvStore _inner = new();
     private bool _closed;
     private int _persistCount;
@@ -22,8 +23,17 @@ public sealed class FileKvStore : IKvStore, IDisposable
         ArgumentNullException.ThrowIfNull(directory);
         _dir = directory;
         Directory.CreateDirectory(directory);
+        _directoryLock = DataDirectoryLock.Acquire(directory, FileName);
         _file = Path.Combine(directory, FileName);
-        Load();
+        try
+        {
+            Load();
+        }
+        catch
+        {
+            _directoryLock.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Successful persist calls.</summary>
@@ -34,6 +44,13 @@ public sealed class FileKvStore : IKvStore, IDisposable
     {
         EnsureOpen();
         _inner.Apply(index, command);
+    }
+
+    /// <inheritdoc />
+    public StateCapture CaptureState()
+    {
+        EnsureOpen();
+        return _inner.CaptureState();
     }
 
     /// <inheritdoc />
@@ -76,12 +93,30 @@ public sealed class FileKvStore : IKvStore, IDisposable
     }
 
     /// <inheritdoc />
+    public long AppliedTimestamp()
+    {
+        EnsureOpen();
+        return _inner.AppliedTimestamp();
+    }
+
+    /// <summary>Result of the last session command applied to the inner store.</summary>
+    internal KvCommandResult CommandResult => _inner.CommandResult;
+
+    /// <inheritdoc />
+    public string? GetForSession(long clientId, string key)
+    {
+        EnsureOpen();
+        return _inner.GetForSession(clientId, key);
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         if (!_closed)
         {
             Persist();
             _closed = true;
+            _directoryLock.Dispose();
         }
 
         GC.SuppressFinalize(this);
@@ -95,17 +130,17 @@ public sealed class FileKvStore : IKvStore, IDisposable
         }
 
         byte[] framed = File.ReadAllBytes(_file);
-        _inner.Restore(ChecksummedRecords.Unframe(framed));
+        _inner.Restore(ChecksummedRecords.ReadRecords(framed));
     }
 
     private void Persist()
     {
         _persistCount++;
-        byte[] framed = ChecksummedRecords.Frame(_inner.EncodeMapForPersist());
+        byte[] payload = _inner.EncodeMapForPersist();
         string tmp = Path.Combine(_dir, FileName + ".tmp");
         using (var channel = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
         {
-            channel.Write(framed);
+            ChecksummedRecords.WriteRecords(channel, payload);
             channel.Flush(flushToDisk: true);
         }
 

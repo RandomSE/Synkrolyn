@@ -8,6 +8,10 @@ public static class KvCommandCodec
 {
     private const byte PutTag = 0x01;
     private const byte DeleteTag = 0x02;
+    private const byte RegisterTag = 0x03;
+    private const byte SessionPutTag = 0x04;
+    private const byte SessionDeleteTag = 0x05;
+    private const byte TickTag = 0x06;
 
     /// <summary>Command operation.</summary>
     public enum Op
@@ -17,10 +21,25 @@ public static class KvCommandCodec
 
         /// <summary>Delete.</summary>
         Delete,
+
+        /// <summary>Open a client session. The log index of this command is the client id.</summary>
+        Register,
+
+        /// <summary>Leader timestamp with no map change. Session expiry reads this, not a local clock.</summary>
+        Tick,
     }
 
-    /// <summary>Decoded command.</summary>
-    public sealed record Command(Op Operation, string Key, string Value, string ClientId, long Serial);
+    /// <summary>Decoded command. Session fields are zero on a put or delete that has no session.</summary>
+    public sealed record Command(
+        Op Operation,
+        string Key,
+        string Value,
+        string ClientId,
+        long Serial,
+        long SessionId = 0,
+        long AckFloor = 0,
+        long LeaderTimestamp = 0,
+        long TimeoutMillis = 0);
 
     /// <summary>Encodes a put without a client serial.</summary>
     public static byte[] EncodePut(string key, string value) => EncodePut(key, value, "", 0);
@@ -43,7 +62,47 @@ public static class KvCommandCodec
         return Encode(DeleteTag, key, "", clientId, serial, includeValue: false);
     }
 
-    /// <summary>Decodes a put or delete.</summary>
+    /// <summary>Encodes a session registration. The applying index becomes the client id.</summary>
+    public static byte[] EncodeRegister(long leaderTimestampMillis, long timeoutMillis)
+    {
+        byte[] buf = new byte[1 + 16];
+        buf[0] = RegisterTag;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(1), leaderTimestampMillis);
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(9), timeoutMillis);
+        return buf;
+    }
+
+    /// <summary>Encodes a session put. A duplicate sequence returns the cached response.</summary>
+    public static byte[] EncodeSessionPut(
+        string key,
+        string value,
+        long clientId,
+        long seq,
+        long ackFloor,
+        long leaderTimestampMillis)
+    {
+        RequireKey(key);
+        ArgumentNullException.ThrowIfNull(value);
+        return EncodeSession(SessionPutTag, key, value, clientId, seq, ackFloor, leaderTimestampMillis, includeValue: true);
+    }
+
+    /// <summary>Encodes a session delete.</summary>
+    public static byte[] EncodeSessionDelete(string key, long clientId, long seq, long ackFloor, long leaderTimestampMillis)
+    {
+        RequireKey(key);
+        return EncodeSession(SessionDeleteTag, key, "", clientId, seq, ackFloor, leaderTimestampMillis, includeValue: false);
+    }
+
+    /// <summary>Encodes a leader timestamp so every replica expires sessions from the same entry.</summary>
+    public static byte[] EncodeTick(long leaderTimestampMillis)
+    {
+        byte[] buf = new byte[1 + 8];
+        buf[0] = TickTag;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(1), leaderTimestampMillis);
+        return buf;
+    }
+
+    /// <summary>Decodes a put, delete, registration, session command, or tick.</summary>
     public static Command Decode(byte[] command)
     {
         ArgumentNullException.ThrowIfNull(command);
@@ -87,6 +146,40 @@ public static class KvCommandCodec
             return new Command(Op.Delete, key, "", clientId, serial);
         }
 
+        if (tag == RegisterTag)
+        {
+            long timestamp = ReadLong(command, ref pos);
+            long timeout = ReadLong(command, ref pos);
+            RequireDone(command, pos);
+            return new Command(Op.Register, "", "", "", 0, 0, 0, timestamp, timeout);
+        }
+
+        if (tag == TickTag)
+        {
+            long timestamp = ReadLong(command, ref pos);
+            RequireDone(command, pos);
+            return new Command(Op.Tick, "", "", "", 0, 0, 0, timestamp);
+        }
+
+        if (tag is SessionPutTag or SessionDeleteTag)
+        {
+            string key = ReadUtf8(command, ref pos);
+            RequireKey(key);
+            string value = "";
+            if (tag == SessionPutTag)
+            {
+                value = ReadUtf8(command, ref pos);
+            }
+
+            long sessionId = ReadLong(command, ref pos);
+            long seq = ReadLong(command, ref pos);
+            long ackFloor = ReadLong(command, ref pos);
+            long timestamp = ReadLong(command, ref pos);
+            RequireDone(command, pos);
+            Op operation = tag == SessionPutTag ? Op.Put : Op.Delete;
+            return new Command(operation, key, value, "", seq, sessionId, ackFloor, timestamp);
+        }
+
         throw new ArgumentException("unknown command tag: " + tag);
     }
 
@@ -126,6 +219,38 @@ public static class KvCommandCodec
             BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), serial);
         }
 
+        return buf;
+    }
+
+    private static byte[] EncodeSession(
+        byte tag,
+        string key,
+        string value,
+        long clientId,
+        long seq,
+        long ackFloor,
+        long leaderTimestampMillis,
+        bool includeValue)
+    {
+        byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+        byte[] valueBytes = includeValue ? Encoding.UTF8.GetBytes(value) : [];
+        int size = 1 + 4 + keyBytes.Length + (includeValue ? 4 + valueBytes.Length : 0) + 32;
+        byte[] buf = new byte[size];
+        int pos = 0;
+        buf[pos++] = tag;
+        WriteBytes(buf, ref pos, keyBytes);
+        if (includeValue)
+        {
+            WriteBytes(buf, ref pos, valueBytes);
+        }
+
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), clientId);
+        pos += 8;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), seq);
+        pos += 8;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), ackFloor);
+        pos += 8;
+        BinaryPrimitives.WriteInt64BigEndian(buf.AsSpan(pos), leaderTimestampMillis);
         return buf;
     }
 

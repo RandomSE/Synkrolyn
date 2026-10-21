@@ -1,23 +1,23 @@
 ---- MODULE Synkrolyn ----
-\* Bounded TLA+ model of Synkrolyn election and log replication.
-\* Static 3-server cluster. Not a line-level model of the C# code and not a proof.
-\* Not modeled: membership, snapshots, sockets, FileRaftLog bytes, ReadIndex,
-\* leadership-transfer completion, KV commands.
-\* AppendEntries rejection may set nextIndex from XLen / XTerm / XIndex.
-\* CanCommit counts the leader only when forcedIndex has reached n.
-\* A successful AppendEntries sets the follower forcedIndex to the new length,
-\* because the implementation acks only after fsync. The leader's own append
-\* stays volatile until Force.
+\* Bounded model of Synkrolyn Raft as implemented.
+\* Entries are terms. One atomic step is one RPC.
+\* Not modeled: membership, snapshots, sockets, the XLen/XTerm fast
+\* backup (a mismatch drops the follower's last entry), leadership transfer.
+\* Replication walks the follower log: one dropped entry, or one appended entry.
+\* CommitPriorTerms commits a replicated entry from an older term.
+\* That is the figure-8 bug. MC.cfg keeps it FALSE.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS Server, Nil, MaxTerm, MaxLogLen, Majority
+CONSTANTS Server, Nil, MaxTerm, MaxLogLen, Majority, CommitPriorTerms
 
 ASSUME /\ Server # {}
        /\ Nil \notin Server
        /\ MaxTerm \in Nat \ {0}
        /\ MaxLogLen \in Nat \ {0}
        /\ Majority \in Nat \ {0}
+       /\ CommitPriorTerms \in BOOLEAN
+       /\ \A s \in Server : ToString(s) \in {"n1", "n2", "n3", "n4", "n5"}
 
 Follower == "Follower"
 Candidate == "Candidate"
@@ -25,10 +25,14 @@ Leader == "Leader"
 Roles == {Follower, Candidate, Leader}
 
 VARIABLES currentTerm, votedFor, log, commitIndex, role,
-          votesGranted, nextIndex, matchIndex, forcedIndex
+          votesGranted, forcedIndex,
+          preCand, preVotes, restartGate, contact, acked,
+          readPrefix
 
 vars == <<currentTerm, votedFor, log, commitIndex, role,
-          votesGranted, nextIndex, matchIndex, forcedIndex>>
+          votesGranted, forcedIndex,
+          preCand, preVotes, restartGate, contact, acked,
+          readPrefix>>
 
 MinNat(a, b) == IF a <= b THEN a ELSE b
 MaxNat(a, b) == IF a >= b THEN a ELSE b
@@ -36,16 +40,37 @@ MaxNat(a, b) == IF a >= b THEN a ELSE b
 LastIndex(s) == Len(log[s])
 LastTerm(s) == IF log[s] = << >> THEN 0 ELSE log[s][Len(log[s])]
 
+\* CompareOrdinal order of the model ids. A higher rank is a higher id.
+\* Names, not a config sequence: this TLC rejects << >> in the cfg file.
+IdNames == <<"n1", "n2", "n3", "n4", "n5">>
+Rank(s) ==
+  LET hits == {i \in 1..Len(IdNames) : IdNames[i] = ToString(s)}
+  IN CHOOSE i \in hits : TRUE
+Named(name) == CHOOSE s \in Server : ToString(s) = name
+
 LogUpToDate(cand, voter) ==
   \/ LastTerm(cand) > LastTerm(voter)
   \/ /\ LastTerm(cand) = LastTerm(voter)
      /\ LastIndex(cand) >= LastIndex(voter)
 
-\* Paper 5.4.2. The leader counts itself only after Force has covered n.
+LogStrictlyNewer(cand, voter) ==
+  \/ LastTerm(cand) > LastTerm(voter)
+  \/ /\ LastTerm(cand) = LastTerm(voter)
+     /\ LastIndex(cand) > LastIndex(voter)
+
+\* VoteBlockedByLeaderContact returns immediately when there has been no
+\* leader contact, so the restart window blocks votes only while contact is set.
+\* Start sets both. Timeout is refused while the window is still armed.
+VoteBlocked(s) == contact[s]
+
+\* Paper 5.4.2, unless CommitPriorTerms skips the current-term test.
+\* The leader counts itself only after Force has covered n.
 CanCommit(s, n) ==
   /\ role[s] = Leader
   /\ n \in 1..Len(log[s])
-  /\ log[s][n] = currentTerm[s]
+  /\ \/ CommitPriorTerms
+     \/ IF n < 1 \/ n > Len(log[s]) THEN FALSE
+        ELSE log[s][n] = currentTerm[s]
   /\ Cardinality({t \in Server :
                     /\ Len(log[t]) >= n
                     /\ SubSeq(log[t], 1, n) = SubSeq(log[s], 1, n)
@@ -55,34 +80,53 @@ TypeOK ==
   /\ currentTerm \in [Server -> 0..MaxTerm]
   /\ votedFor \in [Server -> Server \union {Nil}]
   /\ log \in [Server -> Seq(1..MaxTerm)]
-  /\ \A s \in Server: Len(log[s]) <= MaxLogLen
+  /\ \A s \in Server : Len(log[s]) <= MaxLogLen
   /\ commitIndex \in [Server -> 0..MaxLogLen]
-  /\ \A s \in Server: commitIndex[s] <= Len(log[s])
+  /\ \A s \in Server : commitIndex[s] <= Len(log[s])
   /\ role \in [Server -> Roles]
   /\ votesGranted \in [Server -> SUBSET Server]
-  /\ nextIndex \in [Server -> [Server -> 1..(MaxLogLen + 1)]]
-  /\ matchIndex \in [Server -> [Server -> 0..MaxLogLen]]
   /\ forcedIndex \in [Server -> 0..MaxLogLen]
-  /\ \A s \in Server: forcedIndex[s] <= Len(log[s])
+  /\ \A s \in Server : forcedIndex[s] <= Len(log[s])
+  /\ preCand \in [Server -> BOOLEAN]
+  /\ preVotes \in [Server -> SUBSET Server]
+  /\ restartGate \in [Server -> BOOLEAN]
+  /\ contact \in [Server -> BOOLEAN]
+  /\ acked \in [Server -> SUBSET Server]
+  /\ readPrefix \in Seq(1..MaxTerm)
+  /\ Len(readPrefix) <= MaxLogLen
 
 ElectionSafety ==
-  \A t \in 0..MaxTerm:
+  \A t \in 0..MaxTerm :
     Cardinality({s \in Server : role[s] = Leader /\ currentTerm[s] = t}) <= 1
 
 LogMatching ==
-  \A s, t \in Server:
-    \A i \in 1..MinNat(Len(log[s]), Len(log[t])):
+  \A s, t \in Server :
+    \A i \in 1..MinNat(Len(log[s]), Len(log[t])) :
       log[s][i] = log[t][i] => SubSeq(log[s], 1, i) = SubSeq(log[t], 1, i)
 
-CommittedPrefixSafety ==
-  \A s, t \in Server:
-    \A i \in 1..MinNat(commitIndex[s], commitIndex[t]):
+LeaderCompleteness ==
+  \A s, t \in Server :
+    \A n \in 1..commitIndex[s] :
+      (role[t] = Leader /\ currentTerm[t] > log[s][n]) =>
+        /\ Len(log[t]) >= n
+        /\ log[t][n] = log[s][n]
+
+StateMachineSafety ==
+  \A s, t \in Server :
+    \A i \in 1..MinNat(commitIndex[s], commitIndex[t]) :
       /\ i <= Len(log[s])
       /\ i <= Len(log[t])
       /\ log[s][i] = log[t][i]
 
+\* A recorded read prefix stays committed on every server.
+ReadLinearizability ==
+  \A s \in Server :
+    \A i \in 1..MinNat(Len(readPrefix), commitIndex[s]) :
+      /\ i <= Len(log[s])
+      /\ log[s][i] = readPrefix[i]
+
 LeaderAppendOnly ==
-  \A s \in Server:
+  \A s \in Server :
     \/ role[s] # Leader
     \/ role'[s] # Leader
     \/ currentTerm'[s] # currentTerm[s]
@@ -98,111 +142,162 @@ Init ==
   /\ commitIndex = [s \in Server |-> 0]
   /\ role = [s \in Server |-> Follower]
   /\ votesGranted = [s \in Server |-> {}]
-  /\ nextIndex = [s \in Server |-> [t \in Server |-> 1]]
-  /\ matchIndex = [s \in Server |-> [t \in Server |-> 0]]
   /\ forcedIndex = [s \in Server |-> 0]
+  /\ preCand = [s \in Server |-> FALSE]
+  /\ preVotes = [s \in Server |-> {}]
+  /\ restartGate = [s \in Server |-> FALSE]
+  /\ contact = [s \in Server |-> FALSE]
+  /\ acked = [s \in Server |-> {}]
+  /\ readPrefix = << >>
 
+\* Figure 8, just before the bad commit. n1..n3 hold term 2; n4..n5 hold term 3.
+InitBug ==
+  /\ Cardinality(Server) >= 5
+  /\ LET a == Named("n1")
+         b == Named("n2")
+         c == Named("n3")
+     IN /\ currentTerm = [s \in Server |-> 4]
+        /\ votedFor = [s \in Server |-> Nil]
+        /\ log = [s \in Server |-> IF s \in {a, b, c} THEN <<2>> ELSE <<3>>]
+        /\ commitIndex = [s \in Server |-> 0]
+        /\ role = [s \in Server |-> IF s = a THEN Leader ELSE Follower]
+        /\ votesGranted = [s \in Server |-> {}]
+        /\ forcedIndex = [s \in Server |-> 1]
+        /\ preCand = [s \in Server |-> FALSE]
+        /\ preVotes = [s \in Server |-> {}]
+        /\ restartGate = [s \in Server |-> FALSE]
+        /\ contact = [s \in Server |-> FALSE]
+        /\ acked = [s \in Server |-> IF s = a THEN {a, b, c} ELSE {}]
+        /\ readPrefix = << >>
+
+\* Election deadline. Does not increment the term; BeginPreVote does not either.
 Timeout(s) ==
   /\ role[s] \in {Follower, Candidate}
+  /\ ~restartGate[s]
+  /\ currentTerm[s] < MaxTerm
+  /\ \/ ~preCand[s]
+     \/ preVotes[s] # {s}
+     \/ contact[s]
+  /\ preCand' = [preCand EXCEPT ![s] = TRUE]
+  /\ preVotes' = [preVotes EXCEPT ![s] = {s}]
+  /\ contact' = [contact EXCEPT ![s] = FALSE]
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
+                 forcedIndex, restartGate, acked, readPrefix>>
+
+PreVote(from, to) ==
+  /\ from # to
+  /\ preCand[from]
+  /\ role[from] # Leader
+  /\ role[to] # Leader
+  /\ ~VoteBlocked(to)
+  /\ currentTerm[from] < MaxTerm
+  /\ currentTerm[from] + 1 >= currentTerm[to]
+  /\ LogUpToDate(from, to)
+  /\ ~ (preCand[to] /\ Rank(from) >= Rank(to) /\ ~LogStrictlyNewer(from, to))
+  /\ to \notin preVotes[from]
+  /\ preVotes' = [p \in Server |->
+                    IF p = from THEN preVotes[from] \union {to}
+                    ELSE IF p = to THEN {}
+                    ELSE preVotes[p]]
+  /\ preCand' = [preCand EXCEPT ![to] = FALSE]
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
+                 forcedIndex, restartGate, contact, acked, readPrefix>>
+
+BeginElection(s) ==
+  /\ preCand[s]
+  /\ Cardinality(preVotes[s]) >= Majority
   /\ currentTerm[s] < MaxTerm
   /\ currentTerm' = [currentTerm EXCEPT ![s] = @ + 1]
   /\ role' = [role EXCEPT ![s] = Candidate]
   /\ votedFor' = [votedFor EXCEPT ![s] = s]
   /\ votesGranted' = [votesGranted EXCEPT ![s] = {s}]
-  /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, forcedIndex>>
+  /\ preCand' = [preCand EXCEPT ![s] = FALSE]
+  /\ preVotes' = [preVotes EXCEPT ![s] = {}]
+  /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate,
+                 contact, acked, readPrefix>>
+
+RequestVote(from, to) ==
+  /\ from # to
+  /\ role[from] = Candidate
+  /\ ~preCand[from]
+  /\ \/ /\ currentTerm[to] > currentTerm[from]
+        /\ currentTerm' = [currentTerm EXCEPT ![from] = currentTerm[to]]
+        /\ role' = [role EXCEPT ![from] = Follower]
+        /\ votedFor' = [votedFor EXCEPT ![from] = Nil]
+        /\ votesGranted' = [votesGranted EXCEPT ![from] = {}]
+        /\ preCand' = [preCand EXCEPT ![from] = FALSE]
+        /\ preVotes' = [preVotes EXCEPT ![from] = {}]
+        /\ contact' = [contact EXCEPT ![from] = FALSE]
+        /\ acked' = [acked EXCEPT ![from] = {}]
+        /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
+     \/ /\ currentTerm[from] >= currentTerm[to]
+        /\ ~VoteBlocked(to)
+        /\ LET higher == currentTerm[from] > currentTerm[to]
+               logOk == LogUpToDate(from, to)
+               grant == logOk /\ (higher \/ votedFor[to] \in {Nil, from})
+           IN /\ grant \/ higher
+              /\ \/ higher
+                 \/ votedFor[to] # from
+                 \/ to \notin votesGranted[from]
+              /\ currentTerm' = [currentTerm EXCEPT ![to] = currentTerm[from]]
+              /\ votedFor' = [votedFor EXCEPT ![to] =
+                                IF higher THEN (IF logOk THEN from ELSE Nil)
+                                ELSE from]
+              /\ role' = [role EXCEPT ![to] = IF higher THEN Follower ELSE role[to]]
+              /\ contact' = [contact EXCEPT ![to] = IF higher THEN FALSE ELSE contact[to]]
+              /\ preCand' = [preCand EXCEPT ![to] = IF higher THEN FALSE ELSE preCand[to]]
+              /\ preVotes' = [preVotes EXCEPT ![to] = IF higher THEN {} ELSE preVotes[to]]
+              /\ votesGranted' = [votesGranted EXCEPT
+                                    ![to] = IF higher THEN {} ELSE votesGranted[to],
+                                    ![from] = IF grant THEN votesGranted[from] \union {to}
+                                              ELSE votesGranted[from]]
+              /\ acked' = [acked EXCEPT ![to] =
+                             IF higher /\ role[to] = Leader THEN {} ELSE acked[to]]
+              /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
 
 BecomeLeader(s) ==
   /\ role[s] = Candidate
+  /\ ~preCand[s]
   /\ Cardinality(votesGranted[s]) >= Majority
   /\ Len(log[s]) < MaxLogLen
   /\ LET newLog == Append(log[s], currentTerm[s])
      IN /\ role' = [role EXCEPT ![s] = Leader]
         /\ log' = [log EXCEPT ![s] = newLog]
-        /\ nextIndex' = [nextIndex EXCEPT ![s] = [t \in Server |-> Len(newLog) + 1]]
-        /\ matchIndex' = [matchIndex EXCEPT ![s] = [t \in Server |-> 0]]
-        /\ UNCHANGED <<currentTerm, votedFor, commitIndex, votesGranted, forcedIndex>>
+        /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
+        /\ acked' = [acked EXCEPT ![s] = {s}]
+        /\ preCand' = [preCand EXCEPT ![s] = FALSE]
+        /\ preVotes' = [preVotes EXCEPT ![s] = {}]
+        /\ UNCHANGED <<currentTerm, votedFor, commitIndex, forcedIndex,
+                       restartGate, contact, readPrefix>>
 
 ClientAppend(s) ==
   /\ role[s] = Leader
   /\ currentTerm[s] \in 1..MaxTerm
   /\ Len(log[s]) < MaxLogLen
   /\ log' = [log EXCEPT ![s] = Append(@, currentTerm[s])]
-  /\ UNCHANGED <<currentTerm, votedFor, commitIndex, role,
-                 votesGranted, nextIndex, matchIndex, forcedIndex>>
+  /\ UNCHANGED <<currentTerm, votedFor, commitIndex, role, votesGranted,
+                 forcedIndex, preCand, preVotes, restartGate,
+                 contact, acked, readPrefix>>
 
-\* Group-commit barrier. Does not append.
 Force(s) ==
   /\ forcedIndex[s] < Len(log[s])
   /\ forcedIndex' = [forcedIndex EXCEPT ![s] = Len(log[s])]
-  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role,
-                 votesGranted, nextIndex, matchIndex>>
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
+                 preCand, preVotes, restartGate, contact, acked, readPrefix>>
 
 AdvanceCommit(s) ==
   /\ role[s] = Leader
   /\ LET ns == {n \in (commitIndex[s] + 1)..Len(log[s]) : CanCommit(s, n)}
-     IN  /\ ns # {}
-         /\ commitIndex' = [commitIndex EXCEPT ![s] = CHOOSE n \in ns :
-                              \A m \in ns : m <= n]
-  /\ UNCHANGED <<currentTerm, votedFor, log, role,
-                 votesGranted, nextIndex, matchIndex, forcedIndex>>
+     IN /\ ns # {}
+        /\ commitIndex' = [commitIndex EXCEPT ![s] =
+                             CHOOSE n \in ns : \A m \in ns : m <= n]
+  /\ UNCHANGED <<currentTerm, votedFor, log, role, votesGranted,
+                 forcedIndex, preCand, preVotes, restartGate, contact, acked, readPrefix>>
 
-RequestVote(from, to) ==
-  /\ from # to
-  /\ role[from] = Candidate
-  /\ \/ /\ currentTerm[from] < currentTerm[to]
-        /\ currentTerm' = [currentTerm EXCEPT ![from] = currentTerm[to]]
-        /\ role' = [role EXCEPT ![from] = Follower]
-        /\ votedFor' = [votedFor EXCEPT ![from] = Nil]
-        /\ votesGranted' = [votesGranted EXCEPT ![from] = {}]
-        /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, forcedIndex>>
-     \/ /\ currentTerm[from] >= currentTerm[to]
-        /\ LogUpToDate(from, to)
-        /\ \/ currentTerm[from] > currentTerm[to]
-           \/ votedFor[to] \in {Nil, from}
-        /\ currentTerm' = [currentTerm EXCEPT ![to] = currentTerm[from]]
-        /\ role' = [role EXCEPT ![to] =
-                      IF currentTerm[from] > currentTerm[to]
-                      THEN Follower
-                      ELSE role[to]]
-        /\ votedFor' = [votedFor EXCEPT ![to] = from]
-        /\ votesGranted' = [votesGranted EXCEPT ![from] = @ \union {to}]
-        /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, forcedIndex>>
-     \/ /\ currentTerm[from] >= currentTerm[to]
-        /\ \/ ~LogUpToDate(from, to)
-           \/ /\ currentTerm[from] = currentTerm[to]
-              /\ votedFor[to] \notin {Nil, from}
-        /\ currentTerm' = [currentTerm EXCEPT ![to] =
-                             MaxNat(currentTerm[to], currentTerm[from])]
-        /\ role' = [role EXCEPT ![to] =
-                      IF currentTerm[from] > currentTerm[to]
-                      THEN Follower
-                      ELSE role[to]]
-        /\ votedFor' = IF currentTerm[from] > currentTerm[to]
-                       THEN [votedFor EXCEPT ![to] = Nil]
-                       ELSE votedFor
-        /\ UNCHANGED <<log, commitIndex, votesGranted, nextIndex, matchIndex, forcedIndex>>
-
-FastBackupNext(s, t, prev) ==
-  LET short == prev > Len(log[t])
-      xLen == IF short THEN Len(log[t]) + 1 ELSE 0
-      xTerm == IF short \/ prev < 1 \/ prev > Len(log[t]) THEN 0 ELSE log[t][prev]
-      xIndex == IF xTerm = 0 THEN 0
-                ELSE CHOOSE i \in 1..Len(log[t]) :
-                       /\ log[t][i] = xTerm
-                       /\ \A j \in 1..(i - 1) : log[t][j] # xTerm
-      leaderIdx == {i \in 1..Len(log[s]) : log[s][i] = xTerm}
-      hasTerm == leaderIdx # {}
-      lastWith == IF hasTerm
-                  THEN CHOOSE i \in leaderIdx : \A j \in leaderIdx : j <= i
-                  ELSE 0
-      current == nextIndex[s][t]
-      raw == IF xTerm = 0
-             THEN IF xLen = 0 THEN current - 1 ELSE xLen
-             ELSE IF hasTerm THEN MinNat(lastWith + 1, current - 1)
-                  ELSE IF xIndex = 0 THEN current - 1 ELSE xIndex
-      stepped == IF raw < 1 THEN 1 ELSE raw
-      capped == IF stepped >= current THEN MaxNat(1, current - 1) ELSE stepped
-  IN MinNat(MaxLogLen + 1, MaxNat(1, capped))
+\* Follower log is a term-by-term prefix of the leader log.
+IsPrefix(a, b) ==
+  /\ Len(a) <= Len(b)
+  /\ \A i \in 1..Len(a) : a[i] = b[i]
 
 AppendEntries(s, t) ==
   /\ s # t
@@ -211,54 +306,156 @@ AppendEntries(s, t) ==
         /\ currentTerm' = [currentTerm EXCEPT ![s] = currentTerm[t]]
         /\ role' = [role EXCEPT ![s] = Follower]
         /\ votedFor' = [votedFor EXCEPT ![s] = Nil]
-        /\ UNCHANGED <<log, commitIndex, votesGranted, nextIndex, matchIndex, forcedIndex>>
+        /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
+        /\ preCand' = [preCand EXCEPT ![s] = FALSE]
+        /\ preVotes' = [preVotes EXCEPT ![s] = {}]
+        /\ contact' = [contact EXCEPT ![s] = FALSE]
+        /\ acked' = [acked EXCEPT ![s] = {}]
+        /\ UNCHANGED <<log, commitIndex, forcedIndex, restartGate, readPrefix>>
      \/ /\ currentTerm[s] >= currentTerm[t]
-        /\ LET prev == nextIndex[s][t] - 1
-               prevOk ==
-                 prev = 0
-                 \/ (prev <= Len(log[s])
-                     /\ Len(log[t]) >= prev
-                     /\ log[t][prev] = log[s][prev])
-           IN IF ~prevOk
-              THEN /\ nextIndex' = [nextIndex EXCEPT ![s] =
-                                      [nextIndex[s] EXCEPT ![t] =
-                                         FastBackupNext(s, t, prev)]]
-                   /\ currentTerm' = [currentTerm EXCEPT ![t] = currentTerm[s]]
-                   /\ role' = [role EXCEPT ![t] = Follower]
-                   /\ votedFor' = IF currentTerm[t] < currentTerm[s]
-                                  THEN [votedFor EXCEPT ![t] = Nil]
-                                  ELSE votedFor
-                   /\ UNCHANGED <<log, commitIndex, votesGranted, matchIndex, forcedIndex>>
-              ELSE LET entries == SubSeq(log[s], prev + 1, Len(log[s]))
-                       newLog == IF entries = << >>
-                                 THEN log[t]
-                                 ELSE SubSeq(log[t], 1, prev) \o entries
-                       matchIdx == IF entries = << >> THEN prev ELSE Len(log[s])
-                       newCommit == MaxNat(commitIndex[t],
-                                           MinNat(commitIndex[s], Len(newLog)))
-                   IN /\ log' = [log EXCEPT ![t] = newLog]
-                      /\ commitIndex' = [commitIndex EXCEPT ![t] = newCommit]
-                      /\ matchIndex' = [matchIndex EXCEPT ![s] =
-                                          [matchIndex[s] EXCEPT ![t] = matchIdx]]
-                      /\ nextIndex' = [nextIndex EXCEPT ![s] =
-                                         [nextIndex[s] EXCEPT ![t] = matchIdx + 1]]
-                      /\ forcedIndex' = [forcedIndex EXCEPT ![t] = Len(newLog)]
-                      /\ currentTerm' = [currentTerm EXCEPT ![t] = currentTerm[s]]
-                      /\ role' = [role EXCEPT ![t] = Follower]
-                      /\ votedFor' = IF currentTerm[t] < currentTerm[s]
-                                     THEN [votedFor EXCEPT ![t] = Nil]
-                                     ELSE votedFor
-                      /\ UNCHANGED votesGranted
+        /\ \/ role[t] # Leader
+           \/ currentTerm[s] > currentTerm[t]
+        /\ LET flog == log[t]
+               llog == log[s]
+               termUp == currentTerm[t] < currentTerm[s]
+               newRole == IF termUp \/ role[t] = Candidate THEN Follower ELSE role[t]
+               conflict == ~IsPrefix(flog, llog) /\ Len(flog) > 0
+               extend == IsPrefix(flog, llog) /\ Len(flog) < Len(llog)
+               newLog == IF conflict THEN SubSeq(flog, 1, Len(flog) - 1)
+                         ELSE IF extend THEN Append(flog, llog[Len(flog) + 1])
+                         ELSE flog
+               newCommit == IF conflict THEN MinNat(commitIndex[t], Len(newLog))
+                            ELSE MaxNat(commitIndex[t], MinNat(commitIndex[s], Len(newLog)))
+               newForced == IF conflict THEN MinNat(forcedIndex[t], Len(newLog))
+                            ELSE IF extend THEN Len(newLog)
+                            ELSE forcedIndex[t]
+           IN /\ Len(newLog) <= MaxLogLen
+              /\ \/ conflict
+                 \/ extend
+                 \/ termUp
+                 \/ role[t] # newRole
+                 \/ ~contact[t]
+                 \/ preCand[t]
+                 \/ t \notin acked[s]
+                 \/ newCommit # commitIndex[t]
+                 \/ newForced # forcedIndex[t]
+              /\ log' = [log EXCEPT ![t] = newLog]
+              /\ commitIndex' = [commitIndex EXCEPT ![t] = newCommit]
+              /\ forcedIndex' = [forcedIndex EXCEPT ![t] = newForced]
+              /\ currentTerm' = [currentTerm EXCEPT ![t] = currentTerm[s]]
+              /\ role' = [role EXCEPT ![t] = newRole]
+              /\ votedFor' = IF termUp THEN [votedFor EXCEPT ![t] = Nil] ELSE votedFor
+              /\ votesGranted' = IF newRole # role[t]
+                                 THEN [votesGranted EXCEPT ![t] = {}]
+                                 ELSE votesGranted
+              /\ preCand' = [preCand EXCEPT ![t] = FALSE]
+              /\ preVotes' = [preVotes EXCEPT ![t] = {}]
+              /\ contact' = [contact EXCEPT ![t] = TRUE]
+              /\ acked' = [acked EXCEPT ![s] = acked[s] \union {t}]
+              /\ UNCHANGED <<restartGate, readPrefix>>
 
-Next ==
-  \/ \E s \in Server: Timeout(s)
-  \/ \E s \in Server: BecomeLeader(s)
-  \/ \E s \in Server: ClientAppend(s)
-  \/ \E s \in Server: Force(s)
-  \/ \E s \in Server: AdvanceCommit(s)
-  \/ \E f, t \in Server: RequestVote(f, t)
-  \/ \E s, t \in Server: AppendEntries(s, t)
+CheckQuorum(s) ==
+  /\ role[s] = Leader
+  /\ Cardinality(acked[s]) < Majority
+  /\ role' = [role EXCEPT ![s] = Follower]
+  /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
+  /\ preCand' = [preCand EXCEPT ![s] = FALSE]
+  /\ preVotes' = [preVotes EXCEPT ![s] = {}]
+  /\ contact' = [contact EXCEPT ![s] = FALSE]
+  /\ acked' = [acked EXCEPT ![s] = {}]
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, forcedIndex,
+                 restartGate, readPrefix>>
+
+\* Crash. Durable term, vote, and forced prefix stay. The unforced suffix is dropped.
+\* Start then sets leader contact and the restart vote window.
+Restart(s) ==
+  /\ currentTerm[s] > 0
+  /\ LET kept == IF forcedIndex[s] = 0 THEN << >>
+                 ELSE SubSeq(log[s], 1, forcedIndex[s])
+     IN /\ \/ role[s] # Follower
+           \/ preCand[s]
+           \/ ~contact[s]
+           \/ votesGranted[s] # {}
+           \/ acked[s] # {}
+           \/ ~restartGate[s]
+           \/ preVotes[s] # {}
+           \/ log[s] # kept
+           \/ commitIndex[s] > forcedIndex[s]
+        /\ log' = [log EXCEPT ![s] = kept]
+        /\ commitIndex' = [commitIndex EXCEPT ![s] = MinNat(commitIndex[s], forcedIndex[s])]
+        /\ role' = [role EXCEPT ![s] = Follower]
+        /\ restartGate' = [restartGate EXCEPT ![s] = TRUE]
+        /\ contact' = [contact EXCEPT ![s] = TRUE]
+        /\ preCand' = [preCand EXCEPT ![s] = FALSE]
+        /\ preVotes' = [preVotes EXCEPT ![s] = {}]
+        /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
+        /\ acked' = [acked EXCEPT ![s] = {}]
+        /\ UNCHANGED <<currentTerm, votedFor, forcedIndex, readPrefix>>
+
+ExpireRestartGate(s) ==
+  /\ restartGate[s]
+  /\ restartGate' = [restartGate EXCEPT ![s] = FALSE]
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
+                 forcedIndex, preCand, preVotes, contact, acked, readPrefix>>
+
+\* Lease read. Observes the committed prefix once a current-term entry is
+\* committed and a quorum of append acks is fresh. Apply lag is not separate.
+Read(s) ==
+  /\ role[s] = Leader
+  /\ Cardinality(acked[s]) >= Majority
+  /\ IF commitIndex[s] < 1 THEN FALSE
+     ELSE log[s][commitIndex[s]] = currentTerm[s]
+  /\ LET prefix == SubSeq(log[s], 1, commitIndex[s])
+     IN /\ Len(prefix) >= Len(readPrefix)
+        /\ prefix # readPrefix
+        /\ readPrefix' = prefix
+  /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, role, votesGranted,
+                 forcedIndex, preCand, preVotes, restartGate, contact, acked>>
+
+FullNext ==
+  \/ \E s \in Server : Timeout(s)
+  \/ \E from, to \in Server : PreVote(from, to)
+  \/ \E s \in Server : BeginElection(s)
+  \/ \E from, to \in Server : RequestVote(from, to)
+  \/ \E s \in Server : BecomeLeader(s)
+  \/ \E s \in Server : ClientAppend(s)
+  \/ \E s \in Server : Force(s)
+  \/ \E s \in Server : AdvanceCommit(s)
+  \/ \E s, t \in Server : AppendEntries(s, t)
+  \/ \E s \in Server : CheckQuorum(s)
+  \/ \E s \in Server : Restart(s)
+  \/ \E s \in Server : ExpireRestartGate(s)
+  \/ \E s \in Server : Read(s)
+
+\* Bad commit, then the term-3 log wins the election and appends.
+BugNext ==
+  IF Cardinality(Server) < 5 THEN FALSE
+  ELSE LET a == Named("n1")
+           b == Named("n2")
+           d == Named("n4")
+           e == Named("n5")
+       IN \/ AdvanceCommit(a)
+          \/ Timeout(d)
+          \/ PreVote(d, e)
+          \/ PreVote(d, b)
+          \/ BeginElection(d)
+          \/ RequestVote(d, e)
+          \/ RequestVote(d, b)
+          \/ BecomeLeader(d)
+
+\* A follower's vote set and ack set do not affect the next state.
+\* BeginElection and BecomeLeader overwrite them.
+View == <<currentTerm, votedFor, log, commitIndex, role,
+          [s \in Server |-> IF role[s] = Candidate THEN votesGranted[s] ELSE {}],
+          forcedIndex, preCand,
+          [s \in Server |-> IF preCand[s] THEN preVotes[s] ELSE {}],
+          restartGate, contact,
+          [s \in Server |-> IF role[s] = Leader THEN acked[s] ELSE {}],
+          readPrefix>>
+
+Next == IF CommitPriorTerms THEN BugNext ELSE FullNext
 
 Spec == Init /\ [][Next]_vars
+BugSpec == InitBug /\ [][BugNext]_vars
 
 ====

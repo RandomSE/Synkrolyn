@@ -1,0 +1,25 @@
+name: sim-nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+
+jobs:
+  sim:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: 10k seeds at 2000 steps
+        env:
+          SIM_COUNT: 10000
+          SIM_STEPS: 2000
+        run: dotnet test tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj --configuration Release --filter FullyQualifiedName~PushSeeds_holdInvariants
