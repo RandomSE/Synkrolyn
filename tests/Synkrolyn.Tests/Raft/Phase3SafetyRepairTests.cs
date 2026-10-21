@@ -79,7 +79,7 @@ public class Phase3SafetyRepairTests
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
         long applied = leader.LastApplied;
-        leader.SetSnapshotExecutor(action => ThreadPool.QueueUserWorkItem(_ => action()));
+        leader.SetSnapshotExecutor(ClusterHarness.RunOffThread);
         machine.Arm();
         leader.Snapshot();
         Assert.True(machine.InEncode.Wait(TimeSpan.FromSeconds(2)));
@@ -128,6 +128,20 @@ public class Phase3SafetyRepairTests
     }
 
     [Fact]
+    public void RunOffThread_doesNotUseTheThreadPool()
+    {
+        using var done = new ManualResetEventSlim(false);
+        bool poolThread = true;
+        ClusterHarness.RunOffThread(() =>
+        {
+            poolThread = Thread.CurrentThread.IsThreadPoolThread;
+            done.Set();
+        });
+        Assert.True(done.Wait(TimeSpan.FromSeconds(2)));
+        Assert.False(poolThread);
+    }
+
+    [Fact]
     public void CompactionCommit_runsOnTheRaftThread()
     {
         var cluster = new ClusterHarness();
@@ -139,7 +153,7 @@ public class Phase3SafetyRepairTests
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
         using var executorDone = new ManualResetEventSlim(false);
-        leader.SetSnapshotExecutor(action => ThreadPool.QueueUserWorkItem(_ =>
+        leader.SetSnapshotExecutor(action => ClusterHarness.RunOffThread(() =>
         {
             action();
             executorDone.Set();

@@ -759,7 +759,7 @@ public class Phase123ReviewTests
         Assert.NotNull(cluster.Propose("n1", "a"u8.ToArray()));
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
-        leader.SetSnapshotExecutor(action => ThreadPool.QueueUserWorkItem(_ => action()));
+        leader.SetSnapshotExecutor(ClusterHarness.RunOffThread);
         machine.Arm();
         var drained = new Thread(() => leader.Snapshot());
         drained.Start();
@@ -786,7 +786,7 @@ public class Phase123ReviewTests
         Assert.NotNull(cluster.Propose("n1", "a"u8.ToArray()));
         cluster.DrainAll();
         RaftNode leader = cluster.Node("n1");
-        leader.SetSnapshotExecutor(action => ThreadPool.QueueUserWorkItem(_ => action()));
+        leader.SetSnapshotExecutor(ClusterHarness.RunOffThread);
         log.Arm();
         try
         {

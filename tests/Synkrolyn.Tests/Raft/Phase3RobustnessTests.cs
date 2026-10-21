@@ -490,7 +490,7 @@ public class Phase3RobustnessTests
         cluster.Advance(80);
         Assert.Equal(Role.Leader, cluster.Node("n1").Role);
         Assert.Equal(1, follower.LastApplied);
-        follower.SetApplyExecutor(action => ThreadPool.QueueUserWorkItem(_ => action()));
+        follower.SetApplyExecutor(ClusterHarness.RunOffThread);
         cluster.Propose("n1", "v"u8.ToArray());
         Assert.True(machine.Entered.Wait(TimeSpan.FromSeconds(2)));
         follower.Snapshot();
