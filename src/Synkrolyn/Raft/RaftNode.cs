@@ -139,6 +139,8 @@ public sealed class RaftNode
     private long _commitIndex;
     private long _lastApplied;
     private readonly List<PendingRead> _pendingReads = [];
+    private readonly List<PendingRead> _readPool = [];
+    private readonly List<long> _stampScratch = [];
     private readonly HashSet<string> _aeInFlightPeers = [];
     private readonly Dictionary<string, long> _aeInFlightSince = [];
     private readonly HashSet<string> _aeSilentPeers = [];
@@ -801,12 +803,11 @@ public sealed class RaftNode
                 return null;
             }
 
-            var read = new PendingRead
-            {
-                Ticket = ++_nextReadTicket,
-                Index = _commitIndex,
-                Term = CurrentTermLocked(),
-            };
+            PendingRead read = RentRead();
+            read.Ticket = ++_nextReadTicket;
+            read.Index = _commitIndex;
+            read.Term = CurrentTermLocked();
+            read.Satisfied = false;
             foreach (string peer in _voterPeers)
             {
                 read.Floor[peer] = _nextAeStamp.GetValueOrDefault(peer) + 1;
@@ -841,7 +842,7 @@ public sealed class RaftNode
     {
         lock (_eventLock)
         {
-            return _pendingReads.Exists(read => read.Ticket == ticket);
+            return FindRead(ticket) is not null;
         }
     }
 
@@ -1426,13 +1427,7 @@ public sealed class RaftNode
         sent[stamp] = sentAtNow;
         TrackInFlight(peer, sentAtNow);
         long leaseBound = ReadLeaseBoundMillis();
-        foreach (long key in sent.Keys.ToArray())
-        {
-            if (key != stamp && sentAtNow - sent[key] >= leaseBound)
-            {
-                sent.Remove(key);
-            }
-        }
+        RemoveExpiredStamps(sent, stamp, sentAtNow, leaseBound);
         bool accepted;
         try
         {
@@ -2722,7 +2717,7 @@ public sealed class RaftNode
 
     private bool ReadTicketSatisfiedLocked(long ticket)
     {
-        PendingRead? read = _pendingReads.Find(item => item.Ticket == ticket);
+        PendingRead? read = FindRead(ticket);
         if (read is null
             || !read.Satisfied
             || _role != Role.Leader
@@ -2733,7 +2728,46 @@ public sealed class RaftNode
         }
 
         _pendingReads.Remove(read);
+        ReturnRead(read);
         return true;
+    }
+
+    private PendingRead? FindRead(long ticket)
+    {
+        for (int i = 0; i < _pendingReads.Count; i++)
+        {
+            PendingRead read = _pendingReads[i];
+            if (read.Ticket == ticket)
+            {
+                return read;
+            }
+        }
+
+        return null;
+    }
+
+    private PendingRead RentRead()
+    {
+        int last = _readPool.Count - 1;
+        if (last < 0)
+        {
+            return new PendingRead();
+        }
+
+        PendingRead read = _readPool[last];
+        _readPool.RemoveAt(last);
+        read.Floor.Clear();
+        read.Acks.Clear();
+        read.Satisfied = false;
+        return read;
+    }
+
+    private void ReturnRead(PendingRead read)
+    {
+        read.Floor.Clear();
+        read.Acks.Clear();
+        read.Satisfied = false;
+        _readPool.Add(read);
     }
 
     private void NoteReadAcks(string from, long stamp)
@@ -3102,10 +3136,7 @@ public sealed class RaftNode
             _linearizableAckSendMillis[from] = at;
         }
 
-        foreach (long older in sent.Keys.Where(older => older < stamp).ToArray())
-        {
-            sent.Remove(older);
-        }
+        RemoveOlderStamps(sent, stamp);
     }
 
     private bool AeInFlightLocked() => _aeInFlightPeers.Count > 0;
@@ -3169,7 +3200,49 @@ public sealed class RaftNode
         return false;
     }
 
-    private void AbortReadIndex() => _pendingReads.Clear();
+    private void AbortReadIndex()
+    {
+        for (int i = 0; i < _pendingReads.Count; i++)
+        {
+            ReturnRead(_pendingReads[i]);
+        }
+
+        _pendingReads.Clear();
+    }
+
+    private void RemoveExpiredStamps(Dictionary<long, long> sent, long keep, long now, long bound)
+    {
+        _stampScratch.Clear();
+        foreach (KeyValuePair<long, long> pair in sent)
+        {
+            if (pair.Key != keep && now - pair.Value >= bound)
+            {
+                _stampScratch.Add(pair.Key);
+            }
+        }
+
+        for (int i = 0; i < _stampScratch.Count; i++)
+        {
+            sent.Remove(_stampScratch[i]);
+        }
+    }
+
+    private void RemoveOlderStamps(Dictionary<long, long> sent, long stamp)
+    {
+        _stampScratch.Clear();
+        foreach (KeyValuePair<long, long> pair in sent)
+        {
+            if (pair.Key < stamp)
+            {
+                _stampScratch.Add(pair.Key);
+            }
+        }
+
+        for (int i = 0; i < _stampScratch.Count; i++)
+        {
+            sent.Remove(_stampScratch[i]);
+        }
+    }
 
     private bool CandidateLogUpToDate(RequestVote request)
     {
@@ -3711,11 +3784,11 @@ public sealed class RaftNode
 
     private sealed class PendingRead
     {
-        public long Ticket { get; init; }
+        public long Ticket { get; set; }
 
-        public long Index { get; init; }
+        public long Index { get; set; }
 
-        public long Term { get; init; }
+        public long Term { get; set; }
 
         public Dictionary<string, long> Floor { get; } = [];
 

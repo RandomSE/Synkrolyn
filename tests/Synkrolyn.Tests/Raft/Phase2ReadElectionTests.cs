@@ -443,6 +443,30 @@ public class Phase2ReadElectionTests
         });
     }
 
+    [Fact]
+    public void ReadIndexPoll_doesNotAllocatePerCheck()
+    {
+        var cluster = new ClusterHarness();
+        cluster.AddNode("n1", ["n2"], TimeSpan.FromMilliseconds(80), Heartbeat);
+        cluster.AddNode("n2", ["n1"], TimeSpan.FromMilliseconds(10_000), Heartbeat);
+        cluster.Advance(80);
+        Assert.NotNull(cluster.Propose("n1", "v"u8.ToArray()));
+        cluster.DrainAll();
+        RaftNode leader = cluster.Node("n1");
+        ReadIndexStart? started = leader.BeginReadIndex();
+        Assert.NotNull(started);
+        long ticket = started.Value.Ticket;
+        const int polls = 2000;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < polls; i++)
+        {
+            _ = leader.ReadIndexSatisfied(ticket);
+        }
+
+        long used = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(used < 512, "poll allocated " + used + " bytes");
+    }
+
     private sealed class ForceObservingTransport : ITransport
     {
         private readonly InMemoryTransport _inner;

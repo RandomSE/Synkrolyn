@@ -39,15 +39,17 @@ Positive change means this branch is higher. For latency, election time, and byt
 | Lease read p99 (us) | 0.195 | 0.296 | +52% | Repeat was the other way: 0.215 vs 0.202. This run's max is 17 us, so one outlier moves p99. Not stable across the two runs. |
 | ReadIndex p50 (us) | 41.6 | 78.0 | +88% | Not stable. The other run was 51.4 vs 52.1. |
 | ReadIndex p99 (us) | 112.0 | 35325 | large | Not called. The other run was 7950 vs 124. Both trees move by milliseconds between runs. |
-| Election p50 (ms) | 112.1 | 149.9 | +34% | Repeat 114.3 vs 150.6. The gap does not clear the baseline IQR (38 ms and 39 ms). Min is about 111 ms on both. |
+| Election p50 (ms) | 112.1 | 149.9 | +34% | Repeat 114.3 vs 150.6. Min is about 111 ms on both. Left in place: a follower gates votes for the leader's full election timeout, not two heartbeats. |
 | Election p99 (ms) | 153.6 | 152.1 | -1.0% | Was about 245 to 279 ms. Repeat 155.0 vs 155.5. Max is 152 ms and 156 ms. |
 | Alloc per pipelined write (bytes) | 213363 | 32307 | -85% | Fewer bytes. Repeat 336522 vs 25266. |
 | Alloc per lease read (bytes) | 3.6 | 9.2 | noisy | Repeat was 0 vs 0. A few bytes on one trial. |
-| Alloc per ReadIndex (bytes) | 12247 | 41834 | +242% | More bytes on the ticket round. Not in the latency, throughput, or availability gate. Repeat 11219 vs 25334. |
+| Alloc per ReadIndex (bytes) | 12247 | 7580.7 | -38% | Was 41834 before tickets were reused. Review repeat 7297.4. Same-day baseline 13303.2 and 10213.5. |
 
 ReadIndex completion is a quorum ack (this node plus one peer) after `BeginReadIndex`, with the index applied. This branch times `ReadIndexSatisfied(long)`. The baseline's parameterless `ReadIndexSatisfied` returns immediately while the lease is valid, so the harness reads `_readIndexAcks` under `_eventLock` instead. Both probes wait for one peer ack.
 
-Election time is from `RaftRuntime.Dispose` on the leader until another node is leader at a higher term. The leader is stopped only after one committed put and an 80 ms settle.
+Election time is from `RaftRuntime.Dispose` on the leader until another node is leader at a higher term. The leader is stopped only after one committed put and an 80 ms settle. `9ae58dd` gates a pre-vote for two heartbeats (80 ms), so the faster follower can win near 112 ms. This tree gates for the leader's election timeout (150 ms), the same window as the read lease. A follower that heard the leader just before the stop must not vote while that lease can still be valid. Shortening the gate would reopen that hole, so election p50 stays at the timeout.
+
+ReadIndex bytes on 2026-10-21 used the same alloc batch (5 trials of 80) with the other loops set to 1. The byte count is `GC.GetTotalAllocatedBytes` around that batch only. `9ae58dd` was 13303.2 then 10213.5. This tree was 7580.7 then 7297.4. `ReadIndexSatisfied(long)` no longer allocates a closure per poll, and the ticket's dictionary and ack set are reused.
 
 ## Phase 9 findings after the fixes
 
