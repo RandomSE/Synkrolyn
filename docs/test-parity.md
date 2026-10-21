@@ -302,9 +302,11 @@ WaveERuntimeAndGroupCommitTest.java::membershipCodec_roundtripAddPromoteRemove -
 
 ## Equivalent mutants
 
-Stryker.NET 5.0.0, mutation level Basic. The scope is file globs, not line ranges: `Kv/**/*.cs` (including sessions), `InMemoryRaftLog`, `InMemoryPersistentState`, `LogEntry`, `MembershipCodec`, all of `RaftNode.cs`, and `InMemoryTransport`. PushSeeds, the stale-read seed, and socket tests are excluded. Concurrency is 4. Phase 11 scored 65.26% (1,073 killed, 22 timeout, 380 survived, 203 no coverage). Phase 11b raised that to 66.39% (1,078 killed, 36 timeout, 365 survived, 199 no coverage). Phase 11c killed 23 more on lease, ReadIndex, and vote timing: 67.76% (1,102 killed, 35 timeout, 350 survived, 191 no coverage) on the same 1,678 mutants. An 80% score would need about 210 more detections. Most of the undetected mutants are gaps, not equivalents.
+Stryker.NET 5.0.0, mutation level Basic. The scope is file globs, not line ranges: `Kv/**/*.cs` (including sessions), `InMemoryRaftLog`, `InMemoryPersistentState`, `LogEntry`, `MembershipCodec`, all of `RaftNode.cs`, and `InMemoryTransport`. PushSeeds, the stale-read seed, and socket tests are excluded. Concurrency is 4. Phase 11 scored 65.26% (1,073 killed, 22 timeout, 380 survived, 203 no coverage). Phase 11b raised that to 66.39% (1,078 killed, 36 timeout, 365 survived, 199 no coverage). Phase 11c killed 23 more on lease, ReadIndex, and vote timing: 67.76% on the same 1,678 mutants. An 80% score would need about 210 more detections. Most of the undetected mutants are gaps, not equivalents.
 
-One job on the full scope took 12 min 38 s in CI. `since` with an empty diff reports no score, so CI keeps two jobs. `stryker-raft.json` is all of `RaftNode.cs`: 65.19% (630 killed, 31 timeout, 250 survived, 103 no coverage), 4 min 42 s locally, break 62. `stryker-kv.json` is Kv, sessions, and the in-memory log, vote, codec, and transport: 71.69%, break 68. `stryker-config.json` is the combined scope, break 64, for a local full run.
+A fresh full run on 2026-10-21 scored the same 67.76% (1,117 killed, 20 timeout, 350 survived, 191 no coverage). Fifteen mutants that timed out in the phase 11c note are killed now. Survived and no coverage did not move. `RaftNode` is still 65.19% (647 killed, 14 timeout, 250 survived, 103 no coverage). The Kv slice is still 71.69%.
+
+One job on the full scope took 12 min 38 s in CI. `since` with an empty diff reports no score, so CI keeps two jobs. `stryker-raft.json` is all of `RaftNode.cs`, break 62. `stryker-kv.json` is Kv, sessions, and the in-memory log, vote, codec, and transport, break 68. `stryker-config.json` is the combined scope, break 64, for a local full run.
 
 The earlier line-range scope (`RaftNode.cs` lines 1-1899) scored 67.32% in 2 min 52 s. The wide run scored 61.92% then 63.07% and took 14 min 11 s in CI. That span drifted as the file grew, so CI no longer uses it.
 
@@ -332,6 +334,18 @@ Thirty-five survivors are equivalent. Each one leaves every observable result un
 - `LeaderMillis`: `elapsed < 0` replaced with `<=` stores 0 at elapsed 0, and the clock is monotonic so elapsed is never negative. `applied > stamp` replaced with `>=` stores that same stamp.
 - `RemainingVoteGateMillis`: the restart `&&` replaced with `||` still applies only to a real restart lease, because an unset lease is `long.MinValue` and is not after now. `restart > now` replaced with `>=` adds a zero remainder, which does not replace a longer gate.
 
-The other 506 undetected mutants are gaps. This round killed 23, all on lease, ReadIndex, and vote timing. `RaftNode` still has 43 lease/ReadIndex gaps and 56 vote/term gaps. The other areas were not remeasured: log/snapshot 121, kv/session 109, commit/apply 44, membership and mailbox 80, codec/transport/log store 22.
+The other 506 undetected mutants are gaps (350 survived and 191 with no coverage, minus the 35 equivalents). Phase 11b had counted 89 lease/ReadIndex gaps and 70 vote/term gaps, 159 together. The next note wrote 43 and 56, a drop of 60, and copied the other areas forward (121, 109, 44, 80, 22). Only 23 mutants left the undetected set, and 6 lease/vote survivors were newly marked equivalent (`Start`, `LeaderMillis`, `RemainingVoteGateMillis`). That accounts for 29 of the 60. The other 31 are still undetected. Those area lines sum to 475, and 506 minus 475 is the same 31. They were left out of both the new lease/vote figures and the copied lines.
+
+The 2026-10-21 report, by enclosing method (survived, then no coverage). Equivalents stay in these counts. `ApplyWaiter` is commit/apply. The constructor and `ConfigView.Apply` are membership. `RequirePositive` is vote/term.
+
+- Log append, truncation, fast backup, and snapshot install: 91 survived, 35 no coverage.
+- Kv store, session dedup, expiry, and client retry: 77 survived, 77 no coverage.
+- Lease and ReadIndex: 46 survived, 15 no coverage.
+- Vote, term, and election deadline: 51 survived, 17 no coverage.
+- Commit index and apply: 23 survived, 12 no coverage.
+- Membership change and the mailbox: 50 survived, 31 no coverage.
+- Codec, in-memory transport, and the log store: 12 survived, 4 no coverage.
+
+That is 350 survived and 191 with no coverage. These groups are not the phase 11b buckets, so they do not revise 121, 109, 89, 70, 44, 80, and 22 line by line. They replace the 43 and 56 lines, which do not add up.
 
 `IsExpired` treating a negative timeout as already expired, `TakeEffect` dropping the consumed-index return, and the non-leader return in `MaybeAdvanceCommit` are gaps. A negative timeout, a second take of an error, and a follower force can each change the result.
