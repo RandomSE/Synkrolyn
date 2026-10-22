@@ -132,6 +132,21 @@ public sealed class DeterministicSimulatorTests
     }
 
     [Fact]
+    public void ClockJumpAndPause_refusesStaleLease_andIsLinearizable()
+    {
+        for (int seed = 1; seed <= 5; seed++)
+        {
+            SimResult result = DeterministicSimulator.RunClockAndPause(seed);
+            Assert.True(result.StaleLeaseRefused, "seed " + seed);
+            Assert.True(result.LeaderElected, "seed " + seed);
+            LinVerdict verdict = LinearizabilityChecker.CheckHistory(result.History);
+            Assert.True(
+                verdict == LinVerdict.Linearizable,
+                verdict + " " + LinearizabilityChecker.Conflict(result.History) + " seed " + seed);
+        }
+    }
+
+    [Fact]
     public void FullClusterCrash_keepsCommittedPrefix_andIsLinearizable()
     {
         for (int seed = 1; seed <= 5; seed++)

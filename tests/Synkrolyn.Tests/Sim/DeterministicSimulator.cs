@@ -47,6 +47,12 @@ public sealed class SimResult
 
     /// <summary>True after a scripted full-voter crash kept every committed index.</summary>
     public bool CommittedPrefixKept { get; init; }
+
+    /// <summary>
+    /// True when a paused or clock-stepped former leader refused a lease read
+    /// after another node had become leader.
+    /// </summary>
+    public bool StaleLeaseRefused { get; init; }
 }
 
 /// <summary>
@@ -89,6 +95,19 @@ public static class DeterministicSimulator
     }
 
     /// <summary>
+    /// Commits a value, pauses the leader past the election timeout, then steps
+    /// that node's clock backward while a new leader exists. The history is the
+    /// caller's linearizability input.
+    /// </summary>
+    public static SimResult RunClockAndPause(int seed)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seed);
+        var world = new World(seed, steps: 60, staleReads: false);
+        world.ExecuteClockAndPause(500 + (seed * 50), 1_000L * seed);
+        return world.Result();
+    }
+
+    /// <summary>
     /// <paramref name="staleReads"/> serves gets from a live node's local map.
     /// That skips ReadIndex and the lease. The linearizability checker should reject it.
     /// </summary>
@@ -127,6 +146,7 @@ public static class DeterministicSimulator
         private readonly Dictionary<(string Voter, long Term), string> _grants = [];
         private bool _writeCommitted;
         private bool _committedPrefixKept;
+        private bool _staleLeaseRefused;
         private bool _healed;
         private bool _pendingSettled = true;
         private string? _safetyFailure;
@@ -228,7 +248,135 @@ public static class DeterministicSimulator
                 ReplicasEqual = equal,
                 History = _history,
                 CommittedPrefixKept = _committedPrefixKept,
+                StaleLeaseRefused = _staleLeaseRefused,
             };
+        }
+
+        public void ExecuteClockAndPause(int pauseMs, long backwardMs)
+        {
+            _net.CrashSends = false;
+            Note("clock-pause " + pauseMs.ToString(CultureInfo.InvariantCulture));
+            Drain();
+            for (int step = 0; step < 40 && !_writeCommitted; step++)
+            {
+                Advance(20);
+                Drain();
+                PutOnce(_clients[0], step, "k0", "before-pause");
+                Drain();
+                Check(step);
+            }
+
+            if (!_writeCommitted)
+            {
+                Fail("nothing committed before the clock faults");
+            }
+
+            for (int i = 0; i < 30 && LeaderWithLease() is null; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (LeaderWithLease() is not SimNode leader)
+            {
+                Fail("no lease before the pause");
+                return;
+            }
+
+            Freeze(leader);
+            int slices = Math.Max(1, pauseMs / 20);
+            for (int i = 0; i < slices; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (OtherLeader(leader) is not SimNode elected)
+            {
+                Fail("no leader while " + leader.Id + " was paused");
+                return;
+            }
+
+            leader.Clock.Jump(pauseMs);
+            if (ServesLease(leader))
+            {
+                Fail("paused leader " + leader.Id + " served a lease read after " + elected.Id);
+            }
+
+            Thaw(leader);
+            _net.DropQueued();
+            _net.ClearFaults();
+            for (int i = 0; i < 40 && LeaderWithLease() is null; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (LeaderWithLease() is not SimNode stepped)
+            {
+                Fail("no lease before the backward step");
+                return;
+            }
+
+            Freeze(stepped);
+            Isolate(stepped);
+            _net.DropQueued();
+            for (int i = 0; i < slices; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (OtherLeader(stepped) is not SimNode after)
+            {
+                Fail("no leader after stepping " + stepped.Id);
+                return;
+            }
+
+            stepped.Clock.Jump(-backwardMs);
+            if (ServesLease(stepped))
+            {
+                Fail("stepped leader " + stepped.Id + " served a lease read after " + after.Id);
+            }
+
+            _staleLeaseRefused = true;
+            Thaw(stepped);
+            _net.ClearFaults();
+            _net.DropQueued();
+            for (int i = 0; i < 20; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            for (int step = 0; step < 16; step++)
+            {
+                if (_rng.Next(2) == 0)
+                {
+                    SimNode node = _nodes[_rng.Next(3)];
+                    if (node.Live && !node.Frozen)
+                    {
+                        long delta = _rng.Next(2) == 0 ? 40 + _rng.Next(200) : -(40 + _rng.Next(200));
+                        node.Clock.Jump(delta);
+                        Note(step + " jump " + node.Id + " " + delta.ToString(CultureInfo.InvariantCulture));
+                        if (delta < 0 && OtherLeader(node) is SimNode other && ServesLease(node))
+                        {
+                            Fail("stepped leader " + node.Id + " served a lease read after " + other.Id);
+                        }
+                    }
+                }
+                else if (step % 2 == 0)
+                {
+                    ClientPut(step);
+                }
+                else
+                {
+                    ClientGet(step);
+                }
+
+                Drain();
+                Check(step);
+            }
         }
 
         public void ExecuteFullCrash()
@@ -279,7 +427,7 @@ public static class DeterministicSimulator
                 var detail = new StringBuilder();
                 foreach (SimNode node in _nodes)
                 {
-                    if (node.Raft is null)
+                    if (node.Frozen || node.Raft is null)
                     {
                         continue;
                     }
@@ -470,8 +618,90 @@ public static class DeterministicSimulator
             _net.DeliverDue();
             foreach (SimNode node in _nodes)
             {
+                if (node.Frozen)
+                {
+                    continue;
+                }
+
                 node.Clock.AdvanceScaled(delta, node.RatePercent);
             }
+        }
+
+        private void Freeze(SimNode node)
+        {
+            node.Frozen = true;
+            _net.SetFrozen(node.Id, true);
+            _net.DropQueued();
+            Note("freeze " + node.Id);
+        }
+
+        private void Thaw(SimNode node)
+        {
+            node.Frozen = false;
+            _net.SetFrozen(node.Id, false);
+            Note("thaw " + node.Id);
+        }
+
+        private void Isolate(SimNode node)
+        {
+            foreach (SimNode other in _nodes)
+            {
+                if (other.Id != node.Id)
+                {
+                    _net.TogglePartition(node.Id, other.Id);
+                }
+            }
+
+            Note("isolate " + node.Id);
+        }
+
+        private SimNode? LeaderWithLease()
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (!node.Live || node.Frozen)
+                {
+                    continue;
+                }
+
+                RaftNode raft = node.Raft!;
+                if (raft.Role == Role.Leader && (raft.ReadIndexSatisfied() || raft.QuorumLeaseValid))
+                {
+                    return node;
+                }
+            }
+
+            return null;
+        }
+
+        private SimNode? OtherLeader(SimNode except)
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == except.Id || !node.Live || node.Frozen)
+                {
+                    continue;
+                }
+
+                if (node.Raft!.Role == Role.Leader)
+                {
+                    return node;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool ServesLease(SimNode node)
+        {
+            RaftNode raft = node.Raft!;
+            if (raft.ReadIndexSatisfied() || raft.QuorumLeaseValid || raft.FollowerReadLeaseValid)
+            {
+                return true;
+            }
+
+            var client = new KvClient(raft, node.Store);
+            return client.LinearizableGet("k0") is not null || client.BoundedStaleGet("k0") is not null;
         }
 
         private void AdvanceSettled()
@@ -1097,7 +1327,7 @@ public static class DeterministicSimulator
                 bool progress = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (node.Raft is null)
+                    if (node.Frozen || node.Raft is null)
                     {
                         continue;
                     }
@@ -1129,7 +1359,7 @@ public static class DeterministicSimulator
                 bool quorumCrash = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (!node.Live)
+                    if (node.Frozen || !node.Live)
                     {
                         continue;
                     }
@@ -1159,7 +1389,7 @@ public static class DeterministicSimulator
                 bool more = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (node.Raft is null)
+                    if (node.Frozen || node.Raft is null)
                     {
                         continue;
                     }
@@ -1523,6 +1753,8 @@ public static class DeterministicSimulator
 
         public bool PendingCrash { get; set; }
 
+        public bool Frozen { get; set; }
+
         public int Generation { get; set; }
 
         public long CommitSeen { get; set; }
@@ -1564,6 +1796,24 @@ public static class DeterministicSimulator
                 _onAdvance?.Invoke();
             }
         }
+
+        public void Jump(long delta)
+        {
+            long next = checked(_millis + delta);
+            if (next < 0)
+            {
+                next = 0;
+            }
+
+            if (next == _millis)
+            {
+                return;
+            }
+
+            _millis = next;
+            _fraction = 0;
+            _onAdvance?.Invoke();
+        }
     }
 
     private sealed class SimNet : ITransport
@@ -1572,6 +1822,7 @@ public static class DeterministicSimulator
         private readonly HashSet<string> _known = [];
         private readonly Dictionary<string, RaftNode?> _handlers = [];
         private readonly HashSet<Link> _cuts = [];
+        private readonly HashSet<string> _frozen = [];
         private readonly List<Delivery> _queue = [];
         private long _seq;
 
@@ -1594,6 +1845,18 @@ public static class DeterministicSimulator
         public void Known(string id) => _known.Add(id);
 
         public void Bind(string id, RaftNode? node) => _handlers[id] = node;
+
+        public void SetFrozen(string id, bool frozen)
+        {
+            if (frozen)
+            {
+                _frozen.Add(id);
+            }
+            else
+            {
+                _frozen.Remove(id);
+            }
+        }
 
         public void ClearFaults()
         {
@@ -1671,7 +1934,10 @@ public static class DeterministicSimulator
             var ready = new List<Delivery>();
             foreach (Delivery item in _queue)
             {
-                if (item.Due <= Now && _handlers.TryGetValue(item.Envelope.To, out RaftNode? node) && node is not null)
+                if (item.Due <= Now
+                    && !_frozen.Contains(item.Envelope.To)
+                    && _handlers.TryGetValue(item.Envelope.To, out RaftNode? node)
+                    && node is not null)
                 {
                     ready.Add(item);
                 }
