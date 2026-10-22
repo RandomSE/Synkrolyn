@@ -349,3 +349,11 @@ The 2026-10-21 report, by enclosing method (survived, then no coverage). Equival
 That is 350 survived and 191 with no coverage. These groups are not the phase 11b buckets, so they do not revise 121, 109, 89, 70, 44, 80, and 22 line by line. They replace the 43 and 56 lines, which do not add up.
 
 `IsExpired` treating a negative timeout as already expired, `TakeEffect` dropping the consumed-index return, and the non-leader return in `MaybeAdvanceCommit` are gaps. A negative timeout, a second take of an error, and a follower force can each change the result.
+
+## Phase 13 fault coverage
+
+These three conditions were partial in the fault audit. They are covered now.
+
+- Full-voter crash. `DeterministicSimulator.RunFullClusterCrash` crashes every voter with an unflushed suffix, restarts each from its durable log, and `DeterministicSimulatorTests.FullClusterCrash_keepsCommittedPrefix_andIsLinearizable` checks the committed prefix and linearizability on seeds 1 through 5.
+- Crash during InstallSnapshot. `FaultGapTests.CrashMidInstallSnapshot_restartsAndRejectsStaleFinalChunk` persists one chunk as a torn `snapshot.bin`, reopens the follower, rejects a stale final chunk, and accepts a fresh install from offset 0. A torn snapshot file is dropped. A checksum mismatch still throws.
+- Sustained one-way partition. `FaultGapTests.OneWayPartition_pastElectionTimeout_oneLeaderPerTerm_andNoStaleLeaseRead` drops leader-to-follower traffic past the election timeout and checks one leader per term and no lease read from the stale leader.

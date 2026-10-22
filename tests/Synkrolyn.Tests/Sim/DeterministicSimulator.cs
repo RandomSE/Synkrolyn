@@ -44,6 +44,9 @@ public sealed class SimResult
     public required bool ReplicasEqual { get; init; }
 
     public required IReadOnlyList<ClientHistoryEntry> History { get; init; }
+
+    /// <summary>True after a scripted full-voter crash kept every committed index.</summary>
+    public bool CommittedPrefixKept { get; init; }
 }
 
 /// <summary>
@@ -72,6 +75,18 @@ public static class DeterministicSimulator
     }
 
     public static SimResult Run(int seed, int steps) => Run(seed, steps, staleReads: false);
+
+    /// <summary>
+    /// Quiet commit, then every voter crashes with an unflushed suffix and restarts
+    /// from its durable log. The history is the caller's linearizability input.
+    /// </summary>
+    public static SimResult RunFullClusterCrash(int seed)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seed);
+        var world = new World(seed, steps: 40, staleReads: false);
+        world.ExecuteFullCrash();
+        return world.Result();
+    }
 
     /// <summary>
     /// <paramref name="staleReads"/> serves gets from a live node's local map.
@@ -108,8 +123,10 @@ public static class DeterministicSimulator
         private readonly List<string?> _healedLeaders = [];
         private readonly Dictionary<int, Pending> _pending = [];
         private readonly Dictionary<int, (string Key, string Value)> _openPut = [];
+        private readonly Dictionary<string, string> _ackedValues = [];
         private readonly Dictionary<(string Voter, long Term), string> _grants = [];
         private bool _writeCommitted;
+        private bool _committedPrefixKept;
         private bool _healed;
         private bool _pendingSettled = true;
         private string? _safetyFailure;
@@ -210,7 +227,175 @@ public static class DeterministicSimulator
                 PendingSettled = _pendingSettled,
                 ReplicasEqual = equal,
                 History = _history,
+                CommittedPrefixKept = _committedPrefixKept,
             };
+        }
+
+        public void ExecuteFullCrash()
+        {
+            _net.CrashSends = false;
+            Note("full-crash");
+            Drain();
+            for (int step = 0; step < 40 && !_writeCommitted; step++)
+            {
+                Advance(20);
+                Drain();
+                ClientPut(step);
+                Drain();
+                Check(step);
+            }
+
+            if (!_writeCommitted || _committed.Count == 0)
+            {
+                Fail("nothing committed before the full crash");
+            }
+
+            var kept = new Dictionary<long, (long Term, int Hash)>(_committed);
+            CrashAllVoters();
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == "n4")
+                {
+                    continue;
+                }
+
+                Boot(node);
+            }
+
+            _net.ClearFaults();
+            _healed = true;
+            for (int step = 0; step < 400 && LiveLeader() is null; step++)
+            {
+                Advance(20);
+                Drain();
+                if (step % 20 == 0)
+                {
+                    Check(step);
+                }
+            }
+
+            if (LiveLeader() is null)
+            {
+                var detail = new StringBuilder();
+                foreach (SimNode node in _nodes)
+                {
+                    if (node.Raft is null)
+                    {
+                        continue;
+                    }
+
+                    detail.Append(node.Id);
+                    detail.Append(" term ");
+                    detail.Append(node.Raft.CurrentTerm);
+                    detail.Append(" deadline ");
+                    detail.Append(node.Raft.NextDeadlineMillis());
+                    detail.Append(" clock ");
+                    detail.Append(node.Clock.Millis);
+                    detail.Append(" prevote ");
+                    detail.Append(node.Raft.LastPreVoteGranted);
+                    detail.Append("; ");
+                }
+
+                Fail("no leader after full restart " + detail);
+            }
+
+            foreach ((long index, (long Term, int Hash) entry) in kept)
+            {
+                int copies = 0;
+                foreach (SimNode node in _nodes)
+                {
+                    if (node.Id != "n4" && Covers(node, index, entry.Term, entry.Hash))
+                    {
+                        copies++;
+                    }
+                }
+
+                if (copies < 2)
+                {
+                    Fail("lost committed index " + index.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+
+            ReadBackCommittedPuts();
+            _committedPrefixKept = true;
+        }
+
+        private void CrashAllVoters()
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == "n4" || node.Raft is null || !node.Raft.IsVoter)
+                {
+                    continue;
+                }
+
+                node.Raft.StopAfterRaftThreadFault();
+                node.Clock.Clear();
+                long term = node.State.CurrentTerm;
+                long next = node.Log.LastIndex + 1;
+                long flushed = node.Log.FlushedThrough;
+                node.Log.Append(new LogEntry(next, term, KvCommandCodec.EncodePut("torn", "x")));
+                node.Log.Append(new LogEntry(next + 1, term, KvCommandCodec.EncodePut("torn", "y")));
+                long extended = node.Log.LastIndex;
+                node.Log.LoseUnflushed(_rng.Next(2));
+                if (node.Log.LastIndex >= extended || node.Log.LastIndex < flushed)
+                {
+                    Fail("crash did not trim the unflushed suffix on " + node.Id);
+                }
+
+                node.State.LoseUnflushed();
+                node.Store = new InMemoryKvStore();
+                node.Crashed = true;
+                node.PendingCrash = false;
+                node.Raft = null;
+                _net.Bind(node.Id, null);
+                Note("crash-all " + node.Id);
+            }
+
+            _net.DropQueued();
+        }
+
+        private void ReadBackCommittedPuts()
+        {
+            SimNode? leader = LiveLeader();
+            if (leader?.Raft is null)
+            {
+                Fail("no leader for the read-back");
+                return;
+            }
+
+            var reader = new SimClient(7, new KvClient(leader.Raft, leader.Store));
+            for (int step = 0; step < 8 && reader.Kv.ClientId == 0; step++)
+            {
+                AdvanceSettled();
+                Drain();
+                Bind(reader);
+                EnsureSession(reader);
+            }
+
+            if (reader.Kv.ClientId == 0)
+            {
+                Fail("session did not register after full restart");
+            }
+
+            foreach ((string key, string value) in _ackedValues)
+            {
+                string result = "unknown";
+                for (int step = 0; step < 8 && result != value; step++)
+                {
+                    AdvanceSettled();
+                    Drain();
+                    Bind(reader);
+                    Record(reader.Id, "get", "invoke", key, "");
+                    result = LinearizableRead(reader, key);
+                    Record(reader.Id, "get", "complete", key, result);
+                }
+
+                if (result != value)
+                {
+                    Fail("lost committed value " + key + " saw " + result);
+                }
+            }
         }
 
         private static SimNode Make(string id, string[] peers, int electionMs, int rate) =>
@@ -427,6 +612,12 @@ public static class DeterministicSimulator
                 long? done = client.Kv.AwaitCommitted();
                 string text = done is null ? "null" : done.Value.ToString(CultureInfo.InvariantCulture);
                 TrackOpen(client.Id, key, value, text);
+                if (done is not null)
+                {
+                    _ackedValues[key] = value;
+                    _writeCommitted = true;
+                }
+
                 Record(client.Id, "put", "complete", key, text);
                 Note(step + " put " + client.Id + " " + key + " " + text);
             }
@@ -1412,6 +1603,8 @@ public static class DeterministicSimulator
             MaxDelay = 0;
             CrashSends = false;
         }
+
+        public void DropQueued() => _queue.Clear();
 
         public void TogglePartition(string a, string b)
         {
