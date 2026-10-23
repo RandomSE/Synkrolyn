@@ -305,6 +305,30 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
         SyncDirectory(dest);
     }
 
+    /// <summary>
+    /// Test hook. When it returns true for a directory, <see cref="SyncDirectoryPath"/> throws
+    /// before the real fsync. Null in production. Match one directory so parallel tests stay isolated.
+    /// </summary>
+    internal static Func<string, bool>? DirectorySyncFault { get; set; }
+
+    /// <summary>fsync of an existing directory. A fault or a failed fsync throws.</summary>
+    internal static void SyncDirectoryPath(string directory)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(directory);
+        if (DirectorySyncFault?.Invoke(directory) == true)
+        {
+            throw new IOException("directory fsync failed: " + directory);
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            SyncWindowsDirectory(directory);
+            return;
+        }
+
+        PosixDirectorySync.Sync(directory);
+    }
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW")]
     private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
 
@@ -316,23 +340,22 @@ public sealed class FilePersistentState : IPersistentState, IDisposable
             return;
         }
 
-        if (OperatingSystem.IsWindows())
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS. The public FileOptions enum does not name it.
-            const FileOptions directoryBackupSemantics = (FileOptions)0x02000000;
-            var options = new FileStreamOptions
-            {
-                Mode = FileMode.Open,
-                Access = FileAccess.Read,
-                Share = FileShare.ReadWrite | FileShare.Delete,
-                Options = directoryBackupSemantics,
-            };
-            using var dir = new FileStream(directory, options);
-            dir.Flush(flushToDisk: true);
-            return;
-        }
+        SyncDirectoryPath(directory);
+    }
 
-        PosixDirectorySync.Sync(directory);
+    private static void SyncWindowsDirectory(string directory)
+    {
+        // FILE_FLAG_BACKUP_SEMANTICS. The public FileOptions enum does not name it.
+        const FileOptions directoryBackupSemantics = (FileOptions)0x02000000;
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            Options = directoryBackupSemantics,
+        };
+        using var dir = new FileStream(directory, options);
+        dir.Flush(flushToDisk: true);
     }
 
     private void EnsureOpen()

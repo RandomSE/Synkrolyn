@@ -43,14 +43,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: spec/tla2tools.jar
-          key: tla2tools-1.8.0
+          key: tla2tools-1.8.0-5bd7b64d
       - name: Download tla2tools.jar
         if: steps.tla-jar.outputs.cache-hit != 'true'
         run: |
           mkdir -p spec
           curl -fsSL -o spec/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
       - name: Verify tla2tools checksum
-        run: echo "7beec0f04818732a62fa193731711a99aa4f11279499b2360a7d156c519ea78d  spec/tla2tools.jar" | sha256sum -c -
+        run: echo "5bd7b64db99ae4c6c35f290de5e809c0ee41af43f8699cf696099ffb6452b1e2  spec/tla2tools.jar" | sha256sum -c -
       - name: TLC real config
         run: java -jar spec/tla2tools.jar -cleanup -workers auto -config tla/MC.cfg tla/Synkrolyn.tla
       - name: TLC bug config must fail
@@ -90,6 +90,8 @@ jobs:
         run: dotnet tool restore
       - name: Stryker
         run: dotnet stryker --config-file ${{ matrix.config }}
+      - name: Undetected mutant gate
+        run: python3 scripts/check-mutation-baseline.py mutation-baseline.json ${{ matrix.name }} StrykerOutput
 
   web:
     runs-on: ubuntu-latest

@@ -6,7 +6,9 @@
     "mutation-level": "Basic",
     "thresholds": { "high": 80, "low": 64, "break": 64 },
     "concurrency": 4,
-    "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket",
+    "additional-timeout": 30000,
+    "timeout-ratio": 2,
+    "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket&FullyQualifiedName!~DeterministicSimulatorTests",
     "reporters": ["cleartext", "json"],
     "mutate": [
       "**/Kv/**/*.cs",

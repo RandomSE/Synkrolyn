@@ -64,3 +64,5 @@ Phase 9 called three findings. Each now has a failing test and a fix. Same-day p
 ## What did not regress
 
 Write throughput stays higher. Commit p50 stays inside noise. Election p99 matches the baseline cap of about one timeout. Bytes per pipelined write stay lower.
+
+Phase 14 added one volatile floor check on `ReadIndexSatisfied()`. Two quiet runs of 500 lease reads, with the other loops shortened, were 0.130 us and 0.151 us. Both sit under the published `9ae58dd` lease p50 of 0.165 us. The table above is unchanged.
