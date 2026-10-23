@@ -90,6 +90,8 @@ jobs:
         run: dotnet tool restore
       - name: Stryker
         run: dotnet stryker --config-file ${{ matrix.config }}
+      - name: Undetected mutant gate
+        run: python3 scripts/check-mutation-baseline.py mutation-baseline.json ${{ matrix.name }} StrykerOutput
 
   web:
     runs-on: ubuntu-latest

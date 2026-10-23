@@ -1,0 +1,7 @@
+{
+  "jobs": {
+    "raft": { "survived": 235, "noCoverage": 116 },
+    "kv": { "survived": 101, "noCoverage": 91 }
+  },
+  "overall": { "survived": 336, "noCoverage": 207 }
+}

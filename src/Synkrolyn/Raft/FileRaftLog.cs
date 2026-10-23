@@ -590,6 +590,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             channel.Write(bytes);
             _afterForceWrite?.Invoke(channel);
             DataSync(channel);
+            FilePersistentState.SyncDirectoryPath(_dir);
         }
         catch
         {

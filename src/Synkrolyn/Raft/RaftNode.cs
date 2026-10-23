@@ -1704,17 +1704,25 @@ public sealed class RaftNode
 
         AppendEntriesIfPresent(append.Entries);
         long storedThrough = append.PrevLogIndex + append.Entries.Count;
-        _lastAcceptedLeaderCommit = append.LeaderCommit;
-        _commitIndex = Math.Max(_commitIndex, Math.Min(append.LeaderCommit, storedThrough));
+        long leaderCommit = append.LeaderCommit;
+        long durableCommit = Math.Max(_commitIndex, Math.Min(leaderCommit, storedThrough));
         long term = CurrentTermLocked();
         long stamp = append.Stamp;
         string leader = from;
         if (_logNeedsForce)
         {
-            _afterForce.Add(() => _transport.Send(_nodeId, leader, new AppendEntriesResponse(term, true, storedThrough, stamp)));
+            // The ack and the commit both wait until the directory fsync in Force succeeds.
+            _afterForce.Add(() =>
+            {
+                _lastAcceptedLeaderCommit = leaderCommit;
+                _commitIndex = Math.Max(_commitIndex, durableCommit);
+                _transport.Send(_nodeId, leader, new AppendEntriesResponse(term, true, storedThrough, stamp));
+            });
         }
         else
         {
+            _lastAcceptedLeaderCommit = leaderCommit;
+            _commitIndex = durableCommit;
             ApplyCommitted();
             _transport.Send(_nodeId, from, new AppendEntriesResponse(CurrentTermLocked(), true, storedThrough, stamp));
         }
