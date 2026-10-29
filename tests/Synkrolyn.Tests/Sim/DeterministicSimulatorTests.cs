@@ -132,6 +132,51 @@ public sealed class DeterministicSimulatorTests
     }
 
     [Fact]
+    public void ClockJumpAndPause_refusesStaleLease_andIsLinearizable()
+    {
+        for (int seed = 1; seed <= 5; seed++)
+        {
+            SimResult result = DeterministicSimulator.RunClockAndPause(seed);
+            Assert.True(result.StaleLeaseRefused, "seed " + seed);
+            Assert.True(result.LeaderElected, "seed " + seed);
+            LinVerdict verdict = LinearizabilityChecker.CheckHistory(result.History);
+            Assert.True(
+                verdict == LinVerdict.Linearizable,
+                verdict + " " + LinearizabilityChecker.Conflict(result.History) + " seed " + seed);
+        }
+    }
+
+    [Fact]
+    public void FullClusterCrash_keepsCommittedPrefix_andIsLinearizable()
+    {
+        for (int seed = 1; seed <= 5; seed++)
+        {
+            SimResult result = DeterministicSimulator.RunFullClusterCrash(seed);
+            Assert.True(result.CommittedPrefixKept, "seed " + seed);
+            Assert.True(result.LeaderElected, "seed " + seed);
+            LinVerdict verdict = LinearizabilityChecker.CheckHistory(result.History);
+            Assert.True(
+                verdict == LinVerdict.Linearizable,
+                verdict + " " + LinearizabilityChecker.Conflict(result.History) + " seed " + seed);
+        }
+    }
+
+    [Fact]
+    public void Seed1557_retryOfAnOpenPut_staysOneWrite()
+    {
+        SimResult result = DeterministicSimulator.Run(1557, steps: 2000);
+        Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.CheckHistory(result.History));
+    }
+
+    [Fact]
+    public void Seed436_doesNotAckAnIndexTruncatedBeforeFlush()
+    {
+        SimResult result = DeterministicSimulator.Run(436, steps: 2000);
+        Assert.True(result.LeaderElected);
+        Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.CheckHistory(result.History));
+    }
+
+    [Fact]
     public void SimSeed_replaysEnvironmentSeed()
     {
         string? raw = Environment.GetEnvironmentVariable("SIM_SEED");
