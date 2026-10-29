@@ -142,6 +142,8 @@ public static class DeterministicSimulator
         private readonly List<string?> _healedLeaders = [];
         private readonly Dictionary<int, Pending> _pending = [];
         private readonly Dictionary<int, (string Key, string Value)> _openPut = [];
+
+        private readonly Dictionary<int, (long Session, long Serial, string Key)> _proposal = [];
         private readonly Dictionary<string, string> _ackedValues = [];
         private readonly Dictionary<(string Voter, long Term), string> _grants = [];
         private bool _writeCommitted;
@@ -807,7 +809,6 @@ public static class DeterministicSimulator
                 return;
             }
 
-            Record(client.Id, "put", "invoke", key, value);
             string? outcome = Outcome(client, key, value);
             TrackOpen(client.Id, key, value, outcome);
             if (outcome is null)
@@ -825,20 +826,32 @@ public static class DeterministicSimulator
         {
             if (!Bind(client))
             {
-                string missed = _openPut.ContainsKey(client.Id) ? "null" : "no-leader";
-                Record(client.Id, "put", "invoke", key, value);
-                Record(client.Id, "put", "complete", key, missed);
+                bool retry = _openPut.ContainsKey(client.Id);
+                string missed = retry ? "null" : "no-leader";
+                if (!retry)
+                {
+                    Record(client.Id, "put", "invoke", key, value);
+                    Record(client.Id, "put", "complete", key, missed);
+                }
+
                 TrackOpen(client.Id, key, value, missed);
                 Note(step + " put " + missed);
                 return;
             }
 
             EnsureSession(client);
-            Record(client.Id, "put", "invoke", key, value);
+            BeginProposal(client.Id, key, value);
+            SimNode? bound = LiveLeader();
+            long before = bound?.Log.LastIndex ?? 0;
             try
             {
                 client.Kv.Put(key, value);
                 Drain();
+                if (bound is not null)
+                {
+                    NoteProposal(client, key, value, bound, before);
+                }
+
                 long? done = client.Kv.AwaitCommitted();
                 string text = done is null ? "null" : done.Value.ToString(CultureInfo.InvariantCulture);
                 TrackOpen(client.Id, key, value, text);
@@ -846,18 +859,110 @@ public static class DeterministicSimulator
                 {
                     _ackedValues[key] = value;
                     _writeCommitted = true;
+                    FinishProposal(client.Id, key, text);
                 }
 
-                Record(client.Id, "put", "complete", key, text);
                 Note(step + " put " + client.Id + " " + key + " " + text);
             }
             catch (SimCrash)
             {
+                if (bound is not null)
+                {
+                    NoteProposal(client, key, value, bound, before);
+                }
+
                 TrackOpen(client.Id, key, value, "null");
-                Record(client.Id, "put", "complete", key, "null");
                 Note(step + " put crash " + client.Id + " " + key);
                 throw;
             }
+        }
+
+        private void NoteProposal(SimClient client, string key, string value, SimNode leader, long before)
+        {
+            long after = leader.Log.LastIndex;
+            if (after <= before)
+            {
+                return;
+            }
+
+            for (long index = after; index > before; index--)
+            {
+                LogEntry entry;
+                try
+                {
+                    entry = leader.Log.Read(index);
+                }
+                catch (KeyNotFoundException)
+                {
+                    continue;
+                }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
+
+                KvCommandCodec.Command decoded;
+                try
+                {
+                    decoded = KvCommandCodec.Decode(entry.Command);
+                }
+                catch (ArgumentException)
+                {
+                    continue;
+                }
+
+                if (decoded.Operation != KvCommandCodec.Op.Put || decoded.Key != key || decoded.Value != value)
+                {
+                    continue;
+                }
+
+                bool known = _proposal.TryGetValue(client.Id, out (long Session, long Serial, string Key) prior);
+                if (known && prior.Session < 0)
+                {
+                    _proposal[client.Id] = (decoded.SessionId, decoded.Serial, key);
+                    return;
+                }
+
+                bool duplicate = known
+                    && decoded.SessionId != 0
+                    && prior.Session == decoded.SessionId
+                    && prior.Serial == decoded.Serial;
+                if (duplicate)
+                {
+                    return;
+                }
+
+                if (known)
+                {
+                    Record(client.Id, "put", "complete", prior.Key, "null");
+                }
+
+                Record(client.Id, "put", "invoke", key, value);
+                _proposal[client.Id] = (decoded.SessionId, decoded.Serial, key);
+                return;
+            }
+        }
+
+        private void BeginProposal(int client, string key, string value)
+        {
+            if (_proposal.TryGetValue(client, out _))
+            {
+                return;
+            }
+
+            Record(client, "put", "invoke", key, value);
+            _proposal[client] = (-1, 0, key);
+        }
+
+        private void FinishProposal(int client, string key, string outcome)
+        {
+            if (!_proposal.ContainsKey(client))
+            {
+                return;
+            }
+
+            _proposal.Remove(client);
+            Record(client, "put", "complete", key, outcome);
         }
 
         private void SettlePending(int step)
@@ -872,7 +977,6 @@ public static class DeterministicSimulator
                     {
                         _pendingSettled = false;
                         TrackOpen(id, op.Key, op.Value, "unsettled");
-                        Record(id, "put", "complete", op.Key, "unsettled");
                         finished.Add(id);
                         Note(step + " unsettled " + id);
                     }
@@ -905,7 +1009,7 @@ public static class DeterministicSimulator
 
         private void CompletePut(int client, string key, string outcome)
         {
-            Record(client, "put", "complete", key, outcome);
+            FinishProposal(client, key, outcome);
             if (long.TryParse(outcome, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
             {
                 _writeCommitted = true;
@@ -925,6 +1029,9 @@ public static class DeterministicSimulator
             }
 
             EnsureSession(client);
+            BeginProposal(client.Id, key, value);
+            SimNode? bound = LiveLeader();
+            long before = bound?.Log.LastIndex ?? 0;
             long? done = client.Kv.AwaitCommitted();
             if (done is null)
             {
@@ -932,6 +1039,11 @@ public static class DeterministicSimulator
             }
 
             Drain();
+            if (bound is not null)
+            {
+                NoteProposal(client, key, value, bound, before);
+            }
+
             done ??= client.Kv.AwaitCommitted();
             if (done is not null)
             {
@@ -1617,6 +1729,14 @@ public static class DeterministicSimulator
 
                 foreach ((long index, (long Term, int Hash) entry) in _committed)
                 {
+                    // A leader must hold entries committed in its own term or earlier.
+                    // A commit from a higher term belongs to a later leader. This node
+                    // can still show Role.Leader until it observes that term.
+                    if (entry.Term > node.Raft.CurrentTerm)
+                    {
+                        continue;
+                    }
+
                     if (!Covers(node, index, entry.Term, entry.Hash))
                     {
                         Fail("leader completeness " + node.Id + " term " + node.Raft.CurrentTerm + " missing " + index);

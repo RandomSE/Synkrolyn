@@ -21,8 +21,9 @@ internal readonly record struct LinOp(long Invoke, long Response, string Key, bo
 
 /// <summary>
 /// Wing-Gong search per key. Fail calls and indeterminate gets are no-ops and are dropped.
-/// A timed-out put may still commit after its response, so a lone unknown put stays pending
-/// until a later read observes it. A cache or cluster cap returns <see cref="LinVerdict.Unknown"/>,
+/// A timed-out put may still commit after its response, so an unknown put stays pending
+/// until a later read observes it, including when an absent read overlaps the timeout.
+/// A cache or cluster cap returns <see cref="LinVerdict.Unknown"/>,
 /// which tests treat as a failure.
 /// </summary>
 internal static class LinearizabilityChecker
@@ -263,32 +264,48 @@ internal static class LinearizabilityChecker
             }
 
             bool more = end < steps.Length;
-            var next = new List<World>();
-            bool stopped = false;
-            Step step = steps[index];
-            if (UnknownPuts(steps, index, length))
+            var kept = new List<Step>(length);
+            var baseWorlds = new List<World>(worlds.Count);
+            foreach (World world in worlds)
             {
-                foreach (World world in worlds)
+                baseWorlds.Add(new World(world.State, world.Pending));
+            }
+
+            for (int i = index; i < end; i++)
+            {
+                Step candidate = steps[i];
+                if (candidate.Put && candidate.Effect == LinEffect.Unknown)
                 {
-                    Dictionary<int, int> pending = world.Pending;
-                    for (int i = index; i < end; i++)
+                    for (int w = 0; w < baseWorlds.Count; w++)
                     {
-                        pending = Add(pending, steps[i].Value);
+                        World world = baseWorlds[w];
+                        baseWorlds[w] = new World(world.State, Add(world.Pending, candidate.Value));
                     }
 
-                    next.Add(new World(world.State, pending));
+                    continue;
                 }
+
+                kept.Add(candidate);
             }
-            else if (length == 1 && step.Put)
+
+            var next = new List<World>();
+            bool stopped = false;
+            if (kept.Count == 0)
             {
-                foreach (World world in worlds)
+                next.AddRange(baseWorlds);
+            }
+            else if (kept.Count == 1 && kept[0].Put)
+            {
+                Step step = kept[0];
+                foreach (World world in baseWorlds)
                 {
                     next.Add(new World(step.Value, world.Pending));
                 }
             }
-            else if (length == 1)
+            else if (kept.Count == 1)
             {
-                foreach (World world in worlds)
+                Step step = kept[0];
+                foreach (World world in baseWorlds)
                 {
                     if (world.State == step.Value)
                     {
@@ -302,9 +319,10 @@ internal static class LinearizabilityChecker
             }
             else
             {
-                foreach (World world in worlds)
+                Step[] cluster = kept.ToArray();
+                foreach (World world in baseWorlds)
                 {
-                    Absorb(world, steps.AsSpan(index, length), cacheBudget, more, next, ref stopped);
+                    Absorb(world, cluster, cacheBudget, more, next, ref stopped);
                 }
             }
 
@@ -328,19 +346,6 @@ internal static class LinearizabilityChecker
         }
 
         return LinVerdict.Linearizable;
-    }
-
-    private static bool UnknownPuts(Step[] steps, int index, int length)
-    {
-        for (int i = index; i < index + length; i++)
-        {
-            if (!steps[i].Put || steps[i].Effect != LinEffect.Unknown)
-            {
-                return false;
-            }
-        }
-
-        return length > 0;
     }
 
     private const int MaxWorlds = 64;

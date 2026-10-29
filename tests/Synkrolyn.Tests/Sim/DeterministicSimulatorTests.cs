@@ -162,6 +162,21 @@ public sealed class DeterministicSimulatorTests
     }
 
     [Fact]
+    public void Seed1557_retryOfAnOpenPut_staysOneWrite()
+    {
+        SimResult result = DeterministicSimulator.Run(1557, steps: 2000);
+        Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.CheckHistory(result.History));
+    }
+
+    [Fact]
+    public void Seed436_doesNotAckAnIndexTruncatedBeforeFlush()
+    {
+        SimResult result = DeterministicSimulator.Run(436, steps: 2000);
+        Assert.True(result.LeaderElected);
+        Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.CheckHistory(result.History));
+    }
+
+    [Fact]
     public void SimSeed_replaysEnvironmentSeed()
     {
         string? raw = Environment.GetEnvironmentVariable("SIM_SEED");

@@ -1712,8 +1712,15 @@ public sealed class RaftNode
         if (_logNeedsForce)
         {
             // The ack and the commit both wait until the directory fsync in Force succeeds.
+            // A later RPC in this drain can truncate the suffix before that fsync.
+            // Success is only true if those entries are still the stored suffix.
             _afterForce.Add(() =>
             {
+                if (!SuffixStillStored(append))
+                {
+                    return;
+                }
+
                 _lastAcceptedLeaderCommit = leaderCommit;
                 _commitIndex = Math.Max(_commitIndex, durableCommit);
                 _transport.Send(_nodeId, leader, new AppendEntriesResponse(term, true, storedThrough, stamp));
@@ -1726,6 +1733,29 @@ public sealed class RaftNode
             ApplyCommitted();
             _transport.Send(_nodeId, from, new AppendEntriesResponse(CurrentTermLocked(), true, storedThrough, stamp));
         }
+    }
+
+    private bool SuffixStillStored(AppendEntries append)
+    {
+        if (!PrevLogMatches(append.PrevLogIndex, append.PrevLogTerm))
+        {
+            return false;
+        }
+
+        foreach (LogEntry entry in append.Entries)
+        {
+            if (entry.Index <= _log.LastIncludedIndex)
+            {
+                continue;
+            }
+
+            if (entry.Index > _log.LastIndex || _log.Read(entry.Index).Term != entry.Term)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void ObserveTransfer(string leaderId)
