@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: dotnet build Synkrolyn.slnx --configuration Release
       - name: Test
-        run: dotnet test Synkrolyn.slnx --configuration Release --no-build
+        run: dotnet test Synkrolyn.slnx --configuration Release --no-build --filter "Category!=ProcessCluster"
       - name: TLC if installed
         if: runner.os == 'Linux'
         run: |
@@ -28,6 +28,17 @@ jobs:
           else
             echo "tlc not on PATH; skipping TLA+ model check"
           fi
+
+  process-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Real process cluster
+        run: dotnet test tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj --configuration Release --filter Category=ProcessCluster
 
   tlc:
     runs-on: ubuntu-latest

@@ -37,6 +37,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
     private int _dataSyncCount;
     private ArmedCapture? _armed;
     private readonly Action<FileStream>? _afterForceWrite;
+    private int _failNextForce;
 
     /// <summary>Opens or creates the log under <paramref name="directory"/>.</summary>
     public FileRaftLog(string directory)
@@ -134,6 +135,20 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         lock (this)
         {
             ForceUnlocked();
+        }
+    }
+
+    /// <summary>
+    /// The next <see cref="Force"/> that has pending bytes throws <see cref="IOException"/>
+    /// before those bytes are written. <paramref name="diskFull"/> selects the disk-full
+    /// message. This is a storage-interface stand-in, not a kernel ENOSPC.
+    /// </summary>
+    public void FailNextForce(bool diskFull)
+    {
+        lock (this)
+        {
+            EnsureOpen();
+            _failNextForce = diskFull ? 2 : 1;
         }
     }
 
@@ -579,6 +594,13 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         if (_pendingEntries.Count == 0)
         {
             return;
+        }
+
+        if (_failNextForce != 0)
+        {
+            int kind = _failNextForce;
+            _failNextForce = 0;
+            throw new IOException(kind == 2 ? "disk full (storage interface)" : "injected io failure");
         }
 
         FileStream channel = Channel;

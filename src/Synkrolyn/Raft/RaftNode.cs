@@ -238,6 +238,23 @@ public sealed class RaftNode
         get { lock (_eventLock) { return _leaderId; } }
     }
 
+    /// <summary>Milliseconds since the last leader RPC, or -1 when none has arrived.</summary>
+    public long MillisSinceLeaderContact
+    {
+        get
+        {
+            lock (_eventLock)
+            {
+                if (_lastLeaderContactMillis == long.MinValue)
+                {
+                    return -1;
+                }
+
+                return _clock.Millis - _lastLeaderContactMillis;
+            }
+        }
+    }
+
     /// <summary>Commit index.</summary>
     public long CommitIndex
     {
