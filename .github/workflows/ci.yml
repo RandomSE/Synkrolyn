@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: dotnet build Synkrolyn.slnx --configuration Release
       - name: Test
-        run: dotnet test Synkrolyn.slnx --configuration Release --no-build --filter "Category!=ProcessCluster"
+        run: dotnet test Synkrolyn.slnx --configuration Release --no-build --filter "Category!=ProcessCluster&Category!=ProcessSoak"
       - name: TLC if installed
         if: runner.os == 'Linux'
         run: |

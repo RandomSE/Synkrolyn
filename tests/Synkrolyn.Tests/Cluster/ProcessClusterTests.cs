@@ -196,7 +196,9 @@ internal sealed class ProcessCluster : IDisposable
     ];
 
     private readonly string _root;
-    private readonly ProcessNode[] _nodes;
+    private readonly List<ProcessNode> _nodes;
+
+    public IReadOnlyList<ProcessNode> Nodes => _nodes;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly ConcurrentDictionary<long, string> _termLeader = new();
     private readonly List<string> _leaderClashes = [];
@@ -204,7 +206,7 @@ internal sealed class ProcessCluster : IDisposable
     private readonly ManualResetEventSlim _park = new(false);
     private bool _disposed;
 
-    private ProcessCluster(string root, ProcessNode[] nodes)
+    private ProcessCluster(string root, List<ProcessNode> nodes)
     {
         _root = root;
         _nodes = nodes;
@@ -214,13 +216,13 @@ internal sealed class ProcessCluster : IDisposable
     {
         string root = Path.Combine(Path.GetTempPath(), "synkrolyn-proc-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
-        var nodes = new ProcessNode[3];
+        var nodes = new List<ProcessNode>();
         try
         {
-            for (int i = 0; i < nodes.Length; i++)
+            for (int i = 0; i < Elections.Length; i++)
             {
                 string id = "n" + (i + 1);
-                nodes[i] = ProcessNode.Start(root, id, Elections[i]);
+                nodes.Add(ProcessNode.Start(root, id, Elections[i]));
             }
 
             var cluster = new ProcessCluster(root, nodes);
@@ -274,6 +276,24 @@ internal sealed class ProcessCluster : IDisposable
             },
             TimeSpan.FromSeconds(8));
         return found ?? throw new InvalidOperationException(Dump());
+    }
+
+    public ProcessNode AddNode(string id, TimeSpan election, string[] peers)
+    {
+        var node = ProcessNode.Start(_root, id, election, peers);
+        _nodes.Add(node);
+        try
+        {
+            ExchangePeers();
+        }
+        catch
+        {
+            _nodes.Remove(node);
+            node.Dispose();
+            throw;
+        }
+
+        return node;
     }
 
     public ProcessNode Follower()
@@ -650,6 +670,7 @@ internal sealed class ProcessNode : IDisposable
 {
     private readonly string _root;
     private readonly TimeSpan _election;
+    private readonly string[] _peers;
     private Process? _process;
     private readonly StringBuilder _output = new();
     private readonly StringBuilder _error = new();
@@ -657,12 +678,13 @@ internal sealed class ProcessNode : IDisposable
     private readonly ManualResetEventSlim _ready = new(false);
     private readonly ManualResetEventSlim _park = new(false);
 
-    private ProcessNode(string root, string id, TimeSpan election, string dataDirectory)
+    private ProcessNode(string root, string id, TimeSpan election, string dataDirectory, string[] peers)
     {
         _root = root;
         Id = id;
         _election = election;
         DataDirectory = dataDirectory;
+        _peers = peers;
     }
 
     public string Id { get; }
@@ -674,6 +696,8 @@ internal sealed class ProcessNode : IDisposable
     public int ControlPort { get; private set; }
 
     public bool IsRunning => _process is { HasExited: false };
+
+    public int Pid => _process?.Id ?? -1;
 
     public string Output
     {
@@ -697,11 +721,12 @@ internal sealed class ProcessNode : IDisposable
         }
     }
 
-    public static ProcessNode Start(string root, string id, TimeSpan election)
+    public static ProcessNode Start(string root, string id, TimeSpan election, string[]? peers = null)
     {
         string data = Path.Combine(root, id);
         Directory.CreateDirectory(data);
-        var node = new ProcessNode(root, id, election, data);
+        string[] chosen = peers ?? ["n1", "n2", "n3"];
+        var node = new ProcessNode(root, id, election, data, chosen.Where(peer => peer != id).ToArray());
         node.Launch();
         return node;
     }
@@ -813,20 +838,7 @@ internal sealed class ProcessNode : IDisposable
         }
     }
 
-    private string Peers()
-    {
-        var ids = new List<string>();
-        for (int i = 1; i <= 3; i++)
-        {
-            string id = "n" + i;
-            if (id != Id)
-            {
-                ids.Add(id);
-            }
-        }
-
-        return string.Join(',', ids);
-    }
+    private string Peers() => string.Join(',', _peers);
 
     private void OnLine(StringBuilder sink, string? line, bool readyLine)
     {

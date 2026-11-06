@@ -8,7 +8,7 @@
     "concurrency": 4,
     "additional-timeout": 20000,
     "timeout-ratio": 3,
-    "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket&FullyQualifiedName!~ProcessCluster",
+    "test-case-filter": "FullyQualifiedName!~PushSeeds&FullyQualifiedName!~StaleLocalRead&FullyQualifiedName!~Socket&FullyQualifiedName!~ProcessCluster&FullyQualifiedName!~ProcessSoak",
     "reporters": ["cleartext", "json"],
     "mutate": [
       "**/Raft/RaftNode.cs"

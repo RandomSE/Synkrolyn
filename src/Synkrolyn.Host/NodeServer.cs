@@ -173,6 +173,14 @@ internal static class NodeServer
                 return parts.Length == 2 ? Reconnect(transport, parts[1]) : "ERR reconnect";
             case "FAULT":
                 return Fault(log, parts);
+            case "SNAPSHOT":
+                return Snapshot(node);
+            case "ADDLEARNER":
+                return parts.Length == 2 ? Membership(node.AddLearner(parts[1])) : "ERR learner";
+            case "PROMOTE":
+                return parts.Length == 2 ? Membership(node.PromoteVoter(parts[1])) : "ERR promote";
+            case "REMOVE":
+                return parts.Length == 2 ? Membership(node.RemoveServer(parts[1])) : "ERR remove";
             case "STOP":
                 return "OK";
             default:
@@ -192,7 +200,9 @@ internal static class NodeServer
             + " quorumLease=" + Bit(node.QuorumLeaseValid)
             + " followerLease=" + Bit(node.FollowerReadLeaseValid)
             + " fatal=" + Bit(node.Fatal)
-            + " uncaught=" + uncaught;
+            + " uncaught=" + uncaught
+            + " voters=" + Ids(node.VoterPeerIds)
+            + " learners=" + Ids(node.LearnerPeerIds);
     }
 
     private static string Put(KvClient kv, RaftNode node, string key, string value)
@@ -332,6 +342,33 @@ internal static class NodeServer
         }
 
         return "ERR fault";
+    }
+
+    private static string Membership(long? index) =>
+        index is null ? "MEM null" : "MEM ok " + index.Value.ToString(CultureInfo.InvariantCulture);
+
+    private static string Snapshot(RaftNode node)
+    {
+        try
+        {
+            node.Snapshot();
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            return "ERR snapshot";
+        }
+
+        return "OK";
+    }
+
+    private static string Ids(IReadOnlyCollection<string> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return "-";
+        }
+
+        return string.Join(',', ids.OrderBy(id => id, StringComparer.Ordinal));
     }
 
     private static string Shown(string? value) => value ?? "null";
