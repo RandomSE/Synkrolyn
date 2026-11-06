@@ -44,6 +44,15 @@ public sealed class SimResult
     public required bool ReplicasEqual { get; init; }
 
     public required IReadOnlyList<ClientHistoryEntry> History { get; init; }
+
+    /// <summary>True after a scripted full-voter crash kept every committed index.</summary>
+    public bool CommittedPrefixKept { get; init; }
+
+    /// <summary>
+    /// True when a paused or clock-stepped former leader refused a lease read
+    /// after another node had become leader.
+    /// </summary>
+    public bool StaleLeaseRefused { get; init; }
 }
 
 /// <summary>
@@ -72,6 +81,31 @@ public static class DeterministicSimulator
     }
 
     public static SimResult Run(int seed, int steps) => Run(seed, steps, staleReads: false);
+
+    /// <summary>
+    /// Quiet commit, then every voter crashes with an unflushed suffix and restarts
+    /// from its durable log. The history is the caller's linearizability input.
+    /// </summary>
+    public static SimResult RunFullClusterCrash(int seed)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seed);
+        var world = new World(seed, steps: 40, staleReads: false);
+        world.ExecuteFullCrash();
+        return world.Result();
+    }
+
+    /// <summary>
+    /// Commits a value, pauses the leader past the election timeout, then steps
+    /// that node's clock backward while a new leader exists. The history is the
+    /// caller's linearizability input.
+    /// </summary>
+    public static SimResult RunClockAndPause(int seed)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seed);
+        var world = new World(seed, steps: 60, staleReads: false);
+        world.ExecuteClockAndPause(500 + (seed * 50), 1_000L * seed);
+        return world.Result();
+    }
 
     /// <summary>
     /// <paramref name="staleReads"/> serves gets from a live node's local map.
@@ -108,8 +142,13 @@ public static class DeterministicSimulator
         private readonly List<string?> _healedLeaders = [];
         private readonly Dictionary<int, Pending> _pending = [];
         private readonly Dictionary<int, (string Key, string Value)> _openPut = [];
+
+        private readonly Dictionary<int, (long Session, long Serial, string Key)> _proposal = [];
+        private readonly Dictionary<string, string> _ackedValues = [];
         private readonly Dictionary<(string Voter, long Term), string> _grants = [];
         private bool _writeCommitted;
+        private bool _committedPrefixKept;
+        private bool _staleLeaseRefused;
         private bool _healed;
         private bool _pendingSettled = true;
         private string? _safetyFailure;
@@ -210,7 +249,303 @@ public static class DeterministicSimulator
                 PendingSettled = _pendingSettled,
                 ReplicasEqual = equal,
                 History = _history,
+                CommittedPrefixKept = _committedPrefixKept,
+                StaleLeaseRefused = _staleLeaseRefused,
             };
+        }
+
+        public void ExecuteClockAndPause(int pauseMs, long backwardMs)
+        {
+            _net.CrashSends = false;
+            Note("clock-pause " + pauseMs.ToString(CultureInfo.InvariantCulture));
+            Drain();
+            for (int step = 0; step < 40 && !_writeCommitted; step++)
+            {
+                Advance(20);
+                Drain();
+                PutOnce(_clients[0], step, "k0", "before-pause");
+                Drain();
+                Check(step);
+            }
+
+            if (!_writeCommitted)
+            {
+                Fail("nothing committed before the clock faults");
+            }
+
+            for (int i = 0; i < 30 && LeaderWithLease() is null; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (LeaderWithLease() is not SimNode leader)
+            {
+                Fail("no lease before the pause");
+                return;
+            }
+
+            Freeze(leader);
+            int slices = Math.Max(1, pauseMs / 20);
+            for (int i = 0; i < slices; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (OtherLeader(leader) is not SimNode elected)
+            {
+                Fail("no leader while " + leader.Id + " was paused");
+                return;
+            }
+
+            leader.Clock.Jump(pauseMs);
+            if (ServesLease(leader))
+            {
+                Fail("paused leader " + leader.Id + " served a lease read after " + elected.Id);
+            }
+
+            Thaw(leader);
+            _net.DropQueued();
+            _net.ClearFaults();
+            for (int i = 0; i < 40 && LeaderWithLease() is null; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (LeaderWithLease() is not SimNode stepped)
+            {
+                Fail("no lease before the backward step");
+                return;
+            }
+
+            Freeze(stepped);
+            Isolate(stepped);
+            _net.DropQueued();
+            for (int i = 0; i < slices; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            if (OtherLeader(stepped) is not SimNode after)
+            {
+                Fail("no leader after stepping " + stepped.Id);
+                return;
+            }
+
+            stepped.Clock.Jump(-backwardMs);
+            if (ServesLease(stepped))
+            {
+                Fail("stepped leader " + stepped.Id + " served a lease read after " + after.Id);
+            }
+
+            _staleLeaseRefused = true;
+            Thaw(stepped);
+            _net.ClearFaults();
+            _net.DropQueued();
+            for (int i = 0; i < 20; i++)
+            {
+                Advance(20);
+                Drain();
+            }
+
+            for (int step = 0; step < 16; step++)
+            {
+                if (_rng.Next(2) == 0)
+                {
+                    SimNode node = _nodes[_rng.Next(3)];
+                    if (node.Live && !node.Frozen)
+                    {
+                        long delta = _rng.Next(2) == 0 ? 40 + _rng.Next(200) : -(40 + _rng.Next(200));
+                        node.Clock.Jump(delta);
+                        Note(step + " jump " + node.Id + " " + delta.ToString(CultureInfo.InvariantCulture));
+                        if (delta < 0 && OtherLeader(node) is SimNode other && ServesLease(node))
+                        {
+                            Fail("stepped leader " + node.Id + " served a lease read after " + other.Id);
+                        }
+                    }
+                }
+                else if (step % 2 == 0)
+                {
+                    ClientPut(step);
+                }
+                else
+                {
+                    ClientGet(step);
+                }
+
+                Drain();
+                Check(step);
+            }
+        }
+
+        public void ExecuteFullCrash()
+        {
+            _net.CrashSends = false;
+            Note("full-crash");
+            Drain();
+            for (int step = 0; step < 40 && !_writeCommitted; step++)
+            {
+                Advance(20);
+                Drain();
+                ClientPut(step);
+                Drain();
+                Check(step);
+            }
+
+            if (!_writeCommitted || _committed.Count == 0)
+            {
+                Fail("nothing committed before the full crash");
+            }
+
+            var kept = new Dictionary<long, (long Term, int Hash)>(_committed);
+            CrashAllVoters();
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == "n4")
+                {
+                    continue;
+                }
+
+                Boot(node);
+            }
+
+            _net.ClearFaults();
+            _healed = true;
+            for (int step = 0; step < 400 && LiveLeader() is null; step++)
+            {
+                Advance(20);
+                Drain();
+                if (step % 20 == 0)
+                {
+                    Check(step);
+                }
+            }
+
+            if (LiveLeader() is null)
+            {
+                var detail = new StringBuilder();
+                foreach (SimNode node in _nodes)
+                {
+                    if (node.Frozen || node.Raft is null)
+                    {
+                        continue;
+                    }
+
+                    detail.Append(node.Id);
+                    detail.Append(" term ");
+                    detail.Append(node.Raft.CurrentTerm);
+                    detail.Append(" deadline ");
+                    detail.Append(node.Raft.NextDeadlineMillis());
+                    detail.Append(" clock ");
+                    detail.Append(node.Clock.Millis);
+                    detail.Append(" prevote ");
+                    detail.Append(node.Raft.LastPreVoteGranted);
+                    detail.Append("; ");
+                }
+
+                Fail("no leader after full restart " + detail);
+            }
+
+            foreach ((long index, (long Term, int Hash) entry) in kept)
+            {
+                int copies = 0;
+                foreach (SimNode node in _nodes)
+                {
+                    if (node.Id != "n4" && Covers(node, index, entry.Term, entry.Hash))
+                    {
+                        copies++;
+                    }
+                }
+
+                if (copies < 2)
+                {
+                    Fail("lost committed index " + index.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+
+            ReadBackCommittedPuts();
+            _committedPrefixKept = true;
+        }
+
+        private void CrashAllVoters()
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == "n4" || node.Raft is null || !node.Raft.IsVoter)
+                {
+                    continue;
+                }
+
+                node.Raft.StopAfterRaftThreadFault();
+                node.Clock.Clear();
+                long term = node.State.CurrentTerm;
+                long next = node.Log.LastIndex + 1;
+                long flushed = node.Log.FlushedThrough;
+                node.Log.Append(new LogEntry(next, term, KvCommandCodec.EncodePut("torn", "x")));
+                node.Log.Append(new LogEntry(next + 1, term, KvCommandCodec.EncodePut("torn", "y")));
+                long extended = node.Log.LastIndex;
+                node.Log.LoseUnflushed(_rng.Next(2));
+                if (node.Log.LastIndex >= extended || node.Log.LastIndex < flushed)
+                {
+                    Fail("crash did not trim the unflushed suffix on " + node.Id);
+                }
+
+                node.State.LoseUnflushed();
+                node.Store = new InMemoryKvStore();
+                node.Crashed = true;
+                node.PendingCrash = false;
+                node.Raft = null;
+                _net.Bind(node.Id, null);
+                Note("crash-all " + node.Id);
+            }
+
+            _net.DropQueued();
+        }
+
+        private void ReadBackCommittedPuts()
+        {
+            SimNode? leader = LiveLeader();
+            if (leader?.Raft is null)
+            {
+                Fail("no leader for the read-back");
+                return;
+            }
+
+            var reader = new SimClient(7, new KvClient(leader.Raft, leader.Store));
+            for (int step = 0; step < 8 && reader.Kv.ClientId == 0; step++)
+            {
+                AdvanceSettled();
+                Drain();
+                Bind(reader);
+                EnsureSession(reader);
+            }
+
+            if (reader.Kv.ClientId == 0)
+            {
+                Fail("session did not register after full restart");
+            }
+
+            foreach ((string key, string value) in _ackedValues)
+            {
+                string result = "unknown";
+                for (int step = 0; step < 8 && result != value; step++)
+                {
+                    AdvanceSettled();
+                    Drain();
+                    Bind(reader);
+                    Record(reader.Id, "get", "invoke", key, "");
+                    result = LinearizableRead(reader, key);
+                    Record(reader.Id, "get", "complete", key, result);
+                }
+
+                if (result != value)
+                {
+                    Fail("lost committed value " + key + " saw " + result);
+                }
+            }
         }
 
         private static SimNode Make(string id, string[] peers, int electionMs, int rate) =>
@@ -285,8 +620,90 @@ public static class DeterministicSimulator
             _net.DeliverDue();
             foreach (SimNode node in _nodes)
             {
+                if (node.Frozen)
+                {
+                    continue;
+                }
+
                 node.Clock.AdvanceScaled(delta, node.RatePercent);
             }
+        }
+
+        private void Freeze(SimNode node)
+        {
+            node.Frozen = true;
+            _net.SetFrozen(node.Id, true);
+            _net.DropQueued();
+            Note("freeze " + node.Id);
+        }
+
+        private void Thaw(SimNode node)
+        {
+            node.Frozen = false;
+            _net.SetFrozen(node.Id, false);
+            Note("thaw " + node.Id);
+        }
+
+        private void Isolate(SimNode node)
+        {
+            foreach (SimNode other in _nodes)
+            {
+                if (other.Id != node.Id)
+                {
+                    _net.TogglePartition(node.Id, other.Id);
+                }
+            }
+
+            Note("isolate " + node.Id);
+        }
+
+        private SimNode? LeaderWithLease()
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (!node.Live || node.Frozen)
+                {
+                    continue;
+                }
+
+                RaftNode raft = node.Raft!;
+                if (raft.Role == Role.Leader && (raft.ReadIndexSatisfied() || raft.QuorumLeaseValid))
+                {
+                    return node;
+                }
+            }
+
+            return null;
+        }
+
+        private SimNode? OtherLeader(SimNode except)
+        {
+            foreach (SimNode node in _nodes)
+            {
+                if (node.Id == except.Id || !node.Live || node.Frozen)
+                {
+                    continue;
+                }
+
+                if (node.Raft!.Role == Role.Leader)
+                {
+                    return node;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool ServesLease(SimNode node)
+        {
+            RaftNode raft = node.Raft!;
+            if (raft.ReadIndexSatisfied() || raft.QuorumLeaseValid || raft.FollowerReadLeaseValid)
+            {
+                return true;
+            }
+
+            var client = new KvClient(raft, node.Store);
+            return client.LinearizableGet("k0") is not null || client.BoundedStaleGet("k0") is not null;
         }
 
         private void AdvanceSettled()
@@ -392,7 +809,6 @@ public static class DeterministicSimulator
                 return;
             }
 
-            Record(client.Id, "put", "invoke", key, value);
             string? outcome = Outcome(client, key, value);
             TrackOpen(client.Id, key, value, outcome);
             if (outcome is null)
@@ -410,33 +826,143 @@ public static class DeterministicSimulator
         {
             if (!Bind(client))
             {
-                string missed = _openPut.ContainsKey(client.Id) ? "null" : "no-leader";
-                Record(client.Id, "put", "invoke", key, value);
-                Record(client.Id, "put", "complete", key, missed);
+                bool retry = _openPut.ContainsKey(client.Id);
+                string missed = retry ? "null" : "no-leader";
+                if (!retry)
+                {
+                    Record(client.Id, "put", "invoke", key, value);
+                    Record(client.Id, "put", "complete", key, missed);
+                }
+
                 TrackOpen(client.Id, key, value, missed);
                 Note(step + " put " + missed);
                 return;
             }
 
             EnsureSession(client);
-            Record(client.Id, "put", "invoke", key, value);
+            BeginProposal(client.Id, key, value);
+            SimNode? bound = LiveLeader();
+            long before = bound?.Log.LastIndex ?? 0;
             try
             {
                 client.Kv.Put(key, value);
                 Drain();
+                if (bound is not null)
+                {
+                    NoteProposal(client, key, value, bound, before);
+                }
+
                 long? done = client.Kv.AwaitCommitted();
                 string text = done is null ? "null" : done.Value.ToString(CultureInfo.InvariantCulture);
                 TrackOpen(client.Id, key, value, text);
-                Record(client.Id, "put", "complete", key, text);
+                if (done is not null)
+                {
+                    _ackedValues[key] = value;
+                    _writeCommitted = true;
+                    FinishProposal(client.Id, key, text);
+                }
+
                 Note(step + " put " + client.Id + " " + key + " " + text);
             }
             catch (SimCrash)
             {
+                if (bound is not null)
+                {
+                    NoteProposal(client, key, value, bound, before);
+                }
+
                 TrackOpen(client.Id, key, value, "null");
-                Record(client.Id, "put", "complete", key, "null");
                 Note(step + " put crash " + client.Id + " " + key);
                 throw;
             }
+        }
+
+        private void NoteProposal(SimClient client, string key, string value, SimNode leader, long before)
+        {
+            long after = leader.Log.LastIndex;
+            if (after <= before)
+            {
+                return;
+            }
+
+            for (long index = after; index > before; index--)
+            {
+                LogEntry entry;
+                try
+                {
+                    entry = leader.Log.Read(index);
+                }
+                catch (KeyNotFoundException)
+                {
+                    continue;
+                }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
+
+                KvCommandCodec.Command decoded;
+                try
+                {
+                    decoded = KvCommandCodec.Decode(entry.Command);
+                }
+                catch (ArgumentException)
+                {
+                    continue;
+                }
+
+                if (decoded.Operation != KvCommandCodec.Op.Put || decoded.Key != key || decoded.Value != value)
+                {
+                    continue;
+                }
+
+                bool known = _proposal.TryGetValue(client.Id, out (long Session, long Serial, string Key) prior);
+                if (known && prior.Session < 0)
+                {
+                    _proposal[client.Id] = (decoded.SessionId, decoded.Serial, key);
+                    return;
+                }
+
+                bool duplicate = known
+                    && decoded.SessionId != 0
+                    && prior.Session == decoded.SessionId
+                    && prior.Serial == decoded.Serial;
+                if (duplicate)
+                {
+                    return;
+                }
+
+                if (known)
+                {
+                    Record(client.Id, "put", "complete", prior.Key, "null");
+                }
+
+                Record(client.Id, "put", "invoke", key, value);
+                _proposal[client.Id] = (decoded.SessionId, decoded.Serial, key);
+                return;
+            }
+        }
+
+        private void BeginProposal(int client, string key, string value)
+        {
+            if (_proposal.TryGetValue(client, out _))
+            {
+                return;
+            }
+
+            Record(client, "put", "invoke", key, value);
+            _proposal[client] = (-1, 0, key);
+        }
+
+        private void FinishProposal(int client, string key, string outcome)
+        {
+            if (!_proposal.ContainsKey(client))
+            {
+                return;
+            }
+
+            _proposal.Remove(client);
+            Record(client, "put", "complete", key, outcome);
         }
 
         private void SettlePending(int step)
@@ -451,7 +977,6 @@ public static class DeterministicSimulator
                     {
                         _pendingSettled = false;
                         TrackOpen(id, op.Key, op.Value, "unsettled");
-                        Record(id, "put", "complete", op.Key, "unsettled");
                         finished.Add(id);
                         Note(step + " unsettled " + id);
                     }
@@ -484,7 +1009,7 @@ public static class DeterministicSimulator
 
         private void CompletePut(int client, string key, string outcome)
         {
-            Record(client, "put", "complete", key, outcome);
+            FinishProposal(client, key, outcome);
             if (long.TryParse(outcome, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
             {
                 _writeCommitted = true;
@@ -504,6 +1029,9 @@ public static class DeterministicSimulator
             }
 
             EnsureSession(client);
+            BeginProposal(client.Id, key, value);
+            SimNode? bound = LiveLeader();
+            long before = bound?.Log.LastIndex ?? 0;
             long? done = client.Kv.AwaitCommitted();
             if (done is null)
             {
@@ -511,6 +1039,11 @@ public static class DeterministicSimulator
             }
 
             Drain();
+            if (bound is not null)
+            {
+                NoteProposal(client, key, value, bound, before);
+            }
+
             done ??= client.Kv.AwaitCommitted();
             if (done is not null)
             {
@@ -906,7 +1439,7 @@ public static class DeterministicSimulator
                 bool progress = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (node.Raft is null)
+                    if (node.Frozen || node.Raft is null)
                     {
                         continue;
                     }
@@ -938,7 +1471,7 @@ public static class DeterministicSimulator
                 bool quorumCrash = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (!node.Live)
+                    if (node.Frozen || !node.Live)
                     {
                         continue;
                     }
@@ -968,7 +1501,7 @@ public static class DeterministicSimulator
                 bool more = false;
                 foreach (SimNode node in _nodes)
                 {
-                    if (node.Raft is null)
+                    if (node.Frozen || node.Raft is null)
                     {
                         continue;
                     }
@@ -1196,6 +1729,14 @@ public static class DeterministicSimulator
 
                 foreach ((long index, (long Term, int Hash) entry) in _committed)
                 {
+                    // A leader must hold entries committed in its own term or earlier.
+                    // A commit from a higher term belongs to a later leader. This node
+                    // can still show Role.Leader until it observes that term.
+                    if (entry.Term > node.Raft.CurrentTerm)
+                    {
+                        continue;
+                    }
+
                     if (!Covers(node, index, entry.Term, entry.Hash))
                     {
                         Fail("leader completeness " + node.Id + " term " + node.Raft.CurrentTerm + " missing " + index);
@@ -1332,6 +1873,8 @@ public static class DeterministicSimulator
 
         public bool PendingCrash { get; set; }
 
+        public bool Frozen { get; set; }
+
         public int Generation { get; set; }
 
         public long CommitSeen { get; set; }
@@ -1373,6 +1916,24 @@ public static class DeterministicSimulator
                 _onAdvance?.Invoke();
             }
         }
+
+        public void Jump(long delta)
+        {
+            long next = checked(_millis + delta);
+            if (next < 0)
+            {
+                next = 0;
+            }
+
+            if (next == _millis)
+            {
+                return;
+            }
+
+            _millis = next;
+            _fraction = 0;
+            _onAdvance?.Invoke();
+        }
     }
 
     private sealed class SimNet : ITransport
@@ -1381,6 +1942,7 @@ public static class DeterministicSimulator
         private readonly HashSet<string> _known = [];
         private readonly Dictionary<string, RaftNode?> _handlers = [];
         private readonly HashSet<Link> _cuts = [];
+        private readonly HashSet<string> _frozen = [];
         private readonly List<Delivery> _queue = [];
         private long _seq;
 
@@ -1404,6 +1966,18 @@ public static class DeterministicSimulator
 
         public void Bind(string id, RaftNode? node) => _handlers[id] = node;
 
+        public void SetFrozen(string id, bool frozen)
+        {
+            if (frozen)
+            {
+                _frozen.Add(id);
+            }
+            else
+            {
+                _frozen.Remove(id);
+            }
+        }
+
         public void ClearFaults()
         {
             _cuts.Clear();
@@ -1412,6 +1986,8 @@ public static class DeterministicSimulator
             MaxDelay = 0;
             CrashSends = false;
         }
+
+        public void DropQueued() => _queue.Clear();
 
         public void TogglePartition(string a, string b)
         {
@@ -1478,7 +2054,10 @@ public static class DeterministicSimulator
             var ready = new List<Delivery>();
             foreach (Delivery item in _queue)
             {
-                if (item.Due <= Now && _handlers.TryGetValue(item.Envelope.To, out RaftNode? node) && node is not null)
+                if (item.Due <= Now
+                    && !_frozen.Contains(item.Envelope.To)
+                    && _handlers.TryGetValue(item.Envelope.To, out RaftNode? node)
+                    && node is not null)
                 {
                     ready.Add(item);
                 }

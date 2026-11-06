@@ -64,3 +64,9 @@ Phase 9 called three findings. Each now has a failing test and a fix. Same-day p
 ## What did not regress
 
 Write throughput stays higher. Commit p50 stays inside noise. Election p99 matches the baseline cap of about one timeout. Bytes per pipelined write stay lower.
+
+Phase 14 added one volatile floor check on `ReadIndexSatisfied()`. Two quiet runs of 500 lease reads, with the other loops shortened, were 0.130 us and 0.151 us. Both sit under the published `9ae58dd` lease p50 of 0.165 us. The table above is unchanged.
+
+Phase 15 fsyncs the log directory inside `FileRaftLog.Force`. The harness still prints `log=in-memory`, so that fsync is not on the measured path. Same-day write runs (500 commits, 5 trials of 2000 pipelined puts, alloc batch unchanged, other loops set to 1): head throughput p50 7060 then 7877 ops/s, pre-phase-15 `f9ad895` 6381 then 7085, commit-1 `9ae58dd` 2589. Commit p50 was 170 then 126 us versus 137 then 118 us and 164 us. Both head-versus-pre gaps sit inside the larger write IQR (61 us and 49 us). Alloc per write was 35340 then 20585 bytes versus 16779 then 44729 and 135408. Throughput stayed higher. The directory fsync was left on every force.
+
+`--file-log` measures one voter with `FileRaftLog` and `FilePersistentState`. Each of 200 proposes is drained, so the log fsync runs on that write. Five trials: head 13497 ops/s (spread 2717) and 72.3 us, `f9ad895` 12249 ops/s (spread 4393) and 75.7 us, `9ae58dd` 12474 ops/s (spread 6498) and 76.4 us. Alloc per write was 1894 bytes on head and `f9ad895`, and 1324 on `9ae58dd`. Head was not slower than `f9ad895`. The per-append directory fsync stayed. `dotnet test` does not run this harness.

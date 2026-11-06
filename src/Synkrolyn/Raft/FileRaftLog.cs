@@ -5,7 +5,8 @@ namespace Synkrolyn.Raft;
 /// <summary>
 /// Durable 1-indexed Raft log. <see cref="Append"/> may buffer. <see cref="Force"/>
 /// and <see cref="Dispose"/> share one fsync per batch. A torn tail is dropped.
-/// A checksum failure that is not the tail throws. Snapshot metadata lives in snapshot.bin.
+/// A checksum failure that is not the tail throws. A torn snapshot.bin is dropped on open.
+/// A checksum mismatch in that file still throws. Snapshot metadata lives in snapshot.bin.
 /// </summary>
 public sealed class FileRaftLog : IRaftLog, IDisposable
 {
@@ -589,6 +590,7 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
             channel.Write(bytes);
             _afterForceWrite?.Invoke(channel);
             DataSync(channel);
+            FilePersistentState.SyncDirectoryPath(_dir);
         }
         catch
         {
@@ -642,7 +644,19 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
         }
 
         byte[] framed = File.ReadAllBytes(_snapshotFile);
-        byte[] payload = ReadRecords(framed);
+        byte[] payload;
+        try
+        {
+            payload = ChecksummedRecords.ReadRecords(framed);
+        }
+        catch (InvalidOperationException ex) when (ex.Message == "incomplete checksummed record")
+        {
+            // A crash while the snapshot file was only partly replaced. The
+            // checksummed log is still the source of truth, so drop the torn file.
+            File.Delete(_snapshotFile);
+            return;
+        }
+
         if (payload.Length < 16)
         {
             throw new InvalidOperationException("incomplete or corrupt snapshot file");
@@ -655,18 +669,6 @@ public sealed class FileRaftLog : IRaftLog, IDisposable
 
     private static void WriteRecords(Stream channel, byte[] payload) =>
         ChecksummedRecords.WriteRecords(channel, payload);
-
-    private static byte[] ReadRecords(byte[] framed)
-    {
-        try
-        {
-            return ChecksummedRecords.ReadRecords(framed);
-        }
-        catch (InvalidOperationException ex)
-        {
-            throw new InvalidOperationException("incomplete or corrupt snapshot file", ex);
-        }
-    }
 
     private void PersistSnapshot()
     {

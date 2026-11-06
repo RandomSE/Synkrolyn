@@ -56,6 +56,22 @@ public sealed class LinearizabilityCheckerTests
     }
 
     [Fact]
+    public void UnknownPut_overlappingAbsentRead_canCommitBeforeLaterRead()
+    {
+        Assert.Equal(
+            LinVerdict.Linearizable,
+            LinearizabilityChecker.Check(
+            [
+                Op(0, 0, "k0", put: true, "v1", LinEffect.Unknown),
+                Op(0, 0, "k0", put: false, "", LinEffect.Ok),
+                Op(0, 0, "k0", put: true, "v1", LinEffect.Unknown),
+                Op(5, 5, "k0", put: false, "", LinEffect.Ok),
+                Op(5, 5, "k0", put: false, "", LinEffect.Ok),
+                Op(10, 10, "k0", put: false, "v1", LinEffect.Ok),
+            ]));
+    }
+
+    [Fact]
     public void UnknownPut_thenAbsentRead_isLinearizable()
     {
         Assert.Equal(

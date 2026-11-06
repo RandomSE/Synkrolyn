@@ -97,6 +97,12 @@ public sealed class RaftNode
     /// Written on the raft thread and read without <see cref="_eventLock"/>.
     /// </summary>
     private long _publishedLeaseUntil;
+
+    /// <summary>
+    /// Highest clock sample applied to a lease. A backward step does not lower it,
+    /// so a stepped leader cannot treat old acks as fresh.
+    /// </summary>
+    private long _leaseClockFloor;
     private bool _transferCampaign;
     private Action<Action> _applyExecutor = static action => action();
     private Action<Action> _snapshotExecutor = static action => action();
@@ -852,8 +858,14 @@ public sealed class RaftNode
     /// </summary>
     public bool ReadIndexSatisfied()
     {
+        long now = _clock.Millis;
+        if (now < Volatile.Read(ref _leaseClockFloor))
+        {
+            return false;
+        }
+
         long until = Volatile.Read(ref _publishedLeaseUntil);
-        return until != 0 && _clock.Millis < until;
+        return until != 0 && now < until;
     }
 
     /// <summary>True when <paramref name="ticket"/>'s heartbeat round has a quorum and its index is applied.</summary>
@@ -1165,6 +1177,7 @@ public sealed class RaftNode
     private void OnTick()
     {
         long now = _clock.Millis;
+        NoteLeaseClock(now);
         if (_role == Role.Leader)
         {
             ExpireUnackedInFlight(now);
@@ -1691,20 +1704,58 @@ public sealed class RaftNode
 
         AppendEntriesIfPresent(append.Entries);
         long storedThrough = append.PrevLogIndex + append.Entries.Count;
-        _lastAcceptedLeaderCommit = append.LeaderCommit;
-        _commitIndex = Math.Max(_commitIndex, Math.Min(append.LeaderCommit, storedThrough));
+        long leaderCommit = append.LeaderCommit;
+        long durableCommit = Math.Max(_commitIndex, Math.Min(leaderCommit, storedThrough));
         long term = CurrentTermLocked();
         long stamp = append.Stamp;
         string leader = from;
         if (_logNeedsForce)
         {
-            _afterForce.Add(() => _transport.Send(_nodeId, leader, new AppendEntriesResponse(term, true, storedThrough, stamp)));
+            // The ack and the commit both wait until the directory fsync in Force succeeds.
+            // A later RPC in this drain can truncate the suffix before that fsync.
+            // Success is only true if those entries are still the stored suffix.
+            _afterForce.Add(() =>
+            {
+                if (!SuffixStillStored(append))
+                {
+                    return;
+                }
+
+                _lastAcceptedLeaderCommit = leaderCommit;
+                _commitIndex = Math.Max(_commitIndex, durableCommit);
+                _transport.Send(_nodeId, leader, new AppendEntriesResponse(term, true, storedThrough, stamp));
+            });
         }
         else
         {
+            _lastAcceptedLeaderCommit = leaderCommit;
+            _commitIndex = durableCommit;
             ApplyCommitted();
             _transport.Send(_nodeId, from, new AppendEntriesResponse(CurrentTermLocked(), true, storedThrough, stamp));
         }
+    }
+
+    private bool SuffixStillStored(AppendEntries append)
+    {
+        if (!PrevLogMatches(append.PrevLogIndex, append.PrevLogTerm))
+        {
+            return false;
+        }
+
+        foreach (LogEntry entry in append.Entries)
+        {
+            if (entry.Index <= _log.LastIncludedIndex)
+            {
+                continue;
+            }
+
+            if (entry.Index > _log.LastIndex || _log.Read(entry.Index).Term != entry.Term)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void ObserveTransfer(string leaderId)
@@ -2920,6 +2971,11 @@ public sealed class RaftNode
 
     private bool FollowerReadLeaseValidLocked()
     {
+        if (NoteLeaseClock(_clock.Millis))
+        {
+            return false;
+        }
+
         if (_role == Role.Leader || _lastLeaderContactMillis == long.MinValue)
         {
             return false;
@@ -2935,6 +2991,11 @@ public sealed class RaftNode
 
     private bool QuorumLeaseValidLocked()
     {
+        if (NoteLeaseClock(_clock.Millis))
+        {
+            return false;
+        }
+
         if (_role != Role.Leader || !HasCommittedEntryInCurrentTerm())
         {
             return false;
@@ -2958,6 +3019,11 @@ public sealed class RaftNode
     /// <summary>Caller holds <see cref="_eventLock"/>.</summary>
     private void PublishLinearizableLease()
     {
+        if (NoteLeaseClock(_clock.Millis))
+        {
+            return;
+        }
+
         Volatile.Write(ref _publishedLeaseUntil, LinearizableLeaseUntilLocked());
     }
 
@@ -3054,6 +3120,11 @@ public sealed class RaftNode
 
     private bool LinearizableLeaseValidLocked()
     {
+        if (NoteLeaseClock(_clock.Millis))
+        {
+            return false;
+        }
+
         if (_role != Role.Leader || !HasCommittedEntryInCurrentTerm())
         {
             return false;
@@ -3073,6 +3144,29 @@ public sealed class RaftNode
         }
 
         return HeardCount(_linearizableAckSendMillis, bound) >= Majority();
+    }
+
+    /// <summary>
+    /// True when <paramref name="now"/> is behind the highest lease sample.
+    /// Drops lease acks from that earlier timeline. Caller holds <see cref="_eventLock"/>.
+    /// </summary>
+    private bool NoteLeaseClock(long now)
+    {
+        long floor = Volatile.Read(ref _leaseClockFloor);
+        if (now < floor)
+        {
+            _leaseAckMillis.Clear();
+            _linearizableAckSendMillis.Clear();
+            Volatile.Write(ref _publishedLeaseUntil, 0);
+            return true;
+        }
+
+        if (now > floor)
+        {
+            Volatile.Write(ref _leaseClockFloor, now);
+        }
+
+        return false;
     }
 
     private int HeardCount(Dictionary<string, long> acks, long bound)

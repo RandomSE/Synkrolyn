@@ -349,3 +349,37 @@ The 2026-10-21 report, by enclosing method (survived, then no coverage). Equival
 That is 350 survived and 191 with no coverage. These groups are not the phase 11b buckets, so they do not revise 121, 109, 89, 70, 44, 80, and 22 line by line. They replace the 43 and 56 lines, which do not add up.
 
 `IsExpired` treating a negative timeout as already expired, `TakeEffect` dropping the consumed-index return, and the non-leader return in `MaybeAdvanceCommit` are gaps. A negative timeout, a second take of an error, and a follower force can each change the result.
+
+## Phase 13 fault coverage
+
+These three conditions were partial in the fault audit. They are covered now.
+
+- Full-voter crash. `DeterministicSimulator.RunFullClusterCrash` crashes every voter with an unflushed suffix, restarts each from its durable log, and `DeterministicSimulatorTests.FullClusterCrash_keepsCommittedPrefix_andIsLinearizable` checks the committed prefix and linearizability on seeds 1 through 5.
+- Crash during InstallSnapshot. `FaultGapTests.CrashMidInstallSnapshot_restartsAndRejectsStaleFinalChunk` persists one chunk as a torn `snapshot.bin`, reopens the follower, rejects a stale final chunk, and accepts a fresh install from offset 0. A torn snapshot file is dropped. A checksum mismatch still throws.
+- Sustained one-way partition. `FaultGapTests.OneWayPartition_pastElectionTimeout_oneLeaderPerTerm_andNoStaleLeaseRead` drops leader-to-follower traffic past the election timeout and checks one leader per term and no lease read from the stale leader.
+
+## Phase 14 clock faults and lease boundaries
+
+`DeterministicSimulator.RunClockAndPause` pauses the leader for longer than the election timeout, jumps that clock forward by the pause, then steps a later leader's clock backward while another leader exists. `DeterministicSimulatorTests.ClockJumpAndPause_refusesStaleLease_andIsLinearizable` checks both refusals and linearizability on seeds 1 through 5.
+
+A backward step left `ReadIndexSatisfied` true: the published expiry was still ahead of the stepped clock. `RaftNode` keeps the highest lease sample and drops lease acks from the earlier timeline. A forward step still expires the lease. `SystemRaftClock` was already monotonic.
+
+`Phase14LeaseVoteTests` covers the transfer-vote exception inside a live leader lease, a one-millisecond pre-vote retry when the vote gate is already open, the advertised-lease retry versus a zero bound, the quorum-lease and follower-lease expiry instants, a joint lease that needs both configurations, and transfer-window acks.
+
+Stryker basic, same config, on 2026-10-22. Before these tests: overall 67.75% (1,117 killed, 32 timeout, 357 survived, 190 no coverage). Lease methods 59.09% (65 killed, 35 survived, 10 no coverage). Vote-gate methods 83.87% (52 killed, 10 survived). After: overall 68.91% (1,129 killed, 48 timeout, 341 survived, 190 no coverage). Lease methods 68.03% (83 killed, 29 survived, 10 no coverage) on a larger set because the clock check is new. Vote-gate methods 90.32% (56 killed, 6 survived). Timeouts count as detected. Four of the six remaining vote-gate survivors are the equivalent boundary cases already listed above. The other two still survive: a zero advertised bound compared with `>=`, and contact time added instead of subtracted. The new retry observes that contact at time 0, where those two mutants match the original.
+
+## Phase 15 directory fsync and mutation gate
+
+`Phase15DirectorySyncTests.DirectoryFsyncFailure_doesNotAckTheWrite_orReportItCommitted` fails `FilePersistentState.SyncDirectoryPath` for one log directory. `FileRaftLog.Force` treats that like a failed data fsync: the new bytes are truncated and the index stays undurable. The follower ack and commit index wait until `Force` returns, so a failed directory fsync does not ack the append and does not publish it as committed.
+
+Dropping `DeterministicSimulatorTests` from the mutation filter moved 19 mutants to no coverage: 14 that had survived and 5 that had been killed. They are covered by that class and not by the other filtered tests. PushSeeds, StaleLocalRead, and Socket stay out. The class is back in the filter. Concurrency is 4, `additional-timeout` is 20000, and `timeout-ratio` is 3. Two full runs: 1,129 killed / 48 timeout / 343 survived / 188 no coverage (10:27), then 1,155 / 22 / 343 / 188 (10:06). Survived plus no coverage is 531 both times, the same sum as the pre-phase-15 341 + 190. Killed and timeout still trade places. The CI caps are raft 243 + 100 and kv 100 + 88.
+
+## Nightly simulator
+
+`sim-nightly` runs `PushSeeds_holdInvariants` with `SIM_COUNT=10000` and `SIM_STEPS=2000` on `main`. Both OS jobs failed on seed 392 with the same linearizability history. An unknown put shared a timestamp with an absent read, so the checker resolved that put inside the cluster and could not place its later commit. Unknown puts now stay pending even when a read overlaps the timeout. `UnknownPut_overlappingAbsentRead_canCommitBeforeLaterRead` covers that history.
+
+Seed 435 then reported leader completeness because a term-4 leader had not yet observed a term-5 commit. The check now requires entries committed in the leader's term or earlier. That is the later-leader property.
+
+Seed 436 acked match index 4 after a later RPC in the same drain truncated that suffix and `Force` persisted only through 3. The deferred success is sent only when that suffix is still stored. `Seed436_doesNotAckAnIndexTruncatedBeforeFlush` is the regression.
+
+Seed 1557 recorded every retry of one session put as its own write. The ack of the original value then sat after a newer committed put, and a later read of the newer value was a violation. A retry of the same session serial stays one invoke. A new log entry with a different identity closes that invoke as unknown and starts another. `Seed1557_retryOfAnOpenPut_staysOneWrite` and seed 6814 cover the two cases.

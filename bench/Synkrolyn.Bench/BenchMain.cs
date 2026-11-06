@@ -19,10 +19,16 @@ internal static class BenchMain
             Console.WriteLine("  Loopback 3-node write, read, election, and allocation harness.");
             Console.WriteLine("  --label <text>  --out <file>  --quick");
             Console.WriteLine("  --writes N  --pipeline N  --reads N  --read-index N  --elections N");
+            Console.WriteLine("  --file-log  --file-trials N");
             return 0;
         }
 
         BenchConfig config = BenchConfig.Parse(args);
+        if (config.FileLog)
+        {
+            return FileLogBench.Run(config);
+        }
+
         ReadProbe.EnsureAvailable();
         var report = new StringBuilder();
         void Line(string text)
@@ -424,6 +430,10 @@ internal sealed class BenchConfig
 
     public int ThroughputTrials { get; private set; } = 5;
 
+    public bool FileLog { get; private set; }
+
+    public int FileTrials { get; private set; } = 5;
+
     public string Label { get; private set; } = "local";
 
     public string? OutPath { get; private set; }
@@ -474,6 +484,14 @@ internal sealed class BenchConfig
             else if (arg == "--elections" && i + 1 < args.Length)
             {
                 config.Elections = ParseInt(args[++i], arg);
+            }
+            else if (arg == "--file-log")
+            {
+                config.FileLog = true;
+            }
+            else if (arg == "--file-trials" && i + 1 < args.Length)
+            {
+                config.FileTrials = ParseInt(args[++i], arg);
             }
         }
 
