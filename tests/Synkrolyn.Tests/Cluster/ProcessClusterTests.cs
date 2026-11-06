@@ -201,6 +201,7 @@ internal sealed class ProcessCluster : IDisposable
     private readonly ConcurrentDictionary<long, string> _termLeader = new();
     private readonly List<string> _leaderClashes = [];
     private readonly Lock _clashGate = new();
+    private readonly ManualResetEventSlim _park = new(false);
     private bool _disposed;
 
     private ProcessCluster(string root, ProcessNode[] nodes)
@@ -508,7 +509,7 @@ internal sealed class ProcessCluster : IDisposable
                 throw new TimeoutException(message + " " + Dump());
             }
 
-            Thread.Sleep(2);
+            _park.Wait(TimeSpan.FromMilliseconds(2));
         }
     }
 
@@ -549,6 +550,7 @@ internal sealed class ProcessCluster : IDisposable
         }
 
         _disposed = true;
+        _park.Dispose();
         foreach (ProcessNode node in _nodes)
         {
             node.Dispose();
@@ -653,6 +655,7 @@ internal sealed class ProcessNode : IDisposable
     private readonly StringBuilder _error = new();
     private readonly Lock _textGate = new();
     private readonly ManualResetEventSlim _ready = new(false);
+    private readonly ManualResetEventSlim _park = new(false);
 
     private ProcessNode(string root, string id, TimeSpan election, string dataDirectory)
     {
@@ -753,6 +756,7 @@ internal sealed class ProcessNode : IDisposable
 
         _process?.Dispose();
         _ready.Dispose();
+        _park.Dispose();
     }
 
     private void Launch()
@@ -805,7 +809,7 @@ internal sealed class ProcessNode : IDisposable
                     + " out=" + Output + " err=" + Error);
             }
 
-            Thread.Sleep(2);
+            _park.Wait(TimeSpan.FromMilliseconds(2));
         }
     }
 

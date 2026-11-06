@@ -192,8 +192,7 @@ internal static class NodeServer
             + " quorumLease=" + Bit(node.QuorumLeaseValid)
             + " followerLease=" + Bit(node.FollowerReadLeaseValid)
             + " fatal=" + Bit(node.Fatal)
-            + " uncaught=" + uncaught
-            + " contactAge=" + node.MillisSinceLeaderContact.ToString(CultureInfo.InvariantCulture);
+            + " uncaught=" + uncaught;
     }
 
     private static string Put(KvClient kv, RaftNode node, string key, string value)
