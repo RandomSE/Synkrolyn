@@ -113,6 +113,17 @@ public sealed class RaftRuntime : IDisposable
             {
                 _uncaught = new AggregateException(ex, stop);
             }
+
+            // A dead Raft thread must not keep retransmitting the last leader
+            // AppendEntries. Followers would refresh their lease and never elect.
+            try
+            {
+                _transport.DisconnectAll();
+            }
+            catch (Exception disconnect)
+            {
+                _uncaught = new AggregateException(_uncaught, disconnect);
+            }
         }
     }
 

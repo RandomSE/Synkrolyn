@@ -1,0 +1,26 @@
+name: process-soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Soak length in seconds. 45 is the smoke. 7200 is a two-hour run.
+        required: true
+        default: "45"
+  schedule:
+    - cron: "0 9 * * 0"
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Real-process soak
+        env:
+          SOAK_SECONDS: ${{ github.event_name == 'schedule' && '7200' || github.event.inputs.seconds }}
+          SOAK_SEED: ${{ github.run_id }}
+        run: dotnet test tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj --configuration Release --filter FullyQualifiedName~RealProcessSoak

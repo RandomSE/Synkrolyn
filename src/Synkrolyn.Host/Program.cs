@@ -15,7 +15,13 @@ if (args.Contains("--help") || args.Contains("-h"))
     Console.WriteLine("Synkrolyn.Host");
     Console.WriteLine("  Starts a localhost 3-node Raft KV cluster, puts a key, and reads it back.");
     Console.WriteLine("  Usage: dotnet run --project src/Synkrolyn.Host");
+    Console.WriteLine("  node --id ID --peers ID,ID --data DIR --election-ms N --heartbeat-ms N");
     return 0;
+}
+
+if (args.Length > 0 && args[0] == "node")
+{
+    return NodeServer.Run(args[1..]);
 }
 
 using var runtime = await StartClusterAsync(cts.Token).ConfigureAwait(false);

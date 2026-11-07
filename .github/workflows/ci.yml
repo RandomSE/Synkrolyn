@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: dotnet build Synkrolyn.slnx --configuration Release
       - name: Test
-        run: dotnet test Synkrolyn.slnx --configuration Release --no-build
+        run: dotnet test Synkrolyn.slnx --configuration Release --no-build --filter "Category!=ProcessCluster&Category!=ProcessSoak"
       - name: TLC if installed
         if: runner.os == 'Linux'
         run: |
@@ -28,6 +28,17 @@ jobs:
           else
             echo "tlc not on PATH; skipping TLA+ model check"
           fi
+
+  process-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Real process cluster
+        run: dotnet test tests/Synkrolyn.Tests/Synkrolyn.Tests.csproj --configuration Release --filter Category=ProcessCluster
 
   tlc:
     runs-on: ubuntu-latest
@@ -43,14 +54,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: spec/tla2tools.jar
-          key: tla2tools-1.8.0-5bd7b64d
+          key: tla2tools-1.8.0-654aa501
       - name: Download tla2tools.jar
         if: steps.tla-jar.outputs.cache-hit != 'true'
         run: |
           mkdir -p spec
           curl -fsSL -o spec/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
       - name: Verify tla2tools checksum
-        run: echo "5bd7b64db99ae4c6c35f290de5e809c0ee41af43f8699cf696099ffb6452b1e2  spec/tla2tools.jar" | sha256sum -c -
+        run: echo "654aa50197faa48fa0136b41257270de6469d29ef323e7822ead59d2be43ce10  spec/tla2tools.jar" | sha256sum -c -
       - name: TLC real config
         run: java -jar spec/tla2tools.jar -cleanup -workers auto -config tla/MC.cfg tla/Synkrolyn.tla
       - name: TLC bug config must fail
