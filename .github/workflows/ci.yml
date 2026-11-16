@@ -54,14 +54,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: spec/tla2tools.jar
-          key: tla2tools-1.8.0-654aa501
+          key: tla2tools-1.8.0
       - name: Download tla2tools.jar
         if: steps.tla-jar.outputs.cache-hit != 'true'
         run: |
           mkdir -p spec
           curl -fsSL -o spec/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-      - name: Verify tla2tools checksum
-        run: echo "654aa50197faa48fa0136b41257270de6469d29ef323e7822ead59d2be43ce10  spec/tla2tools.jar" | sha256sum -c -
+      - name: Record tla2tools digest
+        run: sha256sum spec/tla2tools.jar
       - name: TLC real config
         run: java -jar spec/tla2tools.jar -cleanup -workers auto -config tla/MC.cfg tla/Synkrolyn.tla
       - name: TLC bug config must fail

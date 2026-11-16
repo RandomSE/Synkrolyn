@@ -181,6 +181,13 @@ internal static class NodeServer
                 return parts.Length == 2 ? Membership(node.PromoteVoter(parts[1])) : "ERR promote";
             case "REMOVE":
                 return parts.Length == 2 ? Membership(node.RemoveServer(parts[1])) : "ERR remove";
+            case "COLLECT":
+                // The soak samples RSS and fds after this. Finalizable sockets from the
+                // last control calls must not look like a leak.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                return "OK";
             case "STOP":
                 return "OK";
             default:

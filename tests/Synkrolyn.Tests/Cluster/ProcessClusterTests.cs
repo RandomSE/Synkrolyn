@@ -6,8 +6,14 @@ using System.Net.Sockets;
 using System.Text;
 using Synkrolyn.Raft;
 using Synkrolyn.Tests.Sim;
+using Xunit.Abstractions;
 
 namespace Synkrolyn.Tests.Cluster;
+
+[CollectionDefinition("ProcessCluster", DisableParallelization = true)]
+public sealed class ProcessClusterSerial
+{
+}
 
 /// <summary>
 /// Three operating-system processes, production <see cref="RaftRuntime"/>,
@@ -15,6 +21,7 @@ namespace Synkrolyn.Tests.Cluster;
 /// IOException from the log force path, not a kernel ENOSPC. SocketTransport has
 /// no duplication or reordering injector.
 /// </summary>
+[Collection("ProcessCluster")]
 [Trait("Category", "ProcessCluster")]
 public sealed class ProcessClusterTests
 {
@@ -863,6 +870,78 @@ internal sealed class ProcessNode : IDisposable
             RaftPort = raft;
             ControlPort = control;
             _ready.Set();
+        }
+    }
+}
+
+/// <summary>
+/// Control connections and peer reconnects must not keep sockets after a collection.
+/// The scheduled soak reads fds and RSS only after COLLECT.
+/// </summary>
+[Collection("ProcessCluster")]
+[Trait("Category", "ProcessCluster")]
+public sealed class ProcessResourceTests
+{
+    private readonly ITestOutputHelper _output;
+
+    public ProcessResourceTests(ITestOutputHelper output) => _output = output;
+
+    [Fact]
+    public void ControlChurn_afterCollect_doesNotKeepSockets()
+    {
+        using var park = new ManualResetEventSlim(false);
+        using var cluster = ProcessCluster.Start();
+        Commit(cluster, park, "seed", "committed");
+        ProcessNode node = cluster.Nodes[0];
+        ProcNow warm = Settle(cluster, node, park);
+        ProcessNode leader = cluster.WaitLeader();
+        ProcessNode other = cluster.NodeExcept(leader);
+        for (int i = 0; i < 60; i++)
+        {
+            Assert.Equal("OK", cluster.Call(leader, "DISCONNECT " + other.Id));
+            Assert.Equal("OK", cluster.Call(leader, "RECONNECT " + other.Id));
+            _ = cluster.Call(node, "STATUS");
+        }
+
+        ProcNow end = Settle(cluster, node, park);
+        string report = node.Id + " " + warm + " -> " + end;
+        _output.WriteLine(report);
+        Assert.True(end.Threads <= warm.Threads + 6, report);
+        Assert.True(end.Handles <= warm.Handles + 24, report);
+    }
+
+    private static void Commit(ProcessCluster cluster, ManualResetEventSlim park, string key, string value)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            ProcessNode leader = cluster.WaitLeader();
+            string line = cluster.Call(leader, "PUT " + key + " " + value);
+            if (line.StartsWith("PUT ok ", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            park.Wait(TimeSpan.FromMilliseconds(40));
+        }
+
+        throw new InvalidOperationException("put " + key + " " + cluster.Dump());
+    }
+
+    private static ProcNow Settle(ProcessCluster cluster, ProcessNode node, ManualResetEventSlim park)
+    {
+        park.Wait(TimeSpan.FromMilliseconds(200));
+        Assert.Equal("OK", cluster.Call(node, "COLLECT"));
+        park.Wait(TimeSpan.FromMilliseconds(200));
+        return ProcNow.Read(node);
+    }
+
+    private readonly record struct ProcNow(int Threads, int Handles, long WorkingSet)
+    {
+        public static ProcNow Read(ProcessNode node)
+        {
+            using Process process = Process.GetProcessById(node.Pid);
+            process.Refresh();
+            return new ProcNow(process.Threads.Count, process.HandleCount, process.WorkingSet64);
         }
     }
 }
