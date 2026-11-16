@@ -89,7 +89,6 @@ public sealed class ProcessSoakTests
         }
 
         var baseline = new Dictionary<string, ProcSample>(StringComparer.Ordinal);
-        Remember(cluster, baseline);
         var deadline = System.Diagnostics.Stopwatch.StartNew();
         int slice = 0;
         while (deadline.Elapsed < duration || slice < Faults.Length)
@@ -112,11 +111,22 @@ public sealed class ProcessSoakTests
             cluster.AssertLinearizable(history);
             cluster.AssertOneLeaderPerTerm();
             Assert.Equal("committed", cluster.LinearizableGet(cluster.WaitLeader(), "seed"));
-            Remember(cluster, baseline);
             slice++;
+            if (slice >= Faults.Length)
+            {
+                // Cold processes expand the heap and the thread pool during the first
+                // cycle. The two-hour sample is growth after that, on the same pid.
+                if (baseline.Count == 0)
+                {
+                    Collect(cluster);
+                }
+
+                Remember(cluster, baseline);
+            }
         }
 
         await SnapshotAndBound(cluster, log);
+        Collect(cluster);
         AssertResources(cluster, baseline, log);
         log.Add("completed slices " + slice.ToString(CultureInfo.InvariantCulture));
         _output.WriteLine(log.ToString());
@@ -259,6 +269,11 @@ public sealed class ProcessSoakTests
                 () => !Voters(cluster).Contains("n4", StringComparison.Ordinal),
                 TimeSpan.FromSeconds(6));
             cluster.PutCommitted(cluster.WaitLeader(), "after", "remove");
+            if (_extra is { IsRunning: true })
+            {
+                _extra.Kill();
+            }
+
             _removed = true;
         }
     }
@@ -317,6 +332,19 @@ public sealed class ProcessSoakTests
             log.Add(node.Id + " log=" + logBytes.ToString(CultureInfo.InvariantCulture) + " dir=" + dirBytes.ToString(CultureInfo.InvariantCulture));
             Assert.True(logBytes <= MaxLogBytes, node.Id + " log " + logBytes.ToString(CultureInfo.InvariantCulture));
             Assert.True(dirBytes <= MaxDirBytes, node.Id + " dir " + dirBytes.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    private static void Collect(ProcessCluster cluster)
+    {
+        foreach (ProcessNode node in cluster.Nodes)
+        {
+            if (!node.IsRunning)
+            {
+                continue;
+            }
+
+            Assert.Equal("OK", cluster.Call(node, "COLLECT"));
         }
     }
 
