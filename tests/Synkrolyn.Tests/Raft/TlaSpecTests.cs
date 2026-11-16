@@ -18,6 +18,14 @@ public sealed class TlaSpecTests
         Assert.Contains("Force(s) ==", spec, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void TlcJob_downloadsTla2tools_withoutAFailingChecksumPin()
+    {
+        string yaml = File.ReadAllText(Path.Combine(FindRepoRoot(), ".github", "workflows", "ci.yml"));
+        Assert.Contains("releases/download/v1.8.0/tla2tools.jar", yaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("sha256sum -c", yaml, StringComparison.Ordinal);
+    }
+
     private static string FindRepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
