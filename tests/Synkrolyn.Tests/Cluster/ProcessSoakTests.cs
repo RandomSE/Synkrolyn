@@ -96,6 +96,7 @@ public sealed class ProcessSoakTests
             string fault = Faults[(slice + seed) % Faults.Length];
             log.Add("slice " + slice.ToString(CultureInfo.InvariantCulture) + " " + fault + " at " + deadline.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s");
             using var history = new History();
+            SoakHistory.BeginSlice(cluster, history, "k0", "k1", "k2", "k3");
             using var stop = new CancellationTokenSource();
             Task[] writers =
             [
@@ -430,6 +431,45 @@ public sealed class ProcessSoakTests
         {
             Park.Wait(TimeSpan.FromMilliseconds(20), stop);
             await Task.Yield();
+        }
+    }
+}
+
+/// <summary>
+/// A soak slice checks only the calls from that slice. Values already committed
+/// have to be part of that history, or a later read looks like a lost write.
+/// </summary>
+internal static class SoakHistory
+{
+    public static void NoteCommitted(List<LinOp> ops, long stamp, string key, string value)
+    {
+        if (value.Length == 0 || value == "null")
+        {
+            return;
+        }
+
+        ops.Add(new LinOp(stamp, stamp, key, true, value, LinEffect.Ok));
+    }
+
+    public static void BeginSlice(ProcessCluster cluster, History history, params string[] keys)
+    {
+        long started = cluster.Now();
+        var committed = new List<(string Key, string Value)>(keys.Length);
+        foreach (string key in keys)
+        {
+            string value = cluster.LinearizableGet(cluster.WaitLeader(), key);
+            if (value.Length == 0 || value == "null")
+            {
+                continue;
+            }
+
+            committed.Add((key, value));
+        }
+
+        long completed = cluster.Now();
+        foreach ((string key, string value) in committed)
+        {
+            history.Add(new LinOp(started, completed, key, true, value, LinEffect.Ok));
         }
     }
 }
