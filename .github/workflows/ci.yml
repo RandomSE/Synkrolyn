@@ -99,6 +99,10 @@ jobs:
           dotnet-version: "10.0.x"
       - name: Restore local tools
         run: dotnet tool restore
+      - name: Restore
+        run: dotnet restore Synkrolyn.slnx
+      - name: Build
+        run: dotnet build Synkrolyn.slnx --configuration Release --no-restore
       - name: Stryker
         run: dotnet stryker --config-file ${{ matrix.config }}
       - name: Undetected mutant gate

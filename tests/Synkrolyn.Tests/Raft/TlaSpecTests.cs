@@ -26,6 +26,16 @@ public sealed class TlaSpecTests
         Assert.DoesNotContain("sha256sum -c", yaml, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void StrykerJob_restoresTheSolution_beforeMutation()
+    {
+        string yaml = File.ReadAllText(Path.Combine(FindRepoRoot(), ".github", "workflows", "ci.yml"));
+        int tools = yaml.IndexOf("dotnet tool restore", StringComparison.Ordinal);
+        int restore = yaml.IndexOf("dotnet restore Synkrolyn.slnx", StringComparison.Ordinal);
+        int stryker = yaml.IndexOf("dotnet stryker", StringComparison.Ordinal);
+        Assert.True(tools >= 0 && restore > tools && stryker > restore);
+    }
+
     private static string FindRepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
