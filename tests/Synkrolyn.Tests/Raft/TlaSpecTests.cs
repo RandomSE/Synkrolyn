@@ -41,4 +41,14 @@ public sealed class TlaSpecTests
 
         return Directory.GetCurrentDirectory();
     }
+
+    [Fact]
+    public void PagesDeploy_waitsUntilTheUploadJobHasFinished()
+    {
+        string yaml = File.ReadAllText(Path.Combine(FindRepoRoot(), ".github", "workflows", "pages.yml"));
+        int upload = yaml.IndexOf("actions/upload-pages-artifact@", StringComparison.Ordinal);
+        int needs = upload < 0 ? -1 : yaml.IndexOf("needs:", upload, StringComparison.Ordinal);
+        int deploy = needs < 0 ? -1 : yaml.IndexOf("actions/deploy-pages@", needs, StringComparison.Ordinal);
+        Assert.True(upload >= 0 && needs > upload && deploy > needs);
+    }
 }
