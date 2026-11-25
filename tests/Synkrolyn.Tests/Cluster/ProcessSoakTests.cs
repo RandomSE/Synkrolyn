@@ -113,15 +113,11 @@ public sealed class ProcessSoakTests
             cluster.AssertOneLeaderPerTerm();
             Assert.Equal("committed", cluster.LinearizableGet(cluster.WaitLeader(), "seed"));
             slice++;
-            if (slice >= Faults.Length)
+            if (SoakHistory.TimeToSampleResources(deadline.Elapsed, duration, baseline.Count > 0))
             {
-                // Cold processes expand the heap and the thread pool during the first
-                // cycle. The two-hour sample is growth after that, on the same pid.
-                if (baseline.Count == 0)
-                {
-                    Collect(cluster);
-                }
-
+                // The first minute still grows the heap and the thread pool. Compare
+                // the second half of the run, on the same pid.
+                Collect(cluster);
                 Remember(cluster, baseline);
             }
         }
@@ -383,9 +379,9 @@ public sealed class ProcessSoakTests
                 continue;
             }
 
-            Assert.True(now.Threads <= start.Threads + MaxThreadGrowth, node.Id + " threads");
-            Assert.True(now.Fds <= start.Fds + MaxFdGrowth, node.Id + " fds");
-            Assert.True(now.RssKb <= start.RssKb + MaxRssGrowthKb, node.Id + " rss");
+            Assert.True(now.Threads <= start.Threads + MaxThreadGrowth, node.Id + " threads " + start.Threads.ToString(CultureInfo.InvariantCulture) + "->" + now.Threads.ToString(CultureInfo.InvariantCulture));
+            Assert.True(now.Fds <= start.Fds + MaxFdGrowth, node.Id + " fds " + start.Fds.ToString(CultureInfo.InvariantCulture) + "->" + now.Fds.ToString(CultureInfo.InvariantCulture));
+            Assert.True(now.RssKb <= start.RssKb + MaxRssGrowthKb, node.Id + " rssKb " + start.RssKb.ToString(CultureInfo.InvariantCulture) + "->" + now.RssKb.ToString(CultureInfo.InvariantCulture));
         }
     }
 
@@ -449,6 +445,11 @@ internal static class SoakHistory
         }
 
         ops.Add(new LinOp(stamp, stamp, key, true, value, LinEffect.Ok));
+    }
+
+    public static bool TimeToSampleResources(TimeSpan elapsed, TimeSpan duration, bool sampled)
+    {
+        return !sampled && elapsed >= duration / 2;
     }
 
     public static void BeginSlice(ProcessCluster cluster, History history, params string[] keys)

@@ -32,6 +32,15 @@ public sealed class SoakHistoryTests
         Assert.Equal(LinVerdict.Linearizable, LinearizabilityChecker.Check(withPrior));
     }
 
+    [Fact]
+    public void ResourceSample_startsAtHalfTheRun_notAfterTheFirstMinute()
+    {
+        var twoHours = TimeSpan.FromSeconds(7200);
+        Assert.False(SoakHistory.TimeToSampleResources(TimeSpan.FromSeconds(10), twoHours, sampled: false));
+        Assert.True(SoakHistory.TimeToSampleResources(TimeSpan.FromSeconds(3600), twoHours, sampled: false));
+        Assert.False(SoakHistory.TimeToSampleResources(TimeSpan.FromSeconds(4000), twoHours, sampled: true));
+    }
+
     private static LinOp Op(long invoke, long response, string key, bool put, string value, LinEffect effect) =>
         new(invoke, response, key, put, value, effect);
 }
