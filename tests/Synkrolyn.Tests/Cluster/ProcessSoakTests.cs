@@ -96,6 +96,7 @@ public sealed class ProcessSoakTests
             string fault = Faults[(slice + seed) % Faults.Length];
             log.Add("slice " + slice.ToString(CultureInfo.InvariantCulture) + " " + fault + " at " + deadline.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s");
             using var history = new History();
+            SoakHistory.BeginSlice(cluster, history, "k0", "k1", "k2", "k3");
             using var stop = new CancellationTokenSource();
             Task[] writers =
             [
@@ -112,15 +113,11 @@ public sealed class ProcessSoakTests
             cluster.AssertOneLeaderPerTerm();
             Assert.Equal("committed", cluster.LinearizableGet(cluster.WaitLeader(), "seed"));
             slice++;
-            if (slice >= Faults.Length)
+            if (SoakHistory.TimeToSampleResources(deadline.Elapsed, duration, baseline.Count > 0))
             {
-                // Cold processes expand the heap and the thread pool during the first
-                // cycle. The two-hour sample is growth after that, on the same pid.
-                if (baseline.Count == 0)
-                {
-                    Collect(cluster);
-                }
-
+                // The first minute still grows the heap and the thread pool. Compare
+                // the second half of the run, on the same pid.
+                Collect(cluster);
                 Remember(cluster, baseline);
             }
         }
@@ -382,9 +379,9 @@ public sealed class ProcessSoakTests
                 continue;
             }
 
-            Assert.True(now.Threads <= start.Threads + MaxThreadGrowth, node.Id + " threads");
-            Assert.True(now.Fds <= start.Fds + MaxFdGrowth, node.Id + " fds");
-            Assert.True(now.RssKb <= start.RssKb + MaxRssGrowthKb, node.Id + " rss");
+            Assert.True(now.Threads <= start.Threads + MaxThreadGrowth, node.Id + " threads " + start.Threads.ToString(CultureInfo.InvariantCulture) + "->" + now.Threads.ToString(CultureInfo.InvariantCulture));
+            Assert.True(now.Fds <= start.Fds + MaxFdGrowth, node.Id + " fds " + start.Fds.ToString(CultureInfo.InvariantCulture) + "->" + now.Fds.ToString(CultureInfo.InvariantCulture));
+            Assert.True(now.RssKb <= start.RssKb + MaxRssGrowthKb, node.Id + " rssKb " + start.RssKb.ToString(CultureInfo.InvariantCulture) + "->" + now.RssKb.ToString(CultureInfo.InvariantCulture));
         }
     }
 
@@ -430,6 +427,50 @@ public sealed class ProcessSoakTests
         {
             Park.Wait(TimeSpan.FromMilliseconds(20), stop);
             await Task.Yield();
+        }
+    }
+}
+
+/// <summary>
+/// A soak slice checks only the calls from that slice. Values already committed
+/// have to be part of that history, or a later read looks like a lost write.
+/// </summary>
+internal static class SoakHistory
+{
+    public static void NoteCommitted(List<LinOp> ops, long stamp, string key, string value)
+    {
+        if (value.Length == 0 || value == "null")
+        {
+            return;
+        }
+
+        ops.Add(new LinOp(stamp, stamp, key, true, value, LinEffect.Ok));
+    }
+
+    public static bool TimeToSampleResources(TimeSpan elapsed, TimeSpan duration, bool sampled)
+    {
+        return !sampled && elapsed >= duration / 2;
+    }
+
+    public static void BeginSlice(ProcessCluster cluster, History history, params string[] keys)
+    {
+        long started = cluster.Now();
+        var committed = new List<(string Key, string Value)>(keys.Length);
+        foreach (string key in keys)
+        {
+            string value = cluster.LinearizableGet(cluster.WaitLeader(), key);
+            if (value.Length == 0 || value == "null")
+            {
+                continue;
+            }
+
+            committed.Add((key, value));
+        }
+
+        long completed = cluster.Now();
+        foreach ((string key, string value) in committed)
+        {
+            history.Add(new LinOp(started, completed, key, true, value, LinEffect.Ok));
         }
     }
 }

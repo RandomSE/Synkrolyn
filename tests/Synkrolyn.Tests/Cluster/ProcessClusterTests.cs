@@ -150,6 +150,18 @@ public sealed class ProcessClusterTests
     {
     }
 
+    [Fact]
+    public void QuietSlice_readsValuesCommittedBeforeIt()
+    {
+        using var cluster = ProcessCluster.Start();
+        cluster.PutCommitted(cluster.WaitLeader(), "k2", "a-10");
+        cluster.PutCommitted(cluster.WaitLeader(), "k3", "b-11");
+        using var history = new History();
+        SoakHistory.BeginSlice(cluster, history, "k0", "k1", "k2", "k3");
+        cluster.RecordStableReads(history, "k0", "k1", "k2", "k3");
+        cluster.AssertLinearizable(history);
+    }
+
     private static void TruncateLogTail(string directory)
     {
         string path = Path.Combine(directory, FileRaftLog.FileName);
